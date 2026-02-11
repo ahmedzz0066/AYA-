@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Summary - {{ meeting.get('subject', 'Meeting') }} - AYA{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>{{ meeting.get('subject', 'Meeting Summary') }}</h2>
+    {% if meeting.get('start') %}
+    <p style="color: var(--text-light); margin-bottom: 1rem;">
+        {{ meeting.get('start', '')[:16] | replace('T', ' ') }}
+        {% if meeting.get('end') %}
+            &mdash; {{ meeting.get('end', '')[:16] | replace('T', ' ') }}
+        {% endif %}
+    </p>
+    {% endif %}
+
+    <div class="summary-content">
+        {{ summary | replace('## ', '<h2>') | replace('\n- ', '\n<li>') | safe }}
+    </div>
+
+    <div class="export-bar">
+        <form action="{{ url_for('export', fmt='pdf') }}" method="post" style="display:inline;">
+            <input type="hidden" name="summary" value="{{ summary }}">
+            <input type="hidden" name="subject" value="{{ meeting.get('subject', 'meeting') }}">
+            <button type="submit" class="btn btn-primary btn-sm">Export PDF</button>
+        </form>
+        <form action="{{ url_for('export', fmt='markdown') }}" method="post" style="display:inline;">
+            <input type="hidden" name="summary" value="{{ summary }}">
+            <input type="hidden" name="subject" value="{{ meeting.get('subject', 'meeting') }}">
+            <button type="submit" class="btn btn-outline btn-sm">Export Markdown</button>
+        </form>
+        <form action="{{ url_for('export', fmt='text') }}" method="post" style="display:inline;">
+            <input type="hidden" name="summary" value="{{ summary }}">
+            <input type="hidden" name="subject" value="{{ meeting.get('subject', 'meeting') }}">
+            <button type="submit" class="btn btn-outline btn-sm">Export Text</button>
+        </form>
+    </div>
+</div>
+
+<a href="{{ url_for('meetings') }}" class="btn btn-outline" style="margin-top: 0.5rem;">Back to Meetings</a>
+{% endblock %}

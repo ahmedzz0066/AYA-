@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Paste Transcript - AYA{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>Paste Meeting Transcript</h2>
+    <p style="color: var(--text-light); margin-bottom: 1rem;">
+        Paste your meeting transcript, notes, or chat log below and get an AI-powered summary.
+    </p>
+
+    <form method="post" action="{{ url_for('summarize_text') }}">
+        <textarea
+            name="transcript_text"
+            placeholder="Paste your meeting transcript or notes here...
+
+Example:
+John: Good morning everyone. Let's start with the Q1 review.
+Sarah: Revenue is up 15% compared to last quarter.
+John: Great. What about the product launch timeline?
+Mike: We're on track for March 15th launch..."
+        ></textarea>
+        <button type="submit" class="btn btn-accent">Summarize</button>
+    </form>
+</div>
+{% endblock %}

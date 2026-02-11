@@ -1,0 +1,8 @@
+msal==1.31.0
+requests==2.32.3
+flask==3.1.0
+openai==1.59.0
+python-dotenv==1.0.1
+fpdf2==2.8.2
+markdown==3.7
+waitress==3.0.2
