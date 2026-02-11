@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}My Meetings - AYA{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2>My Teams Meetings</h2>
+    {% if user %}
+        <p style="color: var(--text-light); margin-bottom: 1rem;">
+            Signed in as <strong>{{ user.get('displayName', 'User') }}</strong>
+            ({{ user.get('mail', user.get('userPrincipalName', '')) }})
+        </p>
+    {% endif %}
+
+    {% if events %}
+        {% for event in events %}
+        <div class="meeting-item">
+            <div class="meeting-info">
+                <h3>{{ event.get('subject', 'Untitled Meeting') }}</h3>
+                <span class="meta">
+                    {{ event.get('start', {}).get('dateTime', '')[:16] | replace('T', ' ') }}
+                    &mdash;
+                    {{ event.get('end', {}).get('dateTime', '')[:16] | replace('T', ' ') }}
+                    &bull;
+                    Organizer: {{ event.get('organizer', {}).get('emailAddress', {}).get('name', 'Unknown') }}
+                </span>
+            </div>
+            <a href="{{ url_for('summarize', event_index=loop.index0) }}" class="btn btn-accent btn-sm">
+                Summarize
+            </a>
+        </div>
+        {% endfor %}
+    {% else %}
+        <p style="color: var(--text-light); padding: 2rem 0; text-align: center;">
+            No Teams meetings found. Make sure you have recent online meetings with transcription enabled.
+        </p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>Or Paste a Transcript</h2>
+    <p style="margin-bottom: 1rem;">Don't see your meeting? You can paste a transcript or meeting notes directly.</p>
+    <a href="{{ url_for('summarize_text') }}" class="btn btn-outline">Paste Transcript</a>
+</div>
+{% endblock %}

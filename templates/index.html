@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="hero">
+    <h1>AYA Meeting Summarizer</h1>
+    <p>Automatically summarize your Microsoft Teams meetings with AI</p>
+
+    {% if authenticated %}
+        <a href="{{ url_for('meetings') }}" class="btn btn-primary">View My Meetings</a>
+        <a href="{{ url_for('summarize_text') }}" class="btn btn-outline" style="margin-left: 0.5rem;">Paste a Transcript</a>
+    {% else %}
+        <a href="{{ url_for('login') }}" class="btn btn-primary">Sign in with Microsoft</a>
+    {% endif %}
+
+    <div class="features">
+        <div class="feature">
+            <h3>Auto-Capture</h3>
+            <p>Fetches meeting transcripts and chat messages directly from Microsoft Teams via Graph API.</p>
+        </div>
+        <div class="feature">
+            <h3>AI Summarization</h3>
+            <p>Uses GPT-4o to generate structured summaries with key points, decisions, and action items.</p>
+        </div>
+        <div class="feature">
+            <h3>Export Anywhere</h3>
+            <p>Download summaries as PDF, Markdown, or plain text for sharing with your team.</p>
+        </div>
+        <div class="feature">
+            <h3>Paste &amp; Summarize</h3>
+            <p>Don't use Teams? Paste any meeting transcript or notes and get an instant AI summary.</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
