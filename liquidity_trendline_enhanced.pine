@@ -1,0 +1,500 @@
+// Liquidity Trendline Enhanced — High-Probability Trading System
+// Based on "Liquidity Trendline With Signals [StratifyTrade]" (CC BY-NC-SA 4.0)
+// Enhanced with: trend filters, momentum gates, volume confirmation,
+// ATR-based SL/TP, trailing stop, cooldown logic, and HTF confirmation.
+//
+// © StratifyTrade (original concept) — Enhancements by trading system analysis
+// License: CC BY-NC-SA 4.0
+
+//@version=5
+indicator(
+       "Liquidity Trendline Enhanced"
+     , "LT Enhanced — High Probability"
+     , overlay        = true
+     , max_lines_count = 500
+     , max_bars_back   = 5000
+     )
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ INPUTS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Core Trendline Settings ---
+grpCore = "CORE TRENDLINE"
+len     = input.int  (5     , "Pivot Lookback"       , tooltip = "Bars left/right for pivot detection"  , group = grpCore, minval = 2)
+cup     = input.color(#0044ff, "Bullish Color"        , inline = "c1", group = grpCore)
+cdn     = input.color(#ff2b00, "Bearish Color"        , inline = "c1", group = grpCore)
+space   = input.float(2     , "Zone Padding (ATR mult)", tooltip = "Trendline zone width"                , group = grpCore, step = 0.1)
+
+// --- Trend Filter ---
+grpTrend  = "TREND FILTER"
+useTrend  = input.bool (true , "Enable Trend Filter"       , group = grpTrend)
+emaFast   = input.int  (50  , "Fast EMA"                   , group = grpTrend, minval = 5)
+emaSlow   = input.int  (200 , "Slow EMA"                   , group = grpTrend, minval = 20)
+useHTF    = input.bool (true , "Enable HTF Trend Filter"    , group = grpTrend)
+htfTF     = input.timeframe("D", "Higher Timeframe"         , group = grpTrend)
+htfEmaLen = input.int  (50  , "HTF EMA Length"              , group = grpTrend, minval = 5)
+
+// --- Momentum Filter ---
+grpMom    = "MOMENTUM FILTER"
+useMom    = input.bool (true , "Enable RSI Filter"          , group = grpMom)
+rsiLen    = input.int  (14  , "RSI Length"                   , group = grpMom, minval = 2)
+rsiBullLo = input.int  (40  , "RSI Bull Min"                , group = grpMom, minval = 10)
+rsiBullHi = input.int  (70  , "RSI Bull Max"                , group = grpMom, minval = 50)
+rsiBearLo = input.int  (30  , "RSI Bear Min"                , group = grpMom, minval = 10)
+rsiBearHi = input.int  (60  , "RSI Bear Max"                , group = grpMom, minval = 30)
+
+// --- Volume Filter ---
+grpVol    = "VOLUME FILTER"
+useVol    = input.bool (true , "Enable Volume Filter"       , group = grpVol)
+volLen    = input.int  (20  , "Volume SMA Length"            , group = grpVol, minval = 5)
+volMult   = input.float(1.2 , "Volume Threshold Multiplier" , group = grpVol, step = 0.1)
+
+// --- Volatility Filter ---
+grpATR    = "VOLATILITY FILTER"
+useATRflt = input.bool (true , "Enable ATR Activity Filter"  , group = grpATR)
+atrLen    = input.int  (14  , "ATR Length"                    , group = grpATR, minval = 5)
+atrPctLen = input.int  (100 , "ATR Percentile Lookback"      , group = grpATR, minval = 20)
+atrPctThr = input.int  (30  , "ATR Percentile Threshold"     , group = grpATR, tooltip = "Reject signals when ATR is below this percentile of its own history")
+
+// --- Candle Quality ---
+grpCdl      = "CANDLE QUALITY"
+useCdlFlt   = input.bool (true , "Enable Candle Body Filter"  , group = grpCdl)
+bodyPctMin  = input.float(0.40 , "Min Body / Range Ratio"     , group = grpCdl, step = 0.05, minval = 0.1, maxval = 0.9)
+
+// --- Signal Cooldown ---
+grpCool     = "COOLDOWN"
+useCooldown = input.bool(true , "Enable Signal Cooldown"      , group = grpCool)
+coolBars    = input.int (10  , "Min Bars Between Signals"     , group = grpCool, minval = 1)
+
+// --- Risk Management ---
+grpRM      = "RISK MANAGEMENT"
+showSLTP   = input.bool (true , "Show SL / TP Levels"         , group = grpRM)
+slMult     = input.float(1.5 , "Stop Loss (ATR Multiplier)"   , group = grpRM, step = 0.1, minval = 0.5)
+tpMult     = input.float(3.0 , "Take Profit (ATR Multiplier)" , group = grpRM, step = 0.1, minval = 0.5)
+useTrail   = input.bool (true , "Enable Trailing Stop"         , group = grpRM)
+trailAct   = input.float(1.0 , "Trail Activation (ATR Mult)"  , group = grpRM, step = 0.1, tooltip = "Trailing activates after this ATR distance in favor")
+trailDist  = input.float(1.0 , "Trail Distance (ATR Mult)"    , group = grpRM, step = 0.1)
+
+// --- Display ---
+grpDisp    = "DISPLAY"
+showSignals = input.bool(true, "Show Signals"       , group = grpDisp)
+showEMA     = input.bool(true, "Show EMAs"           , group = grpDisp)
+showDash    = input.bool(true, "Show Info Dashboard" , group = grpDisp)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ CALCULATIONS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Trend ---
+ema50  = ta.ema(close, emaFast)
+ema200 = ta.ema(close, emaSlow)
+bullTrend = ema50 > ema200
+bearTrend = ema50 < ema200
+
+// --- HTF Trend ---
+htfEma   = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htfTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfBull  = htfClose > htfEma
+htfBear  = htfClose < htfEma
+
+// --- Momentum ---
+rsiVal = ta.rsi(close, rsiLen)
+
+// --- Volume ---
+volSMA   = ta.sma(volume, volLen)
+volAbove = volume > volSMA * volMult
+
+// --- Volatility ---
+atrVal = ta.atr(atrLen)
+atrPad = ta.atr(200)  // for trendline padding (original logic)
+
+// ATR percentile rank — is current ATR active enough?
+atrPctRank(src, lookback, threshold) =>
+    count = 0
+    for i = 1 to lookback
+        if src > src[i]
+            count += 1
+    rank = (count / lookback) * 100
+    rank >= threshold
+
+atrActive = atrPctRank(atrVal, atrPctLen, atrPctThr)
+
+// --- Candle Quality ---
+totalRange  = high - low
+bodySize    = math.abs(close - open)
+bodyRatio   = totalRange > 0 ? bodySize / totalRange : 0
+candleValid = bodyRatio >= bodyPctMin
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ORIGINAL TRENDLINE LOGIC (with bug fix: separated state) ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+ph = ta.pivothigh(high, len, len)
+pl = ta.pivotlow (low , len, len)
+
+type store
+    float src
+    int   n
+
+type bar
+    float o = open
+    float h = high
+    float l = low
+    float c = close
+    int   n = bar_index
+    float v = volume
+
+type draw
+    line[] upln
+    line[] dnln
+
+var store[] upbin = array.new<store>()
+var store[] dnbin = array.new<store>()
+
+var draw d = draw.new(array.new<line>(), array.new<line>())
+
+bar b = bar.new()
+
+method slope(line ln) =>
+    x = ln.get_x2() - ln.get_x1()
+    y = ln.get_y2() - ln.get_y1()
+    y / x
+
+vol() =>
+    math.min(atrPad * 0.1, close * (0.1 / 100))
+
+// FIX: Separate broken state for up and down trendlines
+var bool broken_up = false
+var bool broken_dn = false
+
+color active = na
+bool plup = false
+bool pldn = false
+
+// --- Resistance Trendline (descending pivot highs → bullish breakout) ---
+if ph
+    bool    remove = false
+    var bool valid  = false
+
+    upbin.unshift(store.new(b.h[len], b.n[len]))
+    if upbin.size() > 1
+        current = upbin.get(0)
+        before  = upbin.get(1)
+        if current.src < before.src
+            if broken_up
+                valid := true
+            else
+                valid := false
+                if upbin.size() > 3
+                    pastold = upbin.get(3)
+                    pastcur = upbin.get(2)
+                    now     = upbin.get(1)
+                    late    = upbin.get(0)
+                    if now.src < pastcur.src and now.src < pastold.src and late.src < pastcur.src and late.src < pastold.src
+                        valid := true
+                    else
+                        valid := false
+                else
+                    valid := false
+
+            if valid
+                d.upln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src                , y2 = current.src                , color = cdn))
+                d.upln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src - vol() * space, y2 = current.src - vol() * space, color = cdn))
+
+                ln = d.upln.get(1)
+                for i = 0 to (b.n - before.n)
+                    slope = ln.slope()
+                    ln.set_x2(b.n[i])
+                    ln.set_y2(ln.get_y2() - slope)
+                    if low[i] > ln.get_y2()
+                        remove := true
+                        break
+
+                if remove
+                    d.upln.get(0).delete()
+                    d.upln.get(1).delete()
+                    d.upln.clear()
+                    upbin.clear()
+                    broken_up := true
+                else
+                    d.upln.get(0).delete()
+                    d.upln.get(1).delete()
+                    d.upln.clear()
+
+                    d.upln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src                , y2 = current.src                , color = cdn))
+                    d.upln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src - vol() * space, y2 = current.src - vol() * space, color = cdn))
+
+                    linefill.new(d.upln.get(0), d.upln.get(1), color = color.new(cdn, 75))
+                    upbin.clear()
+                    broken_up := false
+
+if d.upln.size() > 1
+    btm = d.upln.get(0)
+    top = d.upln.get(1)
+
+    if b.l > top.get_y2()
+        d.upln.clear()
+        broken_up := true
+        upbin.clear()
+        plup := true
+
+    if d.upln.size() > 1
+        slup = top.slope()
+        sldn = btm.slope()
+        top.set_x2(b.n)
+        top.set_y2(top.get_y2() + slup)
+        btm.set_x2(b.n)
+        btm.set_y2(btm.get_y2() + sldn)
+
+// --- Support Trendline (ascending pivot lows → bearish breakdown) ---
+if pl
+    bool    remove = false
+    var bool valid  = false
+
+    dnbin.unshift(store.new(b.l[len], b.n[len]))
+    if dnbin.size() > 1
+        current = dnbin.get(0)
+        before  = dnbin.get(1)
+        if current.src > before.src
+            if broken_dn
+                valid := true
+            else
+                valid := false
+                if dnbin.size() > 3
+                    pastold = dnbin.get(3)
+                    pastcur = dnbin.get(2)
+                    now     = dnbin.get(1)
+                    late    = dnbin.get(0)
+                    if now.src > pastcur.src and now.src > pastold.src and late.src > pastcur.src and late.src > pastold.src
+                        valid := true
+                    else
+                        valid := false
+                else
+                    valid := false
+
+            if valid
+                d.dnln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src                , y2 = current.src                , color = cup))
+                d.dnln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src + vol() * space, y2 = current.src + vol() * space, color = cup))
+
+                ln = d.dnln.get(1)
+                for i = 0 to (b.n - before.n)
+                    slope = ln.slope()
+                    ln.set_x2(b.n[i])
+                    ln.set_y2(ln.get_y2() - slope)
+                    if high[i] < ln.get_y2()
+                        remove := true
+                        break
+
+                if remove
+                    d.dnln.get(0).delete()
+                    d.dnln.get(1).delete()
+                    d.dnln.clear()
+                    dnbin.clear()
+                    broken_dn := true
+                else
+                    d.dnln.get(0).delete()
+                    d.dnln.get(1).delete()
+                    d.dnln.clear()
+
+                    d.dnln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src                , y2 = current.src                , color = cup))
+                    d.dnln.unshift(line.new(x1 = before.n, x2 = current.n, y1 = before.src + vol() * space, y2 = current.src + vol() * space, color = cup))
+
+                    linefill.new(d.dnln.get(0), d.dnln.get(1), color = color.new(cup, 75))
+                    dnbin.clear()
+                    broken_dn := false
+
+if d.dnln.size() > 1
+    btm = d.dnln.get(0)
+    top = d.dnln.get(1)
+
+    if b.h < btm.get_y2()
+        d.dnln.clear()
+        broken_dn := true
+        dnbin.clear()
+        pldn := true
+
+    if d.dnln.size() > 1
+        slup = top.slope()
+        sldn = btm.slope()
+        top.set_x2(b.n)
+        top.set_y2(top.get_y2() + slup)
+        btm.set_x2(b.n)
+        btm.set_y2(btm.get_y2() + sldn)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ ENHANCED SIGNAL FILTERS ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Cooldown Tracking ---
+var int lastBullBar = 0
+var int lastBearBar = 0
+
+bullCooldownOK = not useCooldown or (bar_index - lastBullBar >= coolBars)
+bearCooldownOK = not useCooldown or (bar_index - lastBearBar >= coolBars)
+
+// --- Composite Filter: Long ---
+trendOKlong = not useTrend  or bullTrend
+htfOKlong   = not useHTF    or htfBull
+momOKlong   = not useMom    or (rsiVal >= rsiBullLo and rsiVal <= rsiBullHi)
+volOKlong   = not useVol    or volAbove
+atrOKlong   = not useATRflt or atrActive
+cdlOKlong   = not useCdlFlt or candleValid
+
+longConfirmed = plup and trendOKlong and htfOKlong and momOKlong and volOKlong and atrOKlong and cdlOKlong and bullCooldownOK
+
+// --- Composite Filter: Short ---
+trendOKshort = not useTrend  or bearTrend
+htfOKshort   = not useHTF    or htfBear
+momOKshort   = not useMom    or (rsiVal >= rsiBearLo and rsiVal <= rsiBearHi)
+volOKshort   = not useVol    or volAbove
+atrOKshort   = not useATRflt or atrActive
+cdlOKshort   = not useCdlFlt or candleValid
+
+shortConfirmed = pldn and trendOKshort and htfOKshort and momOKshort and volOKshort and atrOKshort and cdlOKshort and bearCooldownOK
+
+// --- Update cooldown ---
+if longConfirmed
+    lastBullBar := bar_index
+if shortConfirmed
+    lastBearBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ RISK MANAGEMENT — SL / TP / TRAILING STOP ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float longEntry   = na
+var float longSL      = na
+var float longTP      = na
+var float longTrail   = na
+var bool  longActive  = false
+
+var float shortEntry  = na
+var float shortSL     = na
+var float shortTP     = na
+var float shortTrail  = na
+var bool  shortActive = false
+
+var float highSinceEntry = na
+var float lowSinceEntry  = na
+
+// --- Long Position Management ---
+if longConfirmed and not longActive
+    longEntry  := close
+    longSL     := close - atrVal * slMult
+    longTP     := close + atrVal * tpMult
+    longTrail  := na
+    longActive := true
+    highSinceEntry := high
+
+if longActive
+    highSinceEntry := math.max(nz(highSinceEntry, high), high)
+
+    // Trailing stop activation
+    if useTrail and (highSinceEntry - longEntry) >= atrVal * trailAct
+        proposedTrail = highSinceEntry - atrVal * trailDist
+        longTrail := na(longTrail) ? proposedTrail : math.max(longTrail, proposedTrail)
+
+    // Exit conditions
+    effectiveSL = useTrail and not na(longTrail) ? math.max(longSL, longTrail) : longSL
+    if low <= effectiveSL or high >= longTP
+        longActive     := false
+        longEntry      := na
+        longSL         := na
+        longTP         := na
+        longTrail      := na
+        highSinceEntry := na
+
+// --- Short Position Management ---
+if shortConfirmed and not shortActive
+    shortEntry := close
+    shortSL    := close + atrVal * slMult
+    shortTP    := close - atrVal * tpMult
+    shortTrail := na
+    shortActive := true
+    lowSinceEntry := low
+
+if shortActive
+    lowSinceEntry := math.min(nz(lowSinceEntry, low), low)
+
+    // Trailing stop activation
+    if useTrail and (shortEntry - lowSinceEntry) >= atrVal * trailAct
+        proposedTrail = lowSinceEntry + atrVal * trailDist
+        shortTrail := na(shortTrail) ? proposedTrail : math.min(shortTrail, proposedTrail)
+
+    // Exit conditions
+    effectiveSL = useTrail and not na(shortTrail) ? math.min(shortSL, shortTrail) : shortSL
+    if high >= effectiveSL or low <= shortTP
+        shortActive    := false
+        shortEntry     := na
+        shortSL        := na
+        shortTP        := na
+        shortTrail     := na
+        lowSinceEntry  := na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ PLOTTING ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Signals ---
+plotshape(longConfirmed  and showSignals ? low  : na, "LONG" , shape.triangleup  , location.belowbar, cup, size = size.small)
+plotshape(shortConfirmed and showSignals ? high : na, "SHORT", shape.triangledown, location.abovebar, cdn, size = size.small)
+
+// --- Raw (unfiltered) signals as tiny dots for comparison ---
+plotshape(plup and not longConfirmed  and showSignals ? low  : na, "Raw Bull", shape.circle, location.belowbar, color.new(cup, 70), size = size.tiny)
+plotshape(pldn and not shortConfirmed and showSignals ? high : na, "Raw Bear", shape.circle, location.abovebar, color.new(cdn, 70), size = size.tiny)
+
+// --- EMAs ---
+plot(showEMA ? ema50  : na, "EMA Fast", color.new(#2196F3, 40), 1)
+plot(showEMA ? ema200 : na, "EMA Slow", color.new(#FF9800, 40), 1)
+
+// --- SL / TP Levels ---
+plot(showSLTP and longActive  ? longSL    : na, "Long SL"       , color.new(#ff2b00, 30), 1, plot.style_linebr)
+plot(showSLTP and longActive  ? longTP    : na, "Long TP"       , color.new(#00c853, 30), 1, plot.style_linebr)
+plot(showSLTP and longActive  ? longTrail : na, "Long Trail"    , color.new(#ff9800, 30), 1, plot.style_linebr)
+
+plot(showSLTP and shortActive ? shortSL    : na, "Short SL"     , color.new(#ff2b00, 30), 1, plot.style_linebr)
+plot(showSLTP and shortActive ? shortTP    : na, "Short TP"     , color.new(#00c853, 30), 1, plot.style_linebr)
+plot(showSLTP and shortActive ? shortTrail : na, "Short Trail"  , color.new(#ff9800, 30), 1, plot.style_linebr)
+
+// --- Entry Level ---
+plot(showSLTP and longActive  ? longEntry  : na, "Long Entry"   , color.new(#2196F3, 50), 1, plot.style_linebr)
+plot(showSLTP and shortActive ? shortEntry : na, "Short Entry"  , color.new(#2196F3, 50), 1, plot.style_linebr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ░░░ DASHBOARD ░░░
+// ══════════════════════════════════════════════════════════════════════════════
+
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 10, bgcolor = color.new(#1e1e1e, 10), border_color = color.new(#333, 0), border_width = 1)
+
+    txtColor = color.white
+    dash.cell(0, 0, "Filter"           , text_color = color.gray , text_size = size.small)
+    dash.cell(1, 0, "Status"           , text_color = color.gray , text_size = size.small)
+
+    dash.cell(0, 1, "Trend (EMA)"      , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 1, bullTrend ? "BULL" : bearTrend ? "BEAR" : "FLAT", text_color = bullTrend ? #00c853 : bearTrend ? #ff2b00 : color.gray, text_size = size.small)
+
+    dash.cell(0, 2, "HTF Trend"        , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 2, htfBull ? "BULL" : htfBear ? "BEAR" : "FLAT", text_color = htfBull ? #00c853 : htfBear ? #ff2b00 : color.gray, text_size = size.small)
+
+    dash.cell(0, 3, "RSI (" + str.tostring(rsiLen) + ")", text_color = txtColor, text_size = size.small)
+    dash.cell(1, 3, str.tostring(rsiVal, "#.0")          , text_color = rsiVal > 60 ? #ff9800 : rsiVal < 40 ? #2196F3 : color.gray, text_size = size.small)
+
+    dash.cell(0, 4, "Volume"           , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 4, volAbove ? "ABOVE AVG" : "BELOW AVG", text_color = volAbove ? #00c853 : color.gray, text_size = size.small)
+
+    dash.cell(0, 5, "ATR Activity"     , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 5, atrActive ? "ACTIVE" : "LOW", text_color = atrActive ? #00c853 : color.gray, text_size = size.small)
+
+    dash.cell(0, 6, "Candle Quality"   , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 6, candleValid ? "VALID" : "WEAK", text_color = candleValid ? #00c853 : color.gray, text_size = size.small)
+
+    dash.cell(0, 7, "Position"         , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 7, longActive ? "LONG" : shortActive ? "SHORT" : "NONE", text_color = longActive ? #00c853 : shortActive ? #ff2b00 : color.gray, text_size = size.small)
+
+    dash.cell(0, 8, "Cooldown (L/S)"   , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 8, (bullCooldownOK ? "OK" : "WAIT") + " / " + (bearCooldownOK ? "OK" : "WAIT"), text_color = (bullCooldownOK and bearCooldownOK) ? #00c853 : #ff9800, text_size = size.small)
+
+    dash.cell(0, 9, "Signal"           , text_color = txtColor   , text_size = size.small)
+    dash.cell(1, 9, longConfirmed ? "LONG" : shortConfirmed ? "SHORT" : "—", text_color = longConfirmed ? #00c853 : shortConfirmed ? #ff2b00 : color.gray, text_size = size.small)
