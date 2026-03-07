@@ -6,7 +6,7 @@
 // © StratifyTrade (original concept) — Enhancements by trading system analysis
 // License: CC BY-NC-SA 4.0
 
-//@version=5
+//@version=6
 indicator(
        "Liquidity Trendline Enhanced"
      , "LT Enhanced — High Probability"
