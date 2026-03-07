@@ -93,8 +93,7 @@ bullTrend = ema50 > ema200
 bearTrend = ema50 < ema200
 
 // --- HTF Trend ---
-htfEma   = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
-htfClose = request.security(syminfo.tickerid, htfTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+[htfEma, htfClose] = request.security(syminfo.tickerid, htfTF, [ta.ema(close, htfEmaLen), close], barmerge.gaps_off, barmerge.lookahead_off)
 htfBull  = htfClose > htfEma
 htfBear  = htfClose < htfEma
 
