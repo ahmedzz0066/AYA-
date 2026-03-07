@@ -137,12 +137,12 @@ type store
     int   n
 
 type bar
-    float o = open
-    float h = high
-    float l = low
-    float c = close
-    int   n = bar_index
-    float v = volume
+    float o = na
+    float h = na
+    float l = na
+    float c = na
+    int   n = 0
+    float v = na
 
 type draw
     line[] upln
@@ -153,7 +153,7 @@ var store[] dnbin = array.new<store>()
 
 var draw d = draw.new(array.new<line>(), array.new<line>())
 
-bar b = bar.new()
+bar b = bar.new(open, high, low, close, bar_index, volume)
 
 method slope(line ln) =>
     x = ln.get_x2() - ln.get_x1()
