@@ -1,0 +1,254 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BigBeluga
+//@version=5
+indicator("Volumatic S/R Levels [BigBeluga]", overlay = true, max_lines_count = 500, max_labels_count = 20)
+
+// =====================================================================================================================}
+// ＩＮＰＵＴＳ
+// ====================================================================================================================={
+
+float  level         = input.float(2.4, "Levels Strength", step = 0.1,
+                       tooltip = "Define Volume of Levels (Higher Input = Higher Volume of Level)")
+int    line_amount   = input.int(10, "Levels Amount", maxval = 20)
+float  rel_vol_mult  = input.float(1.5, "Min Relative Volume", step = 0.1, minval = 0.5, maxval = 5.0,
+                       tooltip = "Minimum ratio of bar volume to its 20-bar average. Filters low-volume false signals.")
+bool   prox_filter   = input.bool(true, "Proximity Filter",
+                       tooltip = "Prevents new levels from being created too close to existing ones.")
+float  prox_atr_mult = input.float(0.5, "Proximity ATR Mult", step = 0.1, minval = 0.1,
+                       tooltip = "Minimum ATR distance required between levels. Higher = fewer, more separated levels.")
+bool   wick_refine   = input.bool(true, "Wick-Refined Placement",
+                       tooltip = "Uses bar wicks to place levels at more accurate price turning points.")
+
+var bar_hl2  = float(na)
+var volume_  = float(na)
+var color_up = #00e677d8
+var color_dn = #f18a45
+var neutral  = color.gray
+
+var line_a    = array.new_line(line_amount, line(na))
+var label_a   = array.new_label(line_amount, label(na))
+var box_a     = array.new_box(line_amount, box(na))
+var vol_ume   = array.new_float(line_amount, float(na))
+var vol_perc  = array.new_float(line_amount, float(na))
+var cross_cnt = array.new_int(line_amount, 0)   // ★ per-level cross counter (replaces buggy global counter)
+
+// =====================================================================================================================}
+// ＣＡＬＣＵＬＡＴＩＯＮＳ
+// ====================================================================================================================={
+
+// @function       Z-score normalisation
+// @param src      (float) Source value
+// @returns        (float) Normalised value
+method norm(float src) =>
+    (src - ta.sma(src, 200)) / ta.stdev(src, 200)
+
+// ── Bar anatomy ──────────────────────────────────────────────────────────────
+series float body       = math.abs(close - open)
+series float upper_wick = high  - math.max(close, open)
+series float lower_wick = math.min(close, open) - low
+
+// ── Normalised signals ───────────────────────────────────────────────────────
+norm_vol = (close > open ? volume : -volume).norm()
+norm     = (close - open).norm()
+
+// ── Relative volume: bar volume vs its 20-bar SMA ───────────────────────────
+rel_vol  = volume / ta.sma(volume, 20)
+
+// ── ATR ──────────────────────────────────────────────────────────────────────
+atr14  = ta.atr(14)
+atr200 = ta.atr(200)
+
+// ★ FIX: line_width was negative for bearish bars (norm_vol < 0) which inverted
+//        box top/bottom.  Always take the absolute value before scaling.
+line_width = int(math.max(1, math.round(math.abs(norm_vol) * (atr200 * 0.1))))
+
+// @function       Returns true when candidate_price is far enough from all
+//                 existing levels (proximity de-duplication filter).
+// @param A             (array<line>) Current level lines
+// @param candidate     (float)       Price of the proposed new level
+// @param min_dist      (float)       Minimum required separation
+// @returns        (bool) true = level is valid / not a duplicate
+method not_too_close(array<line> A, float candidate, float min_dist) =>
+    result = true
+    if A.size() > 0
+        for i = 0 to A.size() - 1
+            existing = line.get_y1(A.get(i))
+            if not na(existing) and math.abs(candidate - existing) < min_dist
+                result := false
+                break
+    result
+
+// @function       Tracks crosses per level and updates each line's style to
+//                 reflect how many times price has broken through it.
+//                 Solid (0 crosses) → Dashed (1 cross) → Dotted (2+ crosses)
+// @param A        (array<line>)  Level lines
+// @param cnt      (array<int>)   Per-level cross counter
+// @param src      (float)        Price series (close)
+// @param crs      (bool)         true = check downward cross; false = upward
+method check_cross(array<line> A, array<int> cnt, float src, bool crs) =>
+    if A.size() > 0
+        for i = 0 to A.size() - 1
+            if i < A.size()
+                line_id      = A.get(i)
+                current_line = line.get_y2(line_id)
+
+                bool cross = crs
+                           ? src < current_line and src[1] >= current_line
+                           : src > current_line and src[1] <= current_line
+
+                if cross
+                    new_count = cnt.get(i) + 1
+                    cnt.set(i, new_count)
+                    line.set_color(line_id, crs ? color_dn : color_up)
+                    // Degrade style with each break to show weakening S/R
+                    if new_count >= 2
+                        line.set_width(line_id, 2)
+                        line.set_style(line_id, line.style_dotted)
+                    else if new_count == 1
+                        line.set_width(line_id, 2)
+                        line.set_style(line_id, line.style_dashed)
+
+// @function       Computes the level price, optionally refined by wick analysis.
+//                 Support (bullish): anchors to lower-wick midpoint when wick is
+//                 significant, capturing where buyers actually stepped in.
+//                 Resistance (bearish): anchors to upper-wick midpoint.
+// @param is_bullish (bool) true = support level; false = resistance level
+// @returns        (float) Refined level price
+get_level_price(bool is_bullish) =>
+    mid = (open + close) / 2
+    if wick_refine
+        if is_bullish
+            // Significant lower wick → buyers defended near low; use wick midpoint
+            lower_wick > body * 0.5 ? low + lower_wick * 0.5 : mid
+        else
+            // Significant upper wick → sellers rejected near high; use wick midpoint
+            upper_wick > body * 0.5 ? high - upper_wick * 0.5 : mid
+    else
+        mid
+
+// @function       Draws a line on the chart
+// @param color       (color) Colour of the line
+// @param transperent (int)   Transparency level
+// @param width       (int)   Width of the line
+// @returns        (line) Line object created
+method draw_line(color color, transperent = 20, width) =>
+    line.new(bar_index, bar_hl2, bar_index, bar_hl2,
+             color = color.new(color, transperent), width = width)
+
+// @function       Draws a label on the chart
+// @param volume_  (float) Volume value to display
+// @param color    (color) Colour of the label text
+// @returns        (label) Label object created
+method draw_lable(float volume_, x, y, color) =>
+    label_a.push(label.new(x + 15, y,
+                     text      = str.tostring(volume_, format.percent),
+                     textcolor = color,
+                     style     = label.style_label_left,
+                     color     = #363a4500,
+                     size      = size.small))
+
+// @function       Draws a box on the chart
+// @param vol      (float) Volume value to display
+// @param color    (color) Colour of the box text
+// @returns        (box) Box object created
+method draw_box(float vol, color) =>
+    box.new(bar_index, bar_hl2 + line_width, bar_index, bar_hl2 - line_width,
+                     border_color = color.new(neutral, 80),
+                     border_width = 1,
+                     bgcolor      = color.new(neutral, 90),
+                     text         = str.tostring(vol, format.volume),
+                     text_size    = size.small,
+                     text_color   = color,
+                     text_halign  = text.align_right,
+                     text_valign  = text.align_center)
+
+// ── Signal condition ─────────────────────────────────────────────────────────
+// ★ IMPROVEMENT: added rel_vol >= rel_vol_mult to require above-average volume.
+//   This eliminates many low-conviction false signals that satisfy the
+//   normalised thresholds purely by chance on thin-volume bars.
+condition = norm > level and norm_vol > level and rel_vol >= rel_vol_mult
+          ? color_up
+          : norm < -level and norm_vol < -level and rel_vol >= rel_vol_mult
+          ? color_dn
+          : na
+
+// ── Level creation ───────────────────────────────────────────────────────────
+
+// Positive (support) Volume Levels
+if not na(condition) and norm > 0
+    candidate_price = get_level_price(true)
+    // ★ IMPROVEMENT: only draw level when it is not a duplicate of a nearby one
+    if not prox_filter or line_a.not_too_close(candidate_price, prox_atr_mult * atr14)
+        bar_hl2  := candidate_price
+        volume_  := close > open ? volume : -volume
+        line_a.push(condition.draw_line(20, 2))
+        vol_ume.push(volume)
+        box_a.push(volume_.draw_box(condition))
+        cross_cnt.push(0)
+
+// Negative (resistance) Volume Levels
+if not na(condition) and norm < 0
+    candidate_price = get_level_price(false)
+    if not prox_filter or line_a.not_too_close(candidate_price, prox_atr_mult * atr14)
+        bar_hl2  := candidate_price
+        volume_  := close > open ? volume : -volume
+        vol_ume.push(volume)
+        line_a.push(condition.draw_line(20, 2))
+        box_a.push(volume_.draw_box(condition))
+        cross_cnt.push(0)
+
+// ── Extend lines and update labels ───────────────────────────────────────────
+n         = last_bar_index + 15
+isAllowed = (last_bar_index - bar_index) < 1000
+
+if isAllowed
+    // ★ IMPROVEMENT: pass per-level cross_cnt so each line's break count is
+    //   tracked independently (original used a single shared counter for all lines)
+    line_a.check_cross(cross_cnt, close, true)
+    line_a.check_cross(cross_cnt, close, false)
+
+    for i = 0 to line_a.size() - 1
+        volum_perc   = vol_ume.get(i) / vol_ume.sum() * 100
+        vol_perc.push(volum_perc)
+        current_line = line_a.get(i)
+        current_box  = box_a.get(i)
+        current_line.set_x2(n)
+        current_box.set_right(n + 20)
+
+        volum_perc.draw_lable(n + 5, line.get_y1(current_line),
+                               vol_perc.max() == volum_perc ? #008cff :
+                               vol_perc.min() == volum_perc ? color_dn :
+                               color.from_gradient(volum_perc, 0, 10, color_dn, color_up))
+        label.delete(array.shift(label_a))
+
+        if vol_perc.size() > line_amount
+            vol_perc.shift()
+
+// =====================================================================================================================}
+// ＰＬＯＴ
+// ====================================================================================================================={
+
+barcolor(isAllowed ? condition : na)
+
+line_arr = line.all
+if line_arr.size() > line_amount
+    line.delete(line_arr.shift())
+
+a_allBoxes = box.all
+if array.size(a_allBoxes) > line_amount
+    box.delete(array.shift(a_allBoxes))
+
+if vol_ume.size() > line_amount
+    vol_ume.shift()
+    line_a.shift()
+    box_a.shift()
+    cross_cnt.shift()   // keep cross_cnt in sync with line_a
+
+var dash = table.new(position.top_right, 10, 10, frame_color = neutral, frame_width = 1)
+dash.cell(0, 0, "Max Level", text_color = chart.fg_color)
+dash.cell(1, 0, str.tostring(vol_perc.max(), format.percent), text_color = #008cff)
+dash.cell(2, 0, str.tostring(vol_ume.max(), format.volume),   text_color = neutral)
+dash.cell(0, 1, "Min Level", text_color = chart.fg_color)
+dash.cell(1, 1, str.tostring(vol_perc.min(), format.percent), text_color = color_dn)
+dash.cell(2, 1, str.tostring(vol_ume.min(), format.volume),   text_color = neutral)
+// =====================================================================================================================}
