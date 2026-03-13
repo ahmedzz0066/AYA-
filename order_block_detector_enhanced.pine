@@ -334,7 +334,7 @@ plot(bear_ob, 'Bear OB', bear_css, 2, plot.style_linebr
 //──────────────────────────────────────────────────────────────────────────────
 // ALERTS
 //──────────────────────────────────────────────────────────────────────────────
-alertcondition(bull_ob,        'Bullish OB Formed',    'Bullish order block detected')
-alertcondition(bear_ob,        'Bearish OB Formed',    'Bearish order block detected')
-alertcondition(mitigated_bull, 'Bullish OB Mitigated', 'Bullish order block mitigated')
-alertcondition(mitigated_bear, 'Bearish OB Mitigated', 'Bearish order block mitigated')
+alertcondition(not na(bull_ob), 'Bullish OB Formed',    'Bullish order block detected')
+alertcondition(not na(bear_ob), 'Bearish OB Formed',    'Bearish order block detected')
+alertcondition(mitigated_bull,  'Bullish OB Mitigated', 'Bullish order block mitigated')
+alertcondition(mitigated_bear,  'Bearish OB Mitigated', 'Bearish order block mitigated')
