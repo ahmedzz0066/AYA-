@@ -252,8 +252,8 @@ bear_ob_btm = use_body ? math.min(open[length], close[length]) : hl2[length]
 ob_body = math.abs(close[length] - open[length])
 str_val = f_strength(volume[length], vol_ma, ob_body, atr)
 
-bull_cond = phv and os == 1 and vol_ok and atr_ok and bull_disp_ok
-bear_cond = phv and os == 0 and vol_ok and atr_ok and bear_disp_ok
+bull_cond = not na(phv) and os == 1 and vol_ok and atr_ok and bull_disp_ok
+bear_cond = not na(phv) and os == 0 and vol_ok and atr_ok and bear_disp_ok
 
 //──────────────────────────────────────────────────────────────────────────────
 // FAIR VALUE GAPS
@@ -300,30 +300,24 @@ if show_fvg
 // GET OB ARRAYS
 //──────────────────────────────────────────────────────────────────────────────
 
-[bull_top, bull_btm, bull_avg, bull_lft, bull_str, bull_ob] =
-    f_get_ob(bull_cond, bull_ob_top, bull_ob_btm, low[length], str_val)
+[bull_top, bull_btm, bull_avg, bull_lft, bull_str, bull_ob] = f_get_ob(bull_cond, bull_ob_top, bull_ob_btm, low[length], str_val)
 
-[bear_top, bear_btm, bear_avg, bear_lft, bear_str, bear_ob] =
-    f_get_ob(bear_cond, bear_ob_top, bear_ob_btm, high[length], str_val)
+[bear_top, bear_btm, bear_avg, bear_lft, bear_str, bear_ob] = f_get_ob(bear_cond, bear_ob_top, bear_ob_btm, high[length], str_val)
 
 //──────────────────────────────────────────────────────────────────────────────
 // REMOVE MITIGATED OBs
 //──────────────────────────────────────────────────────────────────────────────
 
-[mitigated_bull, mit_bull_top, mit_bull_btm, mit_bull_lft] =
-    f_remove_mit(bull_top, bull_btm, bull_avg, bull_lft, bull_str, target_bull, true)
+[mitigated_bull, mit_bull_top, mit_bull_btm, mit_bull_lft] = f_remove_mit(bull_top, bull_btm, bull_avg, bull_lft, bull_str, target_bull, true)
 
-[mitigated_bear, mit_bear_top, mit_bear_btm, mit_bear_lft] =
-    f_remove_mit(bear_top, bear_btm, bear_avg, bear_lft, bear_str, target_bear, false)
+[mitigated_bear, mit_bear_top, mit_bear_btm, mit_bear_lft] = f_remove_mit(bear_top, bear_btm, bear_avg, bear_lft, bear_str, target_bear, false)
 
 //──────────────────────────────────────────────────────────────────────────────
 // DISPLAY
 //──────────────────────────────────────────────────────────────────────────────
 
-f_draw_ob(bull_top, bull_btm, bull_avg, bull_lft, bull_str
-  , bull_ext_last, bg_bull_css, bull_css, bull_avg_css, true)
-f_draw_ob(bear_top, bear_btm, bear_avg, bear_lft, bear_str
-  , bear_ext_last, bg_bear_css, bear_css, bear_avg_css, false)
+f_draw_ob(bull_top, bull_btm, bull_avg, bull_lft, bull_str, bull_ext_last, bg_bull_css, bull_css, bull_avg_css, true)
+f_draw_ob(bear_top, bear_btm, bear_avg, bear_lft, bear_str, bear_ext_last, bg_bear_css, bear_css, bear_avg_css, false)
 
 // Mitigated bull OB → bearish breaker; mitigated bear OB → bullish breaker
 f_draw_brk(mit_bull_top, mit_bull_btm, mit_bull_lft, brk_ext_last, brk_bear_css)
