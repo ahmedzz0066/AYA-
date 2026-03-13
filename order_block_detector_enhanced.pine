@@ -1,6 +1,6 @@
 // This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
 // © LuxAlgo — Enhanced Liquidity Engineering Edition
-//@version=5
+//@version=6
 indicator("Order Block Detector [LuxAlgo] Enhanced"
   , overlay          = true
   , max_boxes_count  = 500
@@ -45,8 +45,6 @@ atr_min_mult  = input.float (0.3,   'Min OB Candle Size (x ATR)', minval = 0.05,
 show_strength = input.bool  (true,  'Show Strength Labels',                                            group = grp_filt)
 
 // ── Mitigation ───────────────────────────────────────────────────────────────
-// '50% Body' = OB is mitigated only when price trades through its midpoint
-// This dramatically reduces false mitigation vs pure wick method
 mitigation    = input.string('50% Body', 'Mitigation Method',
   options = ['Wick', 'Close', '50% Body'],                                                             group = grp_mit)
 
@@ -70,30 +68,27 @@ line_width    = input.int   (1,    'Midline Width',          minval = 1,        
 // FUNCTIONS
 //──────────────────────────────────────────────────────────────────────────────
 
-// Map style string to Pine line style constant
 f_line_style(s) =>
     switch s
         '⎯⎯⎯' => line.style_solid
         '----' => line.style_dashed
         '····' => line.style_dotted
 
-// Strength score 0–100 combining:
-//   · Volume ratio vs its moving average     (0–50 pts)
-//   · OB candle body size relative to ATR    (0–50 pts)
-// Higher = more institutional conviction behind the OB
+// Strength score 0–100:
+//   · Volume ratio vs MA  (0–50 pts)
+//   · Body size vs ATR    (0–50 pts)
 f_strength(vol, vol_avg, body, atr) =>
     vol_score  = math.min(vol / math.max(vol_avg, 1) * 50, 50)
     body_score = math.min(body / math.max(atr, syminfo.mintick) * 50, 50)
     int(math.round(vol_score + body_score))
 
-// Accumulate OB coordinates into persistent arrays.
-// Each call-site (bull vs bear) maintains its own independent var arrays.
+// Accumulate OB coordinates. Each call-site keeps its own var arrays.
 f_get_ob(cond, top_val, btm_val, entry_val, str_val) =>
-    var ob_top = array.new_float(0)
-    var ob_btm = array.new_float(0)
-    var ob_avg = array.new_float(0)
-    var ob_lft = array.new_int  (0)
-    var ob_str = array.new_int  (0)
+    var ob_top = array.new<float>(0)
+    var ob_btm = array.new<float>(0)
+    var ob_avg = array.new<float>(0)
+    var ob_lft = array.new<int>  (0)
+    var ob_str = array.new<int>  (0)
     float ob   = na
     if cond
         array.unshift(ob_top, top_val)
@@ -104,13 +99,12 @@ f_get_ob(cond, top_val, btm_val, entry_val, str_val) =>
         ob := entry_val
     [ob_top, ob_btm, ob_avg, ob_lft, ob_str, ob]
 
-// Remove mitigated OBs from the coordinate arrays.
-// Iterates BACKWARDS to avoid index-shift bugs during removal.
-// Records mitigated zones as breaker blocks (role-reversal principle).
+// Remove mitigated OBs. Iterates backwards to avoid index-shift bugs.
+// Records mitigated zones for breaker block display.
 f_remove_mit(ob_top, ob_btm, ob_avg, ob_lft, ob_str, target, is_bull) =>
-    var mit_top = array.new_float(0)
-    var mit_btm = array.new_float(0)
-    var mit_lft = array.new_int  (0)
+    var mit_top = array.new<float>(0)
+    var mit_btm = array.new<float>(0)
+    var mit_lft = array.new<int>  (0)
     mitigated   = false
     if array.size(ob_top) > 0
         for i = array.size(ob_top) - 1 to 0
@@ -118,10 +112,6 @@ f_remove_mit(ob_top, ob_btm, ob_avg, ob_lft, ob_str, target, is_bull) =>
             b   = array.get(ob_btm, i)
             mid = math.avg(t, b)
             ref = is_bull ? b : t
-            // Mitigation logic:
-            // · Wick     → any wick beyond the OB edge
-            // · Close    → a closing price beyond the OB edge
-            // · 50% Body → price trades through the OB midpoint (ICT OTE)
             hit = switch mitigation
                 'Close'    => is_bull ? close < ref  : close > ref
                 '50% Body' => is_bull ? target < mid : target > mid
@@ -129,11 +119,9 @@ f_remove_mit(ob_top, ob_btm, ob_avg, ob_lft, ob_str, target, is_bull) =>
             if hit
                 mitigated := true
                 if show_breakers
-                    // A mitigated bull OB becomes a bearish breaker & vice-versa
                     array.unshift(mit_top, t)
                     array.unshift(mit_btm, b)
                     array.unshift(mit_lft, array.get(ob_lft, i))
-                    // Keep only the most recent N breakers
                     if array.size(mit_top) > brk_ext_last
                         array.pop(mit_top)
                         array.pop(mit_btm)
@@ -145,12 +133,11 @@ f_remove_mit(ob_top, ob_btm, ob_avg, ob_lft, ob_str, target, is_bull) =>
                 array.remove(ob_str, i)
     [mitigated, mit_top, mit_btm, mit_lft]
 
-// Draw OB boxes, midlines, and strength labels using pre-allocated objects.
-// Pre-allocation on barstate.isfirst avoids creating new objects every bar.
+// Draw OB boxes, midlines, and strength labels (pre-allocated pattern).
 f_draw_ob(ob_top, ob_btm, ob_avg, ob_lft, ob_str, n_max, bg_css, bdr_css, avg_css, is_bull) =>
-    var boxes  = array.new_box  (0)
-    var lines  = array.new_line (0)
-    var labels = array.new_label(0)
+    var boxes  = array.new<box>  (0)
+    var lines  = array.new<line> (0)
+    var labels = array.new<label>(0)
     if barstate.isfirst
         for i = 0 to n_max - 1
             array.unshift(boxes, box.new(na, na, na, na
@@ -184,17 +171,17 @@ f_draw_ob(ob_top, ob_btm, ob_avg, ob_lft, ob_str, n_max, bg_css, bdr_css, avg_cs
                 line.set_xy1(array.get(lines, i), l,     a)
                 line.set_xy2(array.get(lines, i), l + 1, a)
                 if show_strength
-                    tag = s >= 75 ? '■ Strong ' + str.tostring(s) + '%'
-                        : s >= 50 ? '▪ Medium ' + str.tostring(s) + '%'
-                        :           '· Weak '   + str.tostring(s) + '%'
+                    // v6: use switch instead of chained multiline ternary
+                    tag = switch
+                        s >= 75 => '■ Strong ' + str.tostring(s) + '%'
+                        s >= 50 => '▪ Medium ' + str.tostring(s) + '%'
+                        =>         '· Weak '   + str.tostring(s) + '%'
                     label.set_xy  (array.get(labels, i), l, is_bull ? b : t)
                     label.set_text(array.get(labels, i), tag)
 
-// Draw breaker blocks (role-reversed OBs) using pre-allocated boxes.
-// Mitigated bull OB → bearish breaker (resistance-turned-support flipped back).
-// Mitigated bear OB → bullish breaker (support-turned-resistance flipped back).
+// Draw breaker blocks (pre-allocated).
 f_draw_brk(mit_top, mit_btm, mit_lft, n_max, css) =>
-    var brk_boxes = array.new_box(0)
+    var brk_boxes = array.new<box>(0)
     if barstate.isfirst and show_breakers
         for i = 0 to n_max - 1
             array.unshift(brk_boxes, box.new(na, na, na, na
@@ -210,9 +197,9 @@ f_draw_brk(mit_top, mit_btm, mit_lft, n_max, css) =>
                 box.set_lefttop    (array.get(brk_boxes, i), array.get(mit_lft, i), array.get(mit_top, i))
                 box.set_rightbottom(array.get(brk_boxes, i), array.get(mit_lft, i), array.get(mit_btm, i))
 
-// Draw Fair Value Gap boxes using pre-allocated objects.
+// Draw Fair Value Gap boxes (pre-allocated).
 f_draw_fvg(fvg_top, fvg_btm, fvg_lft, n_max, css) =>
-    var fvg_boxes = array.new_box(0)
+    var fvg_boxes = array.new<box>(0)
     if barstate.isfirst and show_fvg
         for i = 0 to n_max - 1
             array.unshift(fvg_boxes, box.new(na, na, na, na
@@ -241,70 +228,44 @@ var target_bear = 0.
 upper = ta.highest(length)
 lower = ta.lowest(length)
 
-// Market structure: os=0 → uptrend (bearish OB context), os=1 → downtrend (bullish OB context)
 os := high[length] > upper ? 0 : low[length] < lower ? 1 : os[1]
 
-// Volume pivot high at the order block candle
 phv = ta.pivothigh(volume, length, length)
 
-// ── Mitigation targets ───────────────────────────────────────────────────────
 target_bull := mitigation == 'Close' ? ta.lowest(close, length)  : lower
 target_bear := mitigation == 'Close' ? ta.highest(close, length) : upper
 
-// ── Volume filter ────────────────────────────────────────────────────────────
-// Only mark OBs where the pivot candle had above-average institutional volume
-vol_ok = not vol_filter or volume[length] > vol_ma
+vol_ok = not vol_filter    or volume[length] > vol_ma
+atr_ok = not atr_size_filt or (high[length] - low[length]) >= atr_min_mult * atr
 
-// ── ATR size filter ──────────────────────────────────────────────────────────
-// Only mark OBs where the candle range is notable relative to recent volatility
-ob_range = high[length] - low[length]
-atr_ok   = not atr_size_filt or ob_range >= atr_min_mult * atr
-
-// ── Displacement confirmation ────────────────────────────────────────────────
-// The candle AFTER the OB must show strong directional momentum:
-//   • Bullish OB (downtrend pivot) → next candle must close up with large range
-//   • Bearish OB (uptrend pivot)   → next candle must close down with large range
-// This filters out low-conviction pivots that lack follow-through
 bull_disp_ok = not disp_filter or (close > open and (high - low) >= disp_mult * atr)
 bear_disp_ok = not disp_filter or (close < open and (high - low) >= disp_mult * atr)
 
-// ── OB zone boundaries ───────────────────────────────────────────────────────
-// Body-based zones focus on the actual traded area, not the wicks.
-// This gives tighter, higher-probability entry zones (ICT concept).
-//
-// Bullish OB: last bearish (down-close) candle before an up impulse
+// Bullish OB: last down-close candle before an up impulse
 bull_ob_top = use_body ? math.max(open[length], close[length]) : hl2[length]
 bull_ob_btm = use_body ? math.min(open[length], close[length]) : low[length]
-//
-// Bearish OB: last bullish (up-close) candle before a down impulse
+
+// Bearish OB: last up-close candle before a down impulse
 bear_ob_top = use_body ? math.max(open[length], close[length]) : high[length]
 bear_ob_btm = use_body ? math.min(open[length], close[length]) : hl2[length]
 
-// Strength calculation inputs
 ob_body = math.abs(close[length] - open[length])
 str_val = f_strength(volume[length], vol_ma, ob_body, atr)
 
-// ── Final OB conditions ──────────────────────────────────────────────────────
-// Bullish OB: volume pivot during downtrend structure + volume + size + displacement
 bull_cond = phv and os == 1 and vol_ok and atr_ok and bull_disp_ok
-// Bearish OB: volume pivot during uptrend structure + volume + size + displacement
 bear_cond = phv and os == 0 and vol_ok and atr_ok and bear_disp_ok
 
 //──────────────────────────────────────────────────────────────────────────────
-// FAIR VALUE GAPS (accumulated)
+// FAIR VALUE GAPS
 //──────────────────────────────────────────────────────────────────────────────
-// A Fair Value Gap (FVG / imbalance) forms when the market moves so fast it
-// leaves a gap between candle[0].low and candle[2].high (bullish) or
-// candle[0].high and candle[2].low (bearish). These zones often get retested.
-var fvg_bull_top = array.new_float(0)
-var fvg_bull_btm = array.new_float(0)
-var fvg_bull_lft = array.new_int  (0)
-var fvg_bear_top = array.new_float(0)
-var fvg_bear_btm = array.new_float(0)
-var fvg_bear_lft = array.new_int  (0)
+var fvg_bull_top = array.new<float>(0)
+var fvg_bull_btm = array.new<float>(0)
+var fvg_bull_lft = array.new<int>  (0)
+var fvg_bear_top = array.new<float>(0)
+var fvg_bear_btm = array.new<float>(0)
+var fvg_bear_lft = array.new<int>  (0)
 
 if show_fvg
-    // Bullish FVG: current low > two-bars-ago high (upward price gap)
     if low > high[2]
         array.unshift(fvg_bull_top, low)
         array.unshift(fvg_bull_btm, high[2])
@@ -313,7 +274,6 @@ if show_fvg
             array.pop(fvg_bull_top)
             array.pop(fvg_bull_btm)
             array.pop(fvg_bull_lft)
-    // Bearish FVG: current high < two-bars-ago low (downward price gap)
     if high < low[2]
         array.unshift(fvg_bear_top, low[2])
         array.unshift(fvg_bear_btm, high)
@@ -322,7 +282,7 @@ if show_fvg
             array.pop(fvg_bear_top)
             array.pop(fvg_bear_btm)
             array.pop(fvg_bear_lft)
-    // Remove fully filled FVGs (price has traded completely through them)
+    // Remove filled FVGs
     if array.size(fvg_bull_top) > 0
         for i = array.size(fvg_bull_top) - 1 to 0
             if low <= array.get(fvg_bull_btm, i)
@@ -360,23 +320,18 @@ if show_fvg
 // DISPLAY
 //──────────────────────────────────────────────────────────────────────────────
 
-// Active Order Blocks
 f_draw_ob(bull_top, bull_btm, bull_avg, bull_lft, bull_str
   , bull_ext_last, bg_bull_css, bull_css, bull_avg_css, true)
 f_draw_ob(bear_top, bear_btm, bear_avg, bear_lft, bear_str
   , bear_ext_last, bg_bear_css, bear_css, bear_avg_css, false)
 
-// Breaker Blocks (role-reversal zones after OB mitigation)
-// Mitigated bull OB → bearish breaker (was support, now resistance)
+// Mitigated bull OB → bearish breaker; mitigated bear OB → bullish breaker
 f_draw_brk(mit_bull_top, mit_bull_btm, mit_bull_lft, brk_ext_last, brk_bear_css)
-// Mitigated bear OB → bullish breaker (was resistance, now support)
 f_draw_brk(mit_bear_top, mit_bear_btm, mit_bear_lft, brk_ext_last, brk_bull_css)
 
-// Fair Value Gaps
 f_draw_fvg(fvg_bull_top, fvg_bull_btm, fvg_bull_lft, fvg_max, fvg_bull_css)
 f_draw_fvg(fvg_bear_top, fvg_bear_btm, fvg_bear_lft, fvg_max, fvg_bear_css)
 
-// Hidden plots — expose OB values for external alert/strategy access
 plot(bull_ob, 'Bull OB', bull_css, 2, plot.style_linebr
   , offset = -length, display = display.none)
 plot(bear_ob, 'Bear OB', bear_css, 2, plot.style_linebr
