@@ -1,7 +1,7 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © mellowmichellehe — v5 rewrite: RVOL normalization, true exponential / Fibonacci / log-spaced scales,
 //   liquidity-tier pivot filtering, Z-score context, RVOL annotation on labels.
-//@version=5
+//@version=6
 
 indicator("Volume Bars and Lines", shorttitle="Volume Bars",
      format=format.volume, overlay=true,
@@ -112,26 +112,53 @@ f_thresholds(sType, base) =>
     float t8 = na
     float t9 = na
     if sType == "Linear"
-        t2 := 2.0 ;  t3 := 3.0 ;  t4 := 4.0 ;  t5 := 5.0
-        t6 := 6.0 ;  t7 := 7.0 ;  t8 := 8.0 ;  t9 := 9.0
+        t2 := 2.0
+        t3 := 3.0
+        t4 := 4.0
+        t5 := 5.0
+        t6 := 6.0
+        t7 := 7.0
+        t8 := 8.0
+        t9 := 9.0
     else if sType == "Quadratic (original)"
-        t2 := 4.0 ;  t3 := 9.0 ;  t4 := 16.0 ; t5 := 25.0
-        t6 := 36.0 ; t7 := 49.0 ; t8 := 64.0 ; t9 := 81.0
+        t2 := 4.0
+        t3 := 9.0
+        t4 := 16.0
+        t5 := 25.0
+        t6 := 36.0
+        t7 := 49.0
+        t8 := 64.0
+        t9 := 81.0
     else if sType == "True Exponential"
         // base^1, base^2, … base^8  (t1=1=base^0 already set)
-        t2 := math.pow(base, 1) ; t3 := math.pow(base, 2) ; t4 := math.pow(base, 3)
-        t5 := math.pow(base, 4) ; t6 := math.pow(base, 5) ; t7 := math.pow(base, 6)
-        t8 := math.pow(base, 7) ; t9 := math.pow(base, 8)
+        t2 := math.pow(base, 1)
+        t3 := math.pow(base, 2)
+        t4 := math.pow(base, 3)
+        t5 := math.pow(base, 4)
+        t6 := math.pow(base, 5)
+        t7 := math.pow(base, 6)
+        t8 := math.pow(base, 7)
+        t9 := math.pow(base, 8)
     else if sType == "Fibonacci"
         // 1 2 3 5 8 13 21 34 55
-        t2 := 2.0 ;  t3 := 3.0 ;  t4 := 5.0 ;  t5 := 8.0
-        t6 := 13.0 ; t7 := 21.0 ; t8 := 34.0 ; t9 := 55.0
+        t2 := 2.0
+        t3 := 3.0
+        t4 := 5.0
+        t5 := 8.0
+        t6 := 13.0
+        t7 := 21.0
+        t8 := 34.0
+        t9 := 55.0
     else  // "Log-Spaced": 10 evenly spaced points on a log₁₀ axis from 1 to 10
         // t_i = 10^((i-1)/8)  →  1.0, 1.33, 1.78, 2.37, 3.16, 4.22, 5.62, 7.50, 10.0
-        t2 := math.pow(10.0, 1.0/8.0) ; t3 := math.pow(10.0, 2.0/8.0)
-        t4 := math.pow(10.0, 3.0/8.0) ; t5 := math.pow(10.0, 4.0/8.0)
-        t6 := math.pow(10.0, 5.0/8.0) ; t7 := math.pow(10.0, 6.0/8.0)
-        t8 := math.pow(10.0, 7.0/8.0) ; t9 := 10.0
+        t2 := math.pow(10.0, 1.0/8.0)
+        t3 := math.pow(10.0, 2.0/8.0)
+        t4 := math.pow(10.0, 3.0/8.0)
+        t5 := math.pow(10.0, 4.0/8.0)
+        t6 := math.pow(10.0, 5.0/8.0)
+        t7 := math.pow(10.0, 6.0/8.0)
+        t8 := math.pow(10.0, 7.0/8.0)
+        t9 := 10.0
     [t1, t2, t3, t4, t5, t6, t7, t8, t9]
 
 [t1, t2, t3, t4, t5, t6, t7, t8, t9] = f_thresholds(scaleType, expBase)
