@@ -1,0 +1,263 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mellowmichellehe — v5 rewrite: RVOL normalization, true exponential / Fibonacci / log-spaced scales,
+//   liquidity-tier pivot filtering, Z-score context, RVOL annotation on labels.
+//@version=5
+
+indicator("Volume Bars and Lines", shorttitle="Volume Bars",
+     format=format.volume, overlay=true,
+     max_bars_back=2000, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════════════════
+var GRP_NORM  = "Volume Normalization"
+var GRP_SCALE = "Scale Thresholds"
+var GRP_LINES = "Pivot Lines"
+var GRP_STYLE = "Visual Style"
+
+// ── Normalization ─────────────────────────────────────────────────────────────
+// Relative Volume (RVOL) removes per-instrument manual calibration.
+// vol_norm = volume / SMA(volume, rvolLen)  →  1.0 = exactly average volume.
+// When RVOL is OFF the legacy absolute scale (Magnitude × Multiplier) is used.
+useRVOL  = input.bool(true, "Use Relative Volume (RVOL)",
+     tooltip="Normalise against rolling average — no manual calibration needed.",
+     group=GRP_NORM)
+rvolLen  = input.int(50,   "RVOL Lookback Period",
+     minval=2, maxval=1000, group=GRP_NORM)
+showZBg  = input.bool(false, "Tint background by Z-Score",
+     tooltip="Shades background when volume is statistically extreme (|Z|>2).",
+     group=GRP_NORM)
+
+// ── Legacy absolute scale (active only when RVOL is OFF) ──────────────────────
+smg4 = input.int(3, "Magnitude (1=×1  …  9=×100 M)", minval=1, maxval=9, group=GRP_NORM)
+smt4 = input.int(2, "Multiplier",                     minval=1, maxval=9, group=GRP_NORM)
+
+// ── Scale type ────────────────────────────────────────────────────────────────
+// Mathematical comparison of threshold spacing:
+//   Linear          : 1 2 3 4 5 6 7 8 9           (uniform steps)
+//   Quadratic (orig): 1 4 9 16 25 36 49 64 81      (n², original "exponential")
+//   True Exponential: 1 b b² b³ b⁴ b⁵ b⁶ b⁷ b⁸   (base^n, mathematically correct)
+//   Fibonacci       : 1 2 3 5 8 13 21 34 55        (fractal / natural growth)
+//   Log-Spaced      : 10^(0/8)…10^(8/8)            (perceptually uniform on log axis)
+// For RVOL mode: threshold of 2.0 means "2× average volume", etc.
+scaleType = input.string("True Exponential", "Scale Type", group=GRP_SCALE,
+     options=["Linear","Quadratic (original)","True Exponential","Fibonacci","Log-Spaced"])
+expBase   = input.float(2.0, "Exponential Base (True Exp only)",
+     minval=1.1, maxval=10.0, step=0.1, group=GRP_SCALE,
+     tooltip="2.0 → thresholds 1,2,4,8,16,32,64,128,256× avg.  1.5 → finer resolution.")
+
+// ── Pivot lines ───────────────────────────────────────────────────────────────
+res        = input.timeframe("",  "Time Frame",            group=GRP_LINES)
+pivLen     = input.int(4,         "Pivot Length",           minval=1, group=GRP_LINES)
+showLines  = input.bool(true,     "Show Lines",             group=GRP_LINES)
+showLabels = input.bool(true,     "Show Labels",            group=GRP_LINES)
+minTier    = input.int(2,         "Min Volume Tier (0–9)",
+     minval=0, maxval=9, group=GRP_LINES,
+     tooltip="0 = draw all pivots.  2 = c2 blue and above.  5 = yellow and above.  Filters low-liquidity noise.")
+
+// ── Style ─────────────────────────────────────────────────────────────────────
+lhStyle = input.string("dotted (┈)", "High Line Style", group=GRP_STYLE,
+     options=["solid (─)","dotted (┈)","dashed (╌)","arrow left (←)","arrow right (→)","arrows both (↔)"])
+llStyle = input.string("dotted (┈)", "Low Line Style",  group=GRP_STYLE,
+     options=["solid (─)","dotted (┈)","dashed (╌)","arrow left (←)","arrow right (→)","arrows both (↔)"])
+showWick = input.bool(true, "Show Heikin-Ashi Wick", group=GRP_STYLE)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLOURS  (unchanged from original — preserves user's mental model)
+// ═══════════════════════════════════════════════════════════════════════════════
+c0 = #5d606b   // tier 0 – below threshold (grey / dark)
+c1 = #64b5f6   // tier 1 – light blue
+c2 = #2196f3   // tier 2 – blue
+c3 = #81c784   // tier 3 – light green
+c4 = #4caf50   // tier 4 – green
+c5 = #fff176   // tier 5 – light yellow
+c6 = #ffeb3b   // tier 6 – yellow
+c7 = #e57373   // tier 7 – light red / orange-red
+c8 = #f44336   // tier 8 – red
+c9 = #ffffff   // tier 9 – white (extreme / climactic volume)
+ct = color.new(color.red, 100)  // transparent (suppress plotcandle border)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEIKIN-ASHI DATA (v5 API)
+// ═══════════════════════════════════════════════════════════════════════════════
+ha_t    = ticker.heikinashi(syminfo.tickerid)
+ha_low  = request.security(ha_t, res, low,   gaps=barmerge.gaps_on)
+ha_high = request.security(ha_t, res, high,  gaps=barmerge.gaps_on)
+ha_open = request.security(ha_t, res, open,  gaps=barmerge.gaps_on)
+ha_close= request.security(ha_t, res, close, gaps=barmerge.gaps_on)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BASE UNIT  (what "1× threshold" equals in raw volume terms)
+// ═══════════════════════════════════════════════════════════════════════════════
+avgVol = ta.sma(volume, rvolLen)   // rolling mean for RVOL & Z-score
+
+// Legacy absolute base (magnitude table: 10^(smg4-1) × multiplier)
+_absBase = math.pow(10.0, smg4 - 1) * smt4
+
+baseUnit = useRVOL ? avgVol : _absBase
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// THRESHOLD MULTIPLIERS  t1 … t9
+// All comparisons: vol_norm >= t_i  (where vol_norm = volume / baseUnit)
+// ═══════════════════════════════════════════════════════════════════════════════
+f_thresholds(sType, base) =>
+    // Returns [t1,t2,t3,t4,t5,t6,t7,t8,t9]
+    float t1 = 1.0
+    float t2 = na
+    float t3 = na
+    float t4 = na
+    float t5 = na
+    float t6 = na
+    float t7 = na
+    float t8 = na
+    float t9 = na
+    if sType == "Linear"
+        t2 := 2.0 ;  t3 := 3.0 ;  t4 := 4.0 ;  t5 := 5.0
+        t6 := 6.0 ;  t7 := 7.0 ;  t8 := 8.0 ;  t9 := 9.0
+    else if sType == "Quadratic (original)"
+        t2 := 4.0 ;  t3 := 9.0 ;  t4 := 16.0 ; t5 := 25.0
+        t6 := 36.0 ; t7 := 49.0 ; t8 := 64.0 ; t9 := 81.0
+    else if sType == "True Exponential"
+        // base^1, base^2, … base^8  (t1=1=base^0 already set)
+        t2 := math.pow(base, 1) ; t3 := math.pow(base, 2) ; t4 := math.pow(base, 3)
+        t5 := math.pow(base, 4) ; t6 := math.pow(base, 5) ; t7 := math.pow(base, 6)
+        t8 := math.pow(base, 7) ; t9 := math.pow(base, 8)
+    else if sType == "Fibonacci"
+        // 1 2 3 5 8 13 21 34 55
+        t2 := 2.0 ;  t3 := 3.0 ;  t4 := 5.0 ;  t5 := 8.0
+        t6 := 13.0 ; t7 := 21.0 ; t8 := 34.0 ; t9 := 55.0
+    else  // "Log-Spaced": 10 evenly spaced points on a log₁₀ axis from 1 to 10
+        // t_i = 10^((i-1)/8)  →  1.0, 1.33, 1.78, 2.37, 3.16, 4.22, 5.62, 7.50, 10.0
+        t2 := math.pow(10.0, 1.0/8.0) ; t3 := math.pow(10.0, 2.0/8.0)
+        t4 := math.pow(10.0, 3.0/8.0) ; t5 := math.pow(10.0, 4.0/8.0)
+        t6 := math.pow(10.0, 5.0/8.0) ; t7 := math.pow(10.0, 6.0/8.0)
+        t8 := math.pow(10.0, 7.0/8.0) ; t9 := 10.0
+    [t1, t2, t3, t4, t5, t6, t7, t8, t9]
+
+[t1, t2, t3, t4, t5, t6, t7, t8, t9] = f_thresholds(scaleType, expBase)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLUME COLOUR FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+// volNorm at bar_index[offset]:  1.0 = exactly 1× baseUnit
+f_volNorm(offset) =>
+    volume[offset] / math.max(nz(baseUnit[offset], 1), 1e-10)
+
+f_volColor(vn) =>
+    vn >= t9 ? c9 :
+     vn >= t8 ? c8 :
+     vn >= t7 ? c7 :
+     vn >= t6 ? c6 :
+     vn >= t5 ? c5 :
+     vn >= t4 ? c4 :
+     vn >= t3 ? c3 :
+     vn >= t2 ? c2 :
+     vn >= t1 ? c1 : c0
+
+f_colorTier(c) =>
+    c == c9 ? 9 : c == c8 ? 8 : c == c7 ? 7 : c == c6 ? 6 :
+     c == c5 ? 5 : c == c4 ? 4 : c == c3 ? 3 : c == c2 ? 2 :
+     c == c1 ? 1 : 0
+
+// Current-bar colour
+volNorm0 = f_volNorm(0)
+v0       = f_volColor(volNorm0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Z-SCORE BACKGROUND  (optional statistical context)
+// Highlights bars where volume is > 2 standard deviations above the mean —
+// these are statistically rare and mark genuine liquidity events.
+// ═══════════════════════════════════════════════════════════════════════════════
+volStd  = ta.stdev(volume, rvolLen)
+volZ    = (volume - avgVol) / math.max(volStd, 1e-10)
+bgColor = showZBg and volZ > 3.0 ? color.new(color.white,  80) :
+          showZBg and volZ > 2.0 ? color.new(color.yellow, 85) :
+          na
+bgcolor(bgColor, editable=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BAR COLOUR
+// ═══════════════════════════════════════════════════════════════════════════════
+barcolor(v0, editable=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HEIKIN-ASHI WICKS (colour-matched to volume tier)
+// ═══════════════════════════════════════════════════════════════════════════════
+paintWick(_c, _v) => showWick and v0 == _c ? _v : na
+
+plotcandle(paintWick(c0,ha_open), paintWick(c0,ha_close), paintWick(c0,ha_high), paintWick(c0,ha_low), color=c0, wickcolor=c0, editable=false, bordercolor=ct)
+plotcandle(paintWick(c1,ha_open), paintWick(c1,ha_close), paintWick(c1,ha_high), paintWick(c1,ha_low), color=c1, wickcolor=c1, editable=false, bordercolor=ct)
+plotcandle(paintWick(c2,ha_open), paintWick(c2,ha_close), paintWick(c2,ha_high), paintWick(c2,ha_low), color=c2, wickcolor=c2, editable=false, bordercolor=ct)
+plotcandle(paintWick(c3,ha_open), paintWick(c3,ha_close), paintWick(c3,ha_high), paintWick(c3,ha_low), color=c3, wickcolor=c3, editable=false, bordercolor=ct)
+plotcandle(paintWick(c4,ha_open), paintWick(c4,ha_close), paintWick(c4,ha_high), paintWick(c4,ha_low), color=c4, wickcolor=c4, editable=false, bordercolor=ct)
+plotcandle(paintWick(c5,ha_open), paintWick(c5,ha_close), paintWick(c5,ha_high), paintWick(c5,ha_low), color=c5, wickcolor=c5, editable=false, bordercolor=ct)
+plotcandle(paintWick(c6,ha_open), paintWick(c6,ha_close), paintWick(c6,ha_high), paintWick(c6,ha_low), color=c6, wickcolor=c6, editable=false, bordercolor=ct)
+plotcandle(paintWick(c7,ha_open), paintWick(c7,ha_close), paintWick(c7,ha_high), paintWick(c7,ha_low), color=c7, wickcolor=c7, editable=false, bordercolor=ct)
+plotcandle(paintWick(c8,ha_open), paintWick(c8,ha_close), paintWick(c8,ha_high), paintWick(c8,ha_low), color=c8, wickcolor=c8, editable=false, bordercolor=ct)
+plotcandle(paintWick(c9,ha_open), paintWick(c9,ha_close), paintWick(c9,ha_high), paintWick(c9,ha_low), color=c9, wickcolor=c9, editable=false, bordercolor=ct)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE STYLE HELPER
+// ═══════════════════════════════════════════════════════════════════════════════
+f_lineStyle(s) =>
+    s == "dotted (┈)"      ? line.style_dotted      :
+     s == "dashed (╌)"      ? line.style_dashed      :
+     s == "arrow left (←)"  ? line.style_arrow_left  :
+     s == "arrow right (→)" ? line.style_arrow_right :
+     s == "arrows both (↔)" ? line.style_arrow_both  :
+                               line.style_solid
+
+lhLS = f_lineStyle(lhStyle)
+llLS = f_lineStyle(llStyle)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY PIVOT LINE PAINTER
+// ═══════════════════════════════════════════════════════════════════════════════
+// A pivot at offset `length` is confirmed when:
+//   LEFT  window [0, length-1]:  no bar exceeds pivot price (strict for highs)
+//   RIGHT window [length+1, 2×length]: no bar equals or exceeds pivot price
+// Volume filter (minTier) suppresses low-liquidity swing points — only price
+// levels with meaningful volume are true liquidity nodes.
+paintLines(hl, length, isHigh, label_yloc, label_style) =>
+    if showLines
+        pivot_price = nz(hl[length])
+        isFound     = true
+
+        // Left-side check (bars after pivot, index < length)
+        for i = 0 to length - 1
+            if isHigh and hl[i] > pivot_price
+                isFound := false
+            if not isHigh and hl[i] < pivot_price
+                isFound := false
+
+        // Right-side check (bars before pivot confirming the swing)
+        for i = length + 1 to 2 * length
+            if isHigh and hl[i] >= pivot_price
+                isFound := false
+            if not isHigh and hl[i] <= pivot_price
+                isFound := false
+
+        // Volume tier check — only draw lines for liquid pivots
+        _pivVN    = f_volNorm(length)
+        _pivColor = f_volColor(_pivVN)
+        _pivTier  = f_colorTier(_pivColor)
+
+        if isFound and _pivTier >= minTier
+            _ls = isHigh ? lhLS : llLS
+            line.new(bar_index[length], pivot_price, bar_index[1], pivot_price,
+                 xloc.bar_index, extend.right, _pivColor, _ls)
+
+            if showLabels
+                // Label: raw volume + RVOL ratio (e.g. "1 234 567  (3.2×)")
+                _rawVol  = str.tostring(math.round(volume[length]))
+                _rvolStr = useRVOL
+                     ? " (" + str.tostring(math.round(_pivVN * 10) / 10) + "×)"
+                     : ""
+                _priceStr = str.tostring(pivot_price)
+                label.new(bar_index[length], pivot_price,
+                     _rawVol + _rvolStr,
+                     xloc.bar_index, label_yloc, _pivColor, label_style, _pivColor,
+                     size.normal, text.align_center, _priceStr)
+
+paintLines(ha_high, pivLen, true,  yloc.abovebar, label.style_triangledown)
+paintLines(ha_low,  pivLen, false, yloc.belowbar,  label.style_triangleup)
