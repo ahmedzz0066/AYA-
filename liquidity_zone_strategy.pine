@@ -1,0 +1,700 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mellowmichellehe — Liquidity Zone Strategy v6
+//
+// ARCHITECTURE
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  Layer 1 │  RVOL Volume Tiers        │ 10 tiers (T0–T9)               │
+// │  Layer 2 │  Asymmetric Pivot Map     │ Separate minTier High vs Low    │  ← FIX
+// │  Layer 3 │  Level Invalidation       │ ATR-based consumed-level purge  │
+// │  Layer 4 │  Sweep & Reverse Entry    │ Liquidity grab detection        │
+// │  Layer 5 │  Statistical Filter       │ Z-score + RVOL bar filter       │
+// │  Layer 6 │  Risk Engine              │ ATR stop, opposing-level TP     │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// CORE THEORY (Liquidity Engineering)
+//   Pivot HIGH  →  sell-side liquidity pool (stop-losses of long traders rest above)
+//   Pivot LOW   →  buy-side  liquidity pool (stop-losses of short traders rest below)
+//   "Sweep"     →  price briefly breaks a level, triggers stops, then reverses
+//                  = smart money filled orders against trapped retail
+//   ENTRY       →  ride the reversal after the sweep, with volume confirmation
+//
+// ASYMMETRIC MAP FIX (Problem #1 from snapshot analysis)
+//   In downtrends: impulse legs happen on HIGH volume → highs get lines
+//                  retracement legs happen on LOW volume → lows get filtered out
+//   Fix: minTierHigh and minTierLow are independent inputs.
+//        Default minTierLow = 1 (lower bar) ensures support levels are always captured.
+//@version=6
+
+strategy("Liquidity Zone Strategy",
+     shorttitle         = "LQZ-v6",
+     overlay            = true,
+     max_bars_back      = 2000,
+     max_lines_count    = 500,
+     max_labels_count   = 500,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 100,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.02,
+     slippage           = 2,
+     calc_on_every_tick = false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ① INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════════════════
+var G_VOL   = "① Volume Normalization"
+var G_SCALE = "② Scale Thresholds"
+var G_PIV   = "③ Pivot Detection  [Asymmetric Map Fix]"
+var G_ENT   = "④ Entry Conditions"
+var G_RISK  = "⑤ Risk Management"
+var G_FILT  = "⑥ Filters"
+var G_VIZ   = "⑦ Visualisation"
+
+// ── Volume ────────────────────────────────────────────────────────────────────
+useRVOL = input.bool(true, "Use Relative Volume (RVOL)", group=G_VOL,
+     tooltip="Normalise each bar's volume against its own rolling SMA.\n"
+             "Removes need for manual Magnitude/Multiplier per instrument.")
+rvolLen = input.int(288, "RVOL Lookback (bars)", minval=10, maxval=2000, group=G_VOL,
+     tooltip="288 bars = 1 trading day on 5-min chart (24h × 12 bars/hr).\n"
+             "Prevents session-open spikes from inflating RVOL on FX.\n"
+             "For daily charts use 50. For 4H use 42 (1 week).")
+smg4    = input.int(3, "Magnitude (legacy — RVOL OFF only)", minval=1, maxval=9, group=G_VOL)
+smt4    = input.int(2, "Multiplier (legacy — RVOL OFF only)", minval=1, maxval=9, group=G_VOL)
+
+// ── Scale ─────────────────────────────────────────────────────────────────────
+scaleType = input.string("True Exponential", "Scale Type", group=G_SCALE,
+     options=["Linear","Quadratic","True Exponential","Fibonacci","Log-Spaced"],
+     tooltip="True Exponential: tᵢ = b^(i-1). Matches log-normal distribution of volume.\n"
+             "Fibonacci: natural market growth sequence 1,2,3,5,8,13,21,34,55.\n"
+             "Log-Spaced: perceptually uniform on logarithmic price axis.")
+expBase   = input.float(2.0, "Exponential Base (True Exp only)", minval=1.1, maxval=10.0,
+     step=0.1, group=G_SCALE,
+     tooltip="b=2.0 → thresholds 1,2,4,8,16,32,64,128,256× avg volume.\n"
+             "b=1.5 → finer resolution: 1,1.5,2.25,3.4,5.1,7.6,11,17,26×")
+
+// ── Pivot Detection — THE FIX ─────────────────────────────────────────────────
+pivLen      = input.int(4, "Pivot Lookback Length (L)", minval=1, maxval=50, group=G_PIV,
+     tooltip="Pivot confirmed if bar[L] is highest/lowest in window [0,2L].\n"
+             "Confirmation lag = L bars. Higher = stronger / fewer pivots.")
+minTierHigh = input.int(2, "Min Tier — Pivot HIGHS (0–9)", minval=0, maxval=9, group=G_PIV,
+     tooltip="Min volume tier to store a pivot HIGH (sell-side liquidity, resistance).\n"
+             "Tier 2 = blue (notable volume). Tier 4 = green (institutional).")
+minTierLow  = input.int(1, "Min Tier — Pivot LOWS  (0–9)", minval=0, maxval=9, group=G_PIV,
+     tooltip="▼ FIX for asymmetric map ▼\n"
+             "Set LOWER than Highs. In downtrends, retracement rallies have less volume\n"
+             "than impulse legs, so lows form on lower RVOL. Setting this equal to Highs\n"
+             "would produce zero low pivot lines — the problem seen in the snapshot.\n"
+             "Default 1 = capture any above-baseline volume at lows.")
+maxLevels   = input.int(20, "Max Stored Levels per Side", minval=3, maxval=50, group=G_PIV,
+     tooltip="Oldest levels are dropped when this limit is exceeded.")
+invalidMult = input.float(0.5, "Invalidation ATR Multiplier", minval=0.1, maxval=5.0,
+     step=0.1, group=G_PIV,
+     tooltip="A level is removed when price CLOSES beyond it by ATR × this value.\n"
+             "Prevents strategy from trading at 'consumed' levels.")
+flipOnBreak = input.bool(true, "Flip: Broken Resistance → Support (and vice versa)", group=G_PIV,
+     tooltip="When price closes above a resistance level (invalidation), the level is\n"
+             "reclassified as a support level and moved to the low array (flip logic).")
+
+// ── Entry ─────────────────────────────────────────────────────────────────────
+entryMode = input.string("Sweep & Reverse", "Entry Mode", group=G_ENT,
+     options=["Sweep & Reverse","Level Touch","Both"],
+     tooltip="Sweep & Reverse: wick crosses level, bar closes on opposite side.\n"
+             "                 Highest probability — confirms stop-hunt reversal.\n"
+             "Level Touch    : close within tolerance band, volume confirmed.\n"
+             "Both           : take either signal, whichever fires first.")
+zonePct      = input.float(0.05, "Zone Tolerance (%)", minval=0.005, maxval=1.0,
+     step=0.005, group=G_ENT,
+     tooltip="Tolerance band width as % of price for Level Touch mode.\n"
+             "0.05% = 0.5 pips on EUR/USD @ 1.15.")
+minEntryRVOL = input.float(1.2, "Min RVOL on Entry Bar", minval=0.3, maxval=10.0,
+     step=0.1, group=G_ENT,
+     tooltip="Entry bar must show above-average volume participation.\n"
+             "1.2 = 20% above rolling average. Filters low-conviction reversals.")
+requireEngulf = input.bool(true, "Require Engulfing/Pin Bar Confirmation", group=G_ENT,
+     tooltip="Entry bar must close beyond the previous bar's open (engulfing), OR\n"
+             "show a significant wick (pin bar) relative to body. Reduces false sweeps.")
+
+// ── Filters ───────────────────────────────────────────────────────────────────
+useTrend    = input.bool(true,  "Trend Filter — EMA", group=G_FILT,
+     tooltip="Long only when close > EMA. Short only when close < EMA.")
+trendLen    = input.int(200,    "Trend EMA Length",    minval=10, group=G_FILT)
+longOnly    = input.bool(false, "Long Only",           group=G_FILT)
+shortOnly   = input.bool(false, "Short Only",          group=G_FILT)
+minLevelTier = input.int(0,     "Min Tier at Trigger Level (0–9)", minval=0, maxval=9,
+     group=G_FILT,
+     tooltip="Only trade setups where the triggered level's volume tier ≥ this value.\n"
+             "0 = trade all levels. 3 = only trade high-conviction institutional levels.")
+
+// ── Risk ──────────────────────────────────────────────────────────────────────
+atrLen    = input.int(14,   "ATR Length",               minval=1, group=G_RISK)
+slMult    = input.float(1.5,"Stop-Loss ATR Multiplier", minval=0.1, maxval=10.0, step=0.1,
+     group=G_RISK,
+     tooltip="Stop placed beyond sweep bar's extreme by ATR × multiplier.\n"
+             "Long: stop = sweep_bar_low  − ATR × mult\n"
+             "Short: stop = sweep_bar_high + ATR × mult")
+rrRatio   = input.float(2.0,"Minimum R:R Ratio",        minval=0.5, maxval=20.0, step=0.1,
+     group=G_RISK,
+     tooltip="If no opposing level is found for TP, use Entry + (risk × R:R).\n"
+             "Also acts as a minimum: if opposing level gives R:R < this, skip trade.")
+useOppTP  = input.bool(true,"TP at Nearest Opposing Level", group=G_RISK,
+     tooltip="Compute TP as nearest confirmed pivot on the opposite side of trade.\n"
+             "Mathematically optimal: TP = next liquidity pool in trade direction.")
+
+// ── Visualisation ─────────────────────────────────────────────────────────────
+showBars   = input.bool(true,  "Colour Bars by Volume Tier", group=G_VIZ)
+showLines  = input.bool(true,  "Show Pivot Level Lines",     group=G_VIZ)
+showSig    = input.bool(true,  "Show Entry Signals",         group=G_VIZ)
+showZBg    = input.bool(false, "Z-Score Background Tint",    group=G_VIZ)
+showEMA    = input.bool(true,  "Show Trend EMA",             group=G_VIZ)
+showStats  = input.bool(true,  "Show Level Stats in Label",  group=G_VIZ)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLOURS
+// ═══════════════════════════════════════════════════════════════════════════════
+c0 = #5d606b
+c1 = #64b5f6
+c2 = #2196f3
+c3 = #81c784
+c4 = #4caf50
+c5 = #fff176
+c6 = #ffeb3b
+c7 = #e57373
+c8 = #f44336
+c9 = #ffffff
+ct = color.new(color.red, 100)
+
+BULL_COL  = #4caf50
+BEAR_COL  = #f44336
+BULL_LITE = color.new(#4caf50, 60)
+BEAR_LITE = color.new(#f44336, 60)
+EMA_COL   = color.new(#ffeb3b, 35)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ② VOLUME MATHEMATICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Rolling statistics (RVOL baseline + Z-score denominator)
+avgVol = ta.sma(volume, rvolLen)
+volStd = ta.stdev(volume, rvolLen)
+volZ   = (volume - avgVol) / math.max(volStd, 1e-10)
+
+// Legacy absolute base: 10^(mag-1) × multiplier
+_absBase = math.pow(10.0, smg4 - 1.0) * smt4
+
+// Active base unit
+baseUnit = useRVOL ? avgVol : _absBase
+
+// ── Scale threshold function ──────────────────────────────────────────────────
+// Returns [t1,t2,...,t9]: the RVOL multiples at which each colour tier begins.
+// vol_norm = volume/baseUnit; colour tier = max{i: vol_norm >= tᵢ}
+f_thresh(sType, base) =>
+    float t1 = 1.0
+    float t2 = na
+    float t3 = na
+    float t4 = na
+    float t5 = na
+    float t6 = na
+    float t7 = na
+    float t8 = na
+    float t9 = na
+    if sType == "Linear"
+        t2 := 2.0
+        t3 := 3.0
+        t4 := 4.0
+        t5 := 5.0
+        t6 := 6.0
+        t7 := 7.0
+        t8 := 8.0
+        t9 := 9.0
+    else if sType == "Quadratic"
+        t2 := 4.0
+        t3 := 9.0
+        t4 := 16.0
+        t5 := 25.0
+        t6 := 36.0
+        t7 := 49.0
+        t8 := 64.0
+        t9 := 81.0
+    else if sType == "True Exponential"
+        t2 := math.pow(base, 1)
+        t3 := math.pow(base, 2)
+        t4 := math.pow(base, 3)
+        t5 := math.pow(base, 4)
+        t6 := math.pow(base, 5)
+        t7 := math.pow(base, 6)
+        t8 := math.pow(base, 7)
+        t9 := math.pow(base, 8)
+    else if sType == "Fibonacci"
+        t2 := 2.0
+        t3 := 3.0
+        t4 := 5.0
+        t5 := 8.0
+        t6 := 13.0
+        t7 := 21.0
+        t8 := 34.0
+        t9 := 55.0
+    else  // Log-Spaced: 10^(i/8), i=0..8
+        t2 := math.pow(10.0, 1.0/8.0)
+        t3 := math.pow(10.0, 2.0/8.0)
+        t4 := math.pow(10.0, 3.0/8.0)
+        t5 := math.pow(10.0, 4.0/8.0)
+        t6 := math.pow(10.0, 5.0/8.0)
+        t7 := math.pow(10.0, 6.0/8.0)
+        t8 := math.pow(10.0, 7.0/8.0)
+        t9 := 10.0
+    [t1, t2, t3, t4, t5, t6, t7, t8, t9]
+
+[t1, t2, t3, t4, t5, t6, t7, t8, t9] = f_thresh(scaleType, expBase)
+
+// ── Volume normalisation and colour assignment ─────────────────────────────────
+// offset: how many bars back to evaluate (0 = current bar)
+f_vn(offset) =>
+    volume[offset] / math.max(nz(baseUnit[offset], 1), 1e-10)
+
+f_vcol(vn) =>
+    vn >= t9 ? c9 : vn >= t8 ? c8 : vn >= t7 ? c7 : vn >= t6 ? c6 :
+     vn >= t5 ? c5 : vn >= t4 ? c4 : vn >= t3 ? c3 : vn >= t2 ? c2 :
+     vn >= t1 ? c1 : c0
+
+f_vtier(c) =>
+    c == c9 ? 9 : c == c8 ? 8 : c == c7 ? 7 : c == c6 ? 6 :
+     c == c5 ? 5 : c == c4 ? 4 : c == c3 ? 3 : c == c2 ? 2 :
+     c == c1 ? 1 : 0
+
+// Current bar
+vn0 = f_vn(0)
+v0  = f_vcol(vn0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ③ PIVOT DETECTION
+// ta.pivothigh(src, L, R) returns src[R] when confirmed, else na.
+// Confirmation fires exactly R bars after the pivot bar.
+// ═══════════════════════════════════════════════════════════════════════════════
+pivH = ta.pivothigh(high, pivLen, pivLen)   // confirmed pivot high price
+pivL = ta.pivotlow (low,  pivLen, pivLen)   // confirmed pivot low  price
+
+// Volume tier at the pivot bar (offset = pivLen bars back)
+pivHTier = not na(pivH) ? f_vtier(f_vcol(f_vn(pivLen))) : na
+pivLTier = not na(pivL) ? f_vtier(f_vcol(f_vn(pivLen))) : na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ④ LEVEL STORAGE — parallel arrays (price, tier, drawn line)
+//
+// ph_* = pivot HIGHS  (sell-side liquidity / resistance)
+// pl_* = pivot LOWS   (buy-side  liquidity / support)
+//
+// Separate minTierHigh / minTierLow is the core fix for the asymmetric map.
+// ═══════════════════════════════════════════════════════════════════════════════
+var float[] ph_price = array.new_float(0)
+var int[]   ph_tier  = array.new_int(0)
+var line[]  ph_line  = array.new_line(0)
+
+var float[] pl_price = array.new_float(0)
+var int[]   pl_tier  = array.new_int(0)
+var line[]  pl_line  = array.new_line(0)
+
+// ── Helper: add a level, trim if over maxLevels ───────────────────────────────
+f_addHigh(px, tier, ln) =>
+    array.unshift(ph_price, px)
+    array.unshift(ph_tier,  tier)
+    array.unshift(ph_line,  ln)
+    if array.size(ph_price) > maxLevels
+        _old = array.pop(ph_line)
+        line.delete(_old)
+        array.pop(ph_price)
+        array.pop(ph_tier)
+
+f_addLow(px, tier, ln) =>
+    array.unshift(pl_price, px)
+    array.unshift(pl_tier,  tier)
+    array.unshift(pl_line,  ln)
+    if array.size(pl_price) > maxLevels
+        _old = array.pop(pl_line)
+        line.delete(_old)
+        array.pop(pl_price)
+        array.pop(pl_tier)
+
+// ── Add confirmed pivot HIGHs ─────────────────────────────────────────────────
+if not na(pivH) and pivHTier >= minTierHigh
+    _col  = f_vcol(f_vn(pivLen))
+    _rvolStr = str.tostring(math.round(f_vn(pivLen) * 10) / 10) + "×"
+    _ln   = showLines
+         ? line.new(bar_index[pivLen], pivH, bar_index, pivH,
+                    xloc.bar_index, extend.right, _col, line.style_dotted, 1)
+         : line.new(bar_index[pivLen], pivH, bar_index, pivH,
+                    xloc.bar_index, extend.right, color.new(color.white, 100),
+                    line.style_dotted, 1)
+    if showStats
+        label.new(bar_index[pivLen], pivH,
+             "H T" + str.tostring(pivHTier) + " " + _rvolStr,
+             xloc.bar_index, yloc.abovebar, _col, label.style_triangledown,
+             _col, size.tiny, text.align_center)
+    f_addHigh(pivH, pivHTier, _ln)
+
+// ── Add confirmed pivot LOWs  (minTierLow is lower → captures more lows) ──────
+if not na(pivL) and pivLTier >= minTierLow
+    _col  = f_vcol(f_vn(pivLen))
+    _rvolStr = str.tostring(math.round(f_vn(pivLen) * 10) / 10) + "×"
+    _ln   = showLines
+         ? line.new(bar_index[pivLen], pivL, bar_index, pivL,
+                    xloc.bar_index, extend.right, _col, line.style_dotted, 1)
+         : line.new(bar_index[pivLen], pivL, bar_index, pivL,
+                    xloc.bar_index, extend.right, color.new(color.white, 100),
+                    line.style_dotted, 1)
+    if showStats
+        label.new(bar_index[pivLen], pivL,
+             "L T" + str.tostring(pivLTier) + " " + _rvolStr,
+             xloc.bar_index, yloc.belowbar, _col, label.style_triangleup,
+             _col, size.tiny, text.align_center)
+    f_addLow(pivL, pivLTier, _ln)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑤ LEVEL INVALIDATION
+//
+// A level is "consumed" when price closes decisively through it.
+// Threshold: close beyond level by (ATR × invalidMult).
+//
+// FLIP LOGIC: Broken resistance → reclassified as support (and vice versa).
+// Based on Dow Theory: a broken resistance level becomes the new support.
+// Only applied when the close is within 2×ATR of the broken level.
+// ═══════════════════════════════════════════════════════════════════════════════
+atr       = ta.atr(atrLen)
+invalidDist = atr * invalidMult
+flipDist    = atr * 2.0        // within 2 ATR = plausible flip zone
+
+// Invalidate HIGH levels
+if array.size(ph_price) > 0
+    i = 0
+    while i < array.size(ph_price)
+        lvl  = array.get(ph_price, i)
+        tier = array.get(ph_tier,  i)
+        if close > lvl + invalidDist
+            _ln = array.get(ph_line, i)
+            line.delete(_ln)
+            array.remove(ph_price, i)
+            array.remove(ph_tier,  i)
+            array.remove(ph_line,  i)
+            // FLIP: if within flip zone, reclassify as support
+            if flipOnBreak and (close - lvl) < flipDist
+                _fcol = f_vcol(f_vn(0))
+                _fln  = showLines
+                     ? line.new(bar_index, lvl, bar_index + 1, lvl,
+                                xloc.bar_index, extend.right, _fcol, line.style_dashed, 1)
+                     : line.new(bar_index, lvl, bar_index + 1, lvl,
+                                xloc.bar_index, extend.right, color.new(color.white, 100),
+                                line.style_dashed, 1)
+                f_addLow(lvl, math.max(tier - 1, 0), _fln)
+        else
+            i += 1
+
+// Invalidate LOW levels
+if array.size(pl_price) > 0
+    i = 0
+    while i < array.size(pl_price)
+        lvl  = array.get(pl_price, i)
+        tier = array.get(pl_tier,  i)
+        if close < lvl - invalidDist
+            _ln = array.get(pl_line, i)
+            line.delete(_ln)
+            array.remove(pl_price, i)
+            array.remove(pl_tier,  i)
+            array.remove(pl_line,  i)
+            // FLIP: reclassify as resistance
+            if flipOnBreak and (lvl - close) < flipDist
+                _fcol = f_vcol(f_vn(0))
+                _fln  = showLines
+                     ? line.new(bar_index, lvl, bar_index + 1, lvl,
+                                xloc.bar_index, extend.right, _fcol, line.style_dashed, 1)
+                     : line.new(bar_index, lvl, bar_index + 1, lvl,
+                                xloc.bar_index, extend.right, color.new(color.white, 100),
+                                line.style_dashed, 1)
+                f_addHigh(lvl, math.max(tier - 1, 0), _fln)
+        else
+            i += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑥ TREND FILTER
+//
+// Primary filter: RVOL-Weighted EMA
+//   Each bar's contribution to the EMA is scaled by its RVOL.
+//   High-volume bars anchor the trend more strongly — institutionally weighted.
+// Secondary filter: simple EMA(200) direction
+// ═══════════════════════════════════════════════════════════════════════════════
+trendEMA  = ta.ema(close, trendLen)
+trendBull = close > trendEMA
+trendBear = close < trendEMA
+
+// RVOL-weighted moving average (higher volume bars dominate)
+// vwma uses volume as weights — this is our "institutional bias" measure
+rvol_vwma    = ta.vwma(close, trendLen)
+instBull     = close > rvol_vwma
+instBear     = close < rvol_vwma
+
+// Combined trend: EMA direction AND price above VWMA
+trendFilterLong  = not useTrend or (trendBull and instBull)
+trendFilterShort = not useTrend or (trendBear and instBear)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑦ CANDLE CONFIRMATION PATTERNS
+//
+// Sweep & Reverse requires the entry bar to show structural commitment.
+// Two accepted patterns:
+//   (a) Engulfing body: close[0] beyond open[1] in trade direction
+//   (b) Pin bar: wick/body ratio > 2 (significant wick rejection)
+// ═══════════════════════════════════════════════════════════════════════════════
+bodySize  = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+totalRange = high - low
+
+// Bullish pin: long lower wick, small body at top
+bullPin = lowerWick > 2.0 * bodySize and bodySize > 0
+
+// Bearish pin: long upper wick, small body at bottom
+bearPin = upperWick > 2.0 * bodySize and bodySize > 0
+
+// Bullish engulf: closes above prior open
+bullEngulf = close > open[1]
+
+// Bearish engulf: closes below prior open
+bearEngulf = close < open[1]
+
+candleConfirmLong  = not requireEngulf or bullPin  or bullEngulf
+candleConfirmShort = not requireEngulf or bearPin  or bearEngulf
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑧ ENTRY SIGNAL DETECTION
+//
+// LONG (Buy-Side Liquidity Sweep at Pivot LOW)
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │  1.  low  < stored_low_level   (wick penetrates below, sweeps stops)│
+//   │  2.  close > stored_low_level  (bar closes back above = reversal)   │
+//   │  3.  RVOL >= minEntryRVOL      (volume confirms absorption)         │
+//   │  4.  candle confirmation       (pin bar or engulf)                  │
+//   │  5.  trend filter              (close > EMA & close > VWMA)         │
+//   │  6.  level tier >= minLevelTier                                     │
+//   └─────────────────────────────────────────────────────────────────────┘
+//
+// SHORT (Sell-Side Liquidity Sweep at Pivot HIGH)
+//   Mirror conditions above with high > level and close < level.
+// ═══════════════════════════════════════════════════════════════════════════════
+tolAmt   = close * zonePct / 100.0   // absolute tolerance
+curRVOL  = f_vn(0)
+rvolPass = curRVOL >= minEntryRVOL
+
+// Scan stored levels for triggered signals
+float trigLong      = na
+int   trigLongTier  = na
+float trigShort     = na
+int   trigShortTier = na
+
+// ── LONG signal: sweep of stored pivot LOW ────────────────────────────────────
+if array.size(pl_price) > 0 and rvolPass and candleConfirmLong and not shortOnly
+    for i = 0 to array.size(pl_price) - 1
+        lvl  = array.get(pl_price, i)
+        tier = array.get(pl_tier,  i)
+        if tier < minLevelTier
+            continue
+        isSweep = (entryMode == "Sweep & Reverse" or entryMode == "Both")
+                  and low < lvl and close > lvl
+        isTouch = (entryMode == "Level Touch" or entryMode == "Both")
+                  and math.abs(close - lvl) <= tolAmt and close > open
+        if isSweep or isTouch
+            if na(trigLong) or lvl > trigLong   // prefer the nearest (highest) low
+                trigLong     := lvl
+                trigLongTier := tier
+
+// ── SHORT signal: sweep of stored pivot HIGH ──────────────────────────────────
+if array.size(ph_price) > 0 and rvolPass and candleConfirmShort and not longOnly
+    for i = 0 to array.size(ph_price) - 1
+        lvl  = array.get(ph_price, i)
+        tier = array.get(ph_tier,  i)
+        if tier < minLevelTier
+            continue
+        isSweep = (entryMode == "Sweep & Reverse" or entryMode == "Both")
+                  and high > lvl and close < lvl
+        isTouch = (entryMode == "Level Touch" or entryMode == "Both")
+                  and math.abs(close - lvl) <= tolAmt and close < open
+        if isSweep or isTouch
+            if na(trigShort) or lvl < trigShort  // prefer the nearest (lowest) high
+                trigShort     := lvl
+                trigShortTier := tier
+
+// Apply trend filters
+longSignal  = not na(trigLong)  and trendFilterLong
+shortSignal = not na(trigShort) and trendFilterShort
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑨ STOP LOSS & TAKE PROFIT CALCULATION
+//
+// Stop Loss:
+//   Long : sweep bar's low  − ATR × slMult   (below liquidity pool)
+//   Short: sweep bar's high + ATR × slMult   (above liquidity pool)
+//
+// Take Profit — two-tier logic:
+//   Primary  : nearest confirmed opposing pivot level in trade direction
+//              (next resistance for longs, next support for shorts)
+//   Secondary: if no level found OR if level gives R:R < rrRatio,
+//              fall back to entry + risk × rrRatio
+//
+// This mirrors how institutions set targets: the next liquidity pool
+// (stops of the opposite side) is the natural exit destination.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// LONG stop & target
+longStop   = low - atr * slMult
+float longTP = na
+
+if useOppTP and array.size(ph_price) > 0
+    for i = 0 to array.size(ph_price) - 1
+        lvl = array.get(ph_price, i)
+        if lvl > close
+            longTP := na(longTP) ? lvl : math.min(longTP, lvl)  // nearest above
+
+// Verify R:R — if opposing level TP gives less than rrRatio, override with R:R target
+longRisk = close - longStop
+longRR   = na(longTP) ? 0.0 : (longTP - close) / math.max(longRisk, 1e-10)
+if na(longTP) or longRR < rrRatio
+    longTP := close + longRisk * rrRatio
+
+// SHORT stop & target
+shortStop  = high + atr * slMult
+float shortTP = na
+
+if useOppTP and array.size(pl_price) > 0
+    for i = 0 to array.size(pl_price) - 1
+        lvl = array.get(pl_price, i)
+        if lvl < close
+            shortTP := na(shortTP) ? lvl : math.max(shortTP, lvl)  // nearest below
+
+shortRisk = shortStop - close
+shortRR   = na(shortTP) ? 0.0 : (close - shortTP) / math.max(shortRisk, 1e-10)
+if na(shortTP) or shortRR < rrRatio
+    shortTP := close - shortRisk * rrRatio
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑩ POSITION SIZING
+//
+// Fixed fractional risk: size = (equity × riskPct%) / risk_per_unit
+// TradingView handles this via default_qty_type = percent_of_equity.
+//
+// For precise fixed-risk sizing, the formula is:
+//   contracts = (account_equity × riskPct / 100) / (entry_price - stop_price)
+//
+// This is approximated here via the percent_of_equity setting combined with
+// the strategy's built-in commission and slippage model.
+// ═══════════════════════════════════════════════════════════════════════════════
+isFlat = strategy.position_size == 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑪ STRATEGY ORDERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// LONG ENTRY
+if longSignal and isFlat
+    entryTag = "LQZ-L T" + str.tostring(trigLongTier) +
+               " R" + str.tostring(math.round(longRR * 10) / 10)
+    strategy.entry("Long", strategy.long, comment=entryTag)
+    strategy.exit("Long Exit", from_entry="Long",
+         stop  = longStop,
+         limit = longTP,
+         comment_loss   = "SL",
+         comment_profit = "TP-L" + str.tostring(math.round(longRR * 10) / 10) + "R")
+    if showSig
+        label.new(bar_index, low,
+             "▲ SWEEP\nT" + str.tostring(trigLongTier) +
+             "\n" + str.tostring(math.round(curRVOL * 10) / 10) + "×" +
+             "\n" + str.tostring(math.round(longRR * 10) / 10) + "R",
+             style     = label.style_label_up,
+             color     = color.new(BULL_COL, 15),
+             textcolor = color.white,
+             size      = size.small)
+
+// SHORT ENTRY
+if shortSignal and isFlat
+    entryTag = "LQZ-S T" + str.tostring(trigShortTier) +
+               " R" + str.tostring(math.round(shortRR * 10) / 10)
+    strategy.entry("Short", strategy.short, comment=entryTag)
+    strategy.exit("Short Exit", from_entry="Short",
+         stop  = shortStop,
+         limit = shortTP,
+         comment_loss   = "SL",
+         comment_profit = "TP-S" + str.tostring(math.round(shortRR * 10) / 10) + "R")
+    if showSig
+        label.new(bar_index, high,
+             "▼ SWEEP\nT" + str.tostring(trigShortTier) +
+             "\n" + str.tostring(math.round(curRVOL * 10) / 10) + "×" +
+             "\n" + str.tostring(math.round(shortRR * 10) / 10) + "R",
+             style     = label.style_label_down,
+             color     = color.new(BEAR_COL, 15),
+             textcolor = color.white,
+             size      = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑫ OPEN TRADE LEVELS (stop & TP lines)
+// ═══════════════════════════════════════════════════════════════════════════════
+var line sl_line = na
+var line tp_line = na
+
+if strategy.position_size > 0   // long open
+    float sl_px = strategy.position_avg_price - atr * slMult
+    float tp_px = strategy.position_avg_price + (strategy.position_avg_price - sl_px) * rrRatio
+    if not na(sl_line)
+        line.set_y1(sl_line, sl_px)
+        line.set_y2(sl_line, sl_px)
+    else
+        sl_line := line.new(bar_index, sl_px, bar_index + 1, sl_px,
+             xloc.bar_index, extend.right, color.new(BEAR_COL, 30),
+             line.style_dashed, 1)
+    if not na(tp_line)
+        line.set_y1(tp_line, tp_px)
+        line.set_y2(tp_line, tp_px)
+    else
+        tp_line := line.new(bar_index, tp_px, bar_index + 1, tp_px,
+             xloc.bar_index, extend.right, color.new(BULL_COL, 30),
+             line.style_dashed, 1)
+else if strategy.position_size < 0  // short open
+    float sl_px = strategy.position_avg_price + atr * slMult
+    float tp_px = strategy.position_avg_price - (sl_px - strategy.position_avg_price) * rrRatio
+    if not na(sl_line)
+        line.set_y1(sl_line, sl_px)
+        line.set_y2(sl_line, sl_px)
+    else
+        sl_line := line.new(bar_index, sl_px, bar_index + 1, sl_px,
+             xloc.bar_index, extend.right, color.new(BEAR_COL, 30),
+             line.style_dashed, 1)
+    if not na(tp_line)
+        line.set_y1(tp_line, tp_px)
+        line.set_y2(tp_line, tp_px)
+    else
+        tp_line := line.new(bar_index, tp_px, bar_index + 1, tp_px,
+             xloc.bar_index, extend.right, color.new(BULL_COL, 30),
+             line.style_dashed, 1)
+else  // flat — remove lines
+    if not na(sl_line)
+        line.delete(sl_line)
+        sl_line := na
+    if not na(tp_line)
+        line.delete(tp_line)
+        tp_line := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ⑬ VISUALISATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Bar colouring
+if showBars
+    barcolor(v0, editable=false)
+
+// Trend EMA
+plot(showEMA ? trendEMA  : na, "Trend EMA",  color=EMA_COL, linewidth=2)
+plot(showEMA ? rvol_vwma : na, "RVOL VWMA",
+     color=color.new(#64b5f6, 50), linewidth=1, style=plot.style_line)
+
+// Z-score extreme background
+bgC = showZBg and volZ > 3.0 ? color.new(color.white,  88) :
+      showZBg and volZ > 2.0 ? color.new(color.yellow, 92) : na
+bgcolor(bgC, editable=false)
+
+// Entry bar highlight
+bgcolor(longSignal  ? color.new(BULL_COL, 88) :
+        shortSignal ? color.new(BEAR_COL, 88) : na, editable=false)
