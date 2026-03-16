@@ -657,8 +657,7 @@ else  // flat — remove lines
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Bar colouring
-if showBars
-    barcolor(v0, editable=false)
+barcolor(showBars ? v0 : na, editable=false)
 
 // Trend EMA
 plot(showEMA ? trendEMA  : na, "Trend EMA",  color=EMA_COL, linewidth=2)
