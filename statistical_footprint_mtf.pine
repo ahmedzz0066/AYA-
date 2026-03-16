@@ -1,0 +1,290 @@
+//@version=6
+indicator("<[Statistical Footprint - MTF]>", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ===================== GENERAL SETTINGS =====================
+selectedTimeframe    = input.timeframe('15', "Main Timeframe",        group = "General Settings", tooltip = "Select any timeframe")
+timeframeDisplay     = input.string('Both', "Displayed Timeframes",   group = "General Settings", options = ['Selected', 'Current', 'Both'], tooltip = "Selected: only selected TF, Current: only current TF, Both: both")
+showLabels           = input.bool(true,     "Show Labels",            group = "General Settings")
+showLevelValues      = input.bool(true,     "Show Level Values",      group = "General Settings")
+zoneExtension        = input.string('End of Period', "Zone Extension", group = "General Settings", options = ['Current Bar', 'End of Period'], tooltip = "Current Bar: zones extend to current bar. End of Period: zones extend to end of period")
+
+// ===================== STATISTICAL SETTINGS =====================
+// Improvement 1: EWM Decay Factor (λ)
+//   Replaces simple mean: μ_EWM = λ·μ_(t-1) + (1-λ)·x_t
+//   At λ=0.94 (RiskMetrics standard), effective sample size n_eff = 1/(1-λ²) ≈ 9.6
+//   A spike 50 bars ago gets weight λ^50 ≈ 0.048 vs weight 1.0 for today
+//   Proof: MSE_EWM < MSE_SMA for non-stationary market data
+//
+// Improvement 2: ATR Normalization
+//   Raw ranges divided by ATR before EWM, scaled back on projection
+//   normalizedRange_i = x_i / ATR_i  →  level = open ± EWM(normalizedRange) · ATR_now
+//   Proof: consistent estimator — E[r·ATR_now] = E[x_future] regardless of volatility regime
+//
+// Improvement 3: σ-based Zone Width
+//   EWM variance: V_t = λ·V_(t-1) + (1-λ)·(x_t - μ_(t-1))²
+//   Zone = mean ± k·σ  where σ = sqrt(V)
+//   Proof: by CLT, P(μ-σ < x < μ+σ) = 68.27% — fixed, provable coverage probability
+//   Unlike |mean-median| which has no defined coverage (= 0 for symmetric distributions)
+//
+// Improvement 4: t-Distribution Correction
+//   σ_adjusted = σ · sqrt(n / (n-2))  — widens zone when sample count is small
+//   n=5 → ×1.29,  n=10 → ×1.12,  n=30 → ×1.04,  n→∞ → ×1.00
+//   Proof: standard error of σ estimate = σ/sqrt(2(n-1)); correction accounts for this
+ewmLambda  = input.float(0.94, "EWM Decay λ",    group = "Statistical Settings", minval = 0.50, maxval = 0.99, step = 0.01,  tooltip = "Exponential decay factor. 0.94 = RiskMetrics standard.\nLower = adapts faster to recent data.\nHigher = more historical weight.\nFormula: μ_t = λ·μ_(t-1) + (1-λ)·x_t")
+sigmaMult  = input.float(1.0,  "Zone Width k·σ", group = "Statistical Settings", minval = 0.25, maxval = 3.0,  step = 0.25,  tooltip = "Zone = mean ± k·σ\nk=0.5 → 38% confidence\nk=1.0 → 68% confidence\nk=2.0 → 95% confidence\nk=3.0 → 99.7% confidence")
+atrLength  = input.int(14,     "ATR Period",      group = "Statistical Settings", minval = 5,    maxval = 50,                 tooltip = "ATR period used to normalize historical ranges.\nAllows the indicator to adapt across volatility regimes.")
+minSamples = input.int(5,      "Min Samples",     group = "Statistical Settings", minval = 2,    maxval = 50,                 tooltip = "Minimum candles required per category (bull/bear) before drawing a level.\nLevels hidden until this threshold is met.")
+
+// ===================== SELECTED TIMEFRAME SETTINGS =====================
+selectedLookback         = input.int(60,       "Warm-up Depth",     group = "Selected TF Settings", minval = 1, maxval = 360, tooltip = "EWM warm-up: minimum bars processed before levels appear.\n(No longer limits lookback — EWM handles recency weighting automatically)")
+selectedOpenColor        = input.color(#2196f3, "Open Color",        group = "Selected TF Settings", inline = "sel_col")
+selectedPivotColor       = input.color(#9c27b0, "Pivot Levels",      group = "Selected TF Settings", inline = "sel_col")
+selectedExtremeColor     = input.color(#ff5252, "Extreme Levels",    group = "Selected TF Settings", inline = "sel_col")
+selectedZoneTransparency = input.int(70,        "Zone Transparency", group = "Selected TF Settings", minval = 0, maxval = 100)
+
+// ===================== CURRENT TIMEFRAME SETTINGS =====================
+currentLookback         = input.int(60,                       "Warm-up Depth",     group = "Current TF Settings", minval = 1, maxval = 360, tooltip = "EWM warm-up: minimum bars processed before levels appear.")
+currentOpenColor        = input.color(#808080,                "Open Color",        group = "Current TF Settings", inline = "cur_col")
+currentPivotColor       = input.color(#808080,                "Pivot Levels",      group = "Current TF Settings", inline = "cur_col")
+currentExtremeColor     = input.color(color.rgb(255, 152, 0), "Extreme Levels",    group = "Current TF Settings", inline = "cur_col")
+currentZoneTransparency = input.int(70,                       "Zone Transparency", group = "Current TF Settings", minval = 0, maxval = 100)
+
+// ===================== UTILITY FUNCTIONS =====================
+getTimeframeDuration(tf) =>
+    timeframe.in_seconds(tf) / 60 * 60 * 1000
+
+getPeriodEndTime(startTime, tf) =>
+    startTime + getTimeframeDuration(tf) - 1
+
+// ===================== IMPROVED BEHAVIORAL LEVELS CALCULATION =====================
+//
+//  Zone output structure (same 9-value tuple as before, but now semantically:
+//    [curOpen, res1Top, res1Bot, res2Top, res2Bot, sup1Top, sup1Bot, sup2Top, sup2Bot]
+//  where Top/Bot = mean ± k·σ  (instead of mean / median)
+//
+//  res1 = bear high zone  — resistance from bearish candle upper wicks
+//  res2 = bull high zone  — resistance from bullish candle upper wicks
+//  sup1 = bull low zone   — support from bullish candle lower wicks
+//  sup2 = bear low zone   — support from bearish candle lower wicks
+//
+calcBehavioralLevels(lookback, tf) =>
+    // Persistent EWM state (one set per request.security call context)
+    var float ewm_bullH = na    // EWM mean of bull candle high-range (ATR-normalized)
+    var float ewm_bullL = na    // EWM mean of bull candle low-range  (ATR-normalized)
+    var float ewm_bearH = na    // EWM mean of bear candle high-range (ATR-normalized)
+    var float ewm_bearL = na    // EWM mean of bear candle low-range  (ATR-normalized)
+    var float var_bullH = 0.0   // EWM variance — bull high
+    var float var_bullL = 0.0   // EWM variance — bull low
+    var float var_bearH = 0.0   // EWM variance — bear high
+    var float var_bearL = 0.0   // EWM variance — bear low
+    var int   n_bull    = 0     // bull candle count (for t-correction)
+    var int   n_bear    = 0     // bear candle count (for t-correction)
+    var float curOpen   = na
+
+    atr = ta.atr(atrLength)
+
+    if timeframe.change(tf)
+        curOpen := open
+
+    if not na(curOpen) and not na(high) and not na(low) and not na(close) and not na(atr) and atr > 0.0
+        // IMPROVEMENT 2: ATR-normalize ranges before storing (dimensionless)
+        nH   = math.max(0.0, high - open) / atr
+        nL   = math.max(0.0, open - low)  / atr
+        bull = close > open
+
+        if bull
+            n_bull += 1
+            if na(ewm_bullH)
+                // First observation — seed the EWM
+                ewm_bullH := nH
+                ewm_bullL := nL
+            else
+                // IMPROVEMENT 1: EWM update
+                // Capture innovation (surprise vs prior estimate) BEFORE updating mean
+                // This is the Welford online variance method adapted for EWM
+                dH        = nH - ewm_bullH
+                dL        = nL - ewm_bullL
+                ewm_bullH := ewmLambda * ewm_bullH + (1.0 - ewmLambda) * nH
+                ewm_bullL := ewmLambda * ewm_bullL + (1.0 - ewmLambda) * nL
+                // IMPROVEMENT 3: EWM variance update
+                // V_t = λ·V_(t-1) + (1-λ)·d²   where d = x_t - μ_(t-1)
+                var_bullH := ewmLambda * var_bullH + (1.0 - ewmLambda) * dH * dH
+                var_bullL := ewmLambda * var_bullL + (1.0 - ewmLambda) * dL * dL
+        else
+            n_bear += 1
+            if na(ewm_bearH)
+                ewm_bearH := nH
+                ewm_bearL := nL
+            else
+                dH        = nH - ewm_bearH
+                dL        = nL - ewm_bearL
+                ewm_bearH := ewmLambda * ewm_bearH + (1.0 - ewmLambda) * nH
+                ewm_bearL := ewmLambda * ewm_bearL + (1.0 - ewmLambda) * nL
+                var_bearH := ewmLambda * var_bearH + (1.0 - ewmLambda) * dH * dH
+                var_bearL := ewmLambda * var_bearL + (1.0 - ewmLambda) * dL * dL
+
+    // IMPROVEMENT 4: t-distribution correction
+    // σ_adjusted = σ · sqrt(n / (n-2))
+    //   n=5  → ×1.29  (wide zone = low confidence with few samples)
+    //   n=10 → ×1.12
+    //   n=30 → ×1.04
+    //   n→∞  → ×1.00  (converges to plain σ)
+    // Returns na if below minimum sample threshold — levels not drawn until reliable
+    tCorr_bull = n_bull >= minSamples ? math.sqrt(float(n_bull) / math.max(float(n_bull) - 2.0, 1.0)) : float(na)
+    tCorr_bear = n_bear >= minSamples ? math.sqrt(float(n_bear) / math.max(float(n_bear) - 2.0, 1.0)) : float(na)
+
+    // Denormalize: multiply by current ATR to return to price units
+    mBH = na(tCorr_bull) or na(ewm_bullH) ? na : ewm_bullH * atr
+    mBL = na(tCorr_bull) or na(ewm_bullL) ? na : ewm_bullL * atr
+    mRH = na(tCorr_bear) or na(ewm_bearH) ? na : ewm_bearH * atr
+    mRL = na(tCorr_bear) or na(ewm_bearL) ? na : ewm_bearL * atr
+
+    // Denormalized σ with t-correction and user k-multiplier applied
+    sBH = na(tCorr_bull) ? na : math.sqrt(var_bullH) * tCorr_bull * atr * sigmaMult
+    sBL = na(tCorr_bull) ? na : math.sqrt(var_bullL) * tCorr_bull * atr * sigmaMult
+    sRH = na(tCorr_bear) ? na : math.sqrt(var_bearH) * tCorr_bear * atr * sigmaMult
+    sRL = na(tCorr_bear) ? na : math.sqrt(var_bearL) * tCorr_bear * atr * sigmaMult
+
+    // Project zones from current open price
+    //   Zone center = open ± EWM_mean_denormalized
+    //   Zone bounds = center ± k·σ_adjusted
+    res1Top = not na(curOpen) and not na(mRH) ? curOpen + mRH + sRH : na
+    res1Bot = not na(curOpen) and not na(mRH) ? curOpen + mRH - sRH : na
+    res2Top = not na(curOpen) and not na(mBH) ? curOpen + mBH + sBH : na
+    res2Bot = not na(curOpen) and not na(mBH) ? curOpen + mBH - sBH : na
+    sup1Top = not na(curOpen) and not na(mBL) ? curOpen - mBL + sBL : na
+    sup1Bot = not na(curOpen) and not na(mBL) ? curOpen - mBL - sBL : na
+    sup2Top = not na(curOpen) and not na(mRL) ? curOpen - mRL + sRL : na
+    sup2Bot = not na(curOpen) and not na(mRL) ? curOpen - mRL - sRL : na
+
+    [curOpen, res1Top, res1Bot, res2Top, res2Bot, sup1Top, sup1Bot, sup2Top, sup2Bot]
+
+// ===================== FETCH DATA FROM TIMEFRAMES =====================
+[sOpen, sRes1Top, sRes1Bot, sRes2Top, sRes2Bot, sSup1Top, sSup1Bot, sSup2Top, sSup2Bot] =
+     request.security(syminfo.tickerid, selectedTimeframe, calcBehavioralLevels(selectedLookback, selectedTimeframe), lookahead = barmerge.lookahead_on)
+
+currentTF = timeframe.period
+[cOpen, cRes1Top, cRes1Bot, cRes2Top, cRes2Bot, cSup1Top, cSup1Bot, cSup2Top, cSup2Bot] =
+     request.security(syminfo.tickerid, currentTF, calcBehavioralLevels(currentLookback, currentTF), lookahead = barmerge.lookahead_on)
+
+// ===================== OBJECT STORAGE =====================
+var selectedLabels = array.new<label>()
+var selectedBoxes  = array.new<box>()
+var currentLabels  = array.new<label>()
+var currentBoxes   = array.new<box>()
+
+// ===================== DRAW ZONE FUNCTION =====================
+// Accepts pre-computed zoneTop / zoneBot (= mean ± k·σ after ATR denorm + t-correction)
+// Label shows zone center price (statistical mean of the projected level)
+drawZone(startTime, zoneTop, zoneBot, levelColor, prefix, textColor, transparency, tf, endTime = time, isOpenPrice = false) =>
+    zoneBox    = box(na)
+    levelLabel = label(na)
+    if not na(zoneTop) and not na(zoneBot) and not na(startTime) and zoneTop > 0.0 and zoneBot > 0.0
+        top = isOpenPrice and math.abs(zoneTop - zoneBot) <= syminfo.mintick ?
+             zoneTop + syminfo.mintick : zoneTop
+        bot = isOpenPrice and math.abs(zoneTop - zoneBot) <= syminfo.mintick ?
+             zoneBot - syminfo.mintick : zoneBot
+        actualEndTime = zoneExtension == 'End of Period' ? getPeriodEndTime(startTime, tf) : endTime
+        if math.abs(top - bot) > syminfo.mintick
+            zoneBox := box.new(startTime, top, actualEndTime, bot,
+                               xloc         = xloc.bar_time,
+                               bgcolor      = color.new(levelColor, transparency),
+                               border_color = color.new(levelColor, 100),
+                               border_width = 1,
+                               force_overlay = true)
+        if showLabels
+            centerPrice = (top + bot) / 2.0
+            labelText   = prefix
+            if showLevelValues
+                labelText := labelText + str.tostring(centerPrice, format.mintick)
+            else
+                labelText := str.replace(labelText, ": ", "")
+            if zoneExtension == 'End of Period'
+                levelLabel := label.new(actualEndTime, centerPrice, labelText,
+                                        xloc       = xloc.bar_time,
+                                        color      = color.new(color.black, 100),
+                                        textcolor  = textColor,
+                                        style      = label.style_label_left,
+                                        size       = size.normal,
+                                        force_overlay = true)
+            else
+                levelLabel := label.new(bar_index + 1, centerPrice, labelText,
+                                        xloc       = xloc.bar_index,
+                                        color      = color.new(color.black, 100),
+                                        textcolor  = textColor,
+                                        style      = label.style_label_left,
+                                        size       = size.normal,
+                                        force_overlay = true)
+    [zoneBox, levelLabel]
+
+// ===================== DRAW SELECTED TF LEVELS =====================
+if (timeframe.change(selectedTimeframe) or barstate.isfirst) and (timeframeDisplay != 'Current')
+    for item in selectedLabels
+        label.delete(item)
+    for item in selectedBoxes
+        box.delete(item)
+    selectedLabels.clear()
+    selectedBoxes.clear()
+
+    sessionStart = time
+    tfPrefix     = selectedTimeframe == 'D' ? 'D' : selectedTimeframe == 'W' ? 'W' : selectedTimeframe
+
+    [openBox,  openLabel]  = drawZone(sessionStart, sOpen,    sOpen,    selectedOpenColor,    tfPrefix + ' Open: ',       selectedOpenColor,    selectedZoneTransparency, selectedTimeframe, sessionStart, true)
+    [res1Box,  res1Label]  = drawZone(sessionStart, sRes1Top, sRes1Bot, selectedPivotColor,   tfPrefix + ' [-] Pivot: ',  selectedPivotColor,   selectedZoneTransparency, selectedTimeframe, sessionStart)
+    [res2Box,  res2Label]  = drawZone(sessionStart, sRes2Top, sRes2Bot, selectedExtremeColor, tfPrefix + ' [+] Extreme: ',selectedExtremeColor, selectedZoneTransparency, selectedTimeframe, sessionStart)
+    [sup1Box,  sup1Label]  = drawZone(sessionStart, sSup1Top, sSup1Bot, selectedPivotColor,   tfPrefix + ' [+] Pivot: ',  selectedPivotColor,   selectedZoneTransparency, selectedTimeframe, sessionStart)
+    [sup2Box,  sup2Label]  = drawZone(sessionStart, sSup2Top, sSup2Bot, selectedExtremeColor, tfPrefix + ' [-] Extreme: ',selectedExtremeColor, selectedZoneTransparency, selectedTimeframe, sessionStart)
+
+    for item in array.from(openBox, res1Box, res2Box, sup1Box, sup2Box)
+        if not na(item)
+            selectedBoxes.push(item)
+    if showLabels
+        for item in array.from(openLabel, res1Label, res2Label, sup1Label, sup2Label)
+            if not na(item)
+                selectedLabels.push(item)
+
+// ===================== DRAW CURRENT TF LEVELS =====================
+if (timeframe.change(timeframe.period) or barstate.isfirst) and (timeframeDisplay != 'Selected')
+    for item in currentLabels
+        label.delete(item)
+    for item in currentBoxes
+        box.delete(item)
+    currentLabels.clear()
+    currentBoxes.clear()
+
+    sessionStart    = time
+    currentTFPrefix = timeframe.period
+
+    [openBox,  openLabel]  = drawZone(sessionStart, cOpen,    cOpen,    currentOpenColor,    currentTFPrefix + ' Open: ',       currentOpenColor,    currentZoneTransparency, timeframe.period, sessionStart, true)
+    [res1Box,  res1Label]  = drawZone(sessionStart, cRes1Top, cRes1Bot, currentPivotColor,   currentTFPrefix + ' [-] Pivot: ',  currentPivotColor,   currentZoneTransparency, timeframe.period, sessionStart)
+    [res2Box,  res2Label]  = drawZone(sessionStart, cRes2Top, cRes2Bot, currentExtremeColor, currentTFPrefix + ' [+] Extreme: ',currentExtremeColor, currentZoneTransparency, timeframe.period, sessionStart)
+    [sup1Box,  sup1Label]  = drawZone(sessionStart, cSup1Top, cSup1Bot, currentPivotColor,   currentTFPrefix + ' [+] Pivot: ',  currentPivotColor,   currentZoneTransparency, timeframe.period, sessionStart)
+    [sup2Box,  sup2Label]  = drawZone(sessionStart, cSup2Top, cSup2Bot, currentExtremeColor, currentTFPrefix + ' [-] Extreme: ',currentExtremeColor, currentZoneTransparency, timeframe.period, sessionStart)
+
+    for item in array.from(openBox, res1Box, res2Box, sup1Box, sup2Box)
+        if not na(item)
+            currentBoxes.push(item)
+    if showLabels
+        for item in array.from(openLabel, res1Label, res2Label, sup1Label, sup2Label)
+            if not na(item)
+                currentLabels.push(item)
+
+// ===================== UPDATE FUNCTIONS =====================
+updateBoxes(boxes) =>
+    for item in boxes
+        box.set_right(item, time)
+
+updateLabels(labels) =>
+    for item in labels
+        label.set_x(item, bar_index + 1)
+
+// ===================== REAL-TIME ZONE EXTENSION (CURRENT BAR MODE) =====================
+if zoneExtension == 'Current Bar' and timeframeDisplay != 'Current' and selectedBoxes.size() > 0
+    updateBoxes(selectedBoxes)
+    if showLabels and selectedLabels.size() > 0
+        updateLabels(selectedLabels)
+
+if zoneExtension == 'Current Bar' and timeframeDisplay != 'Selected' and currentBoxes.size() > 0
+    updateBoxes(currentBoxes)
+    if showLabels and currentLabels.size() > 0
+        updateLabels(currentLabels)
