@@ -51,67 +51,47 @@ var G_VIZ   = "⑦ Visualisation"
 
 // ── Volume ────────────────────────────────────────────────────────────────────
 useRVOL = input.bool(true, "Use Relative Volume (RVOL)", group=G_VOL,
-     tooltip="Normalise each bar's volume against its own rolling SMA.\n"
-             "Removes need for manual Magnitude/Multiplier per instrument.")
+     tooltip="Normalise each bar's volume against its own rolling SMA.\nRemoves need for manual Magnitude/Multiplier per instrument.")
 rvolLen = input.int(288, "RVOL Lookback (bars)", minval=10, maxval=2000, group=G_VOL,
-     tooltip="288 bars = 1 trading day on 5-min chart (24h × 12 bars/hr).\n"
-             "Prevents session-open spikes from inflating RVOL on FX.\n"
-             "For daily charts use 50. For 4H use 42 (1 week).")
+     tooltip="288 bars = 1 trading day on 5-min chart (24h x 12 bars/hr).\nPrevents session-open spikes from inflating RVOL on FX.\nFor daily charts use 50. For 4H use 42 (1 week).")
 smg4    = input.int(3, "Magnitude (legacy — RVOL OFF only)", minval=1, maxval=9, group=G_VOL)
 smt4    = input.int(2, "Multiplier (legacy — RVOL OFF only)", minval=1, maxval=9, group=G_VOL)
 
 // ── Scale ─────────────────────────────────────────────────────────────────────
 scaleType = input.string("True Exponential", "Scale Type", group=G_SCALE,
      options=["Linear","Quadratic","True Exponential","Fibonacci","Log-Spaced"],
-     tooltip="True Exponential: tᵢ = b^(i-1). Matches log-normal distribution of volume.\n"
-             "Fibonacci: natural market growth sequence 1,2,3,5,8,13,21,34,55.\n"
-             "Log-Spaced: perceptually uniform on logarithmic price axis.")
+     tooltip="True Exponential: ti = b^(i-1). Matches log-normal distribution of volume.\nFibonacci: natural market growth sequence 1,2,3,5,8,13,21,34,55.\nLog-Spaced: perceptually uniform on logarithmic price axis.")
 expBase   = input.float(2.0, "Exponential Base (True Exp only)", minval=1.1, maxval=10.0,
      step=0.1, group=G_SCALE,
-     tooltip="b=2.0 → thresholds 1,2,4,8,16,32,64,128,256× avg volume.\n"
-             "b=1.5 → finer resolution: 1,1.5,2.25,3.4,5.1,7.6,11,17,26×")
+     tooltip="b=2.0 -> thresholds 1,2,4,8,16,32,64,128,256x avg volume.\nb=1.5 -> finer resolution: 1,1.5,2.25,3.4,5.1,7.6,11,17,26x")
 
 // ── Pivot Detection — THE FIX ─────────────────────────────────────────────────
 pivLen      = input.int(4, "Pivot Lookback Length (L)", minval=1, maxval=50, group=G_PIV,
-     tooltip="Pivot confirmed if bar[L] is highest/lowest in window [0,2L].\n"
-             "Confirmation lag = L bars. Higher = stronger / fewer pivots.")
-minTierHigh = input.int(2, "Min Tier — Pivot HIGHS (0–9)", minval=0, maxval=9, group=G_PIV,
-     tooltip="Min volume tier to store a pivot HIGH (sell-side liquidity, resistance).\n"
-             "Tier 2 = blue (notable volume). Tier 4 = green (institutional).")
-minTierLow  = input.int(1, "Min Tier — Pivot LOWS  (0–9)", minval=0, maxval=9, group=G_PIV,
-     tooltip="▼ FIX for asymmetric map ▼\n"
-             "Set LOWER than Highs. In downtrends, retracement rallies have less volume\n"
-             "than impulse legs, so lows form on lower RVOL. Setting this equal to Highs\n"
-             "would produce zero low pivot lines — the problem seen in the snapshot.\n"
-             "Default 1 = capture any above-baseline volume at lows.")
+     tooltip="Pivot confirmed if bar[L] is highest/lowest in window [0,2L].\nConfirmation lag = L bars. Higher = stronger / fewer pivots.")
+minTierHigh = input.int(2, "Min Tier - Pivot HIGHS (0-9)", minval=0, maxval=9, group=G_PIV,
+     tooltip="Min volume tier to store a pivot HIGH (sell-side liquidity, resistance).\nTier 2 = blue (notable volume). Tier 4 = green (institutional).")
+minTierLow  = input.int(1, "Min Tier - Pivot LOWS  (0-9)", minval=0, maxval=9, group=G_PIV,
+     tooltip="FIX for asymmetric map.\nSet LOWER than Highs. In downtrends retracement rallies have less volume than impulse legs, so lows form on lower RVOL.\nSetting equal to Highs produces zero low pivot lines (the snapshot problem).\nDefault 1 = capture any above-baseline volume at lows.")
 maxLevels   = input.int(20, "Max Stored Levels per Side", minval=3, maxval=50, group=G_PIV,
      tooltip="Oldest levels are dropped when this limit is exceeded.")
 invalidMult = input.float(0.5, "Invalidation ATR Multiplier", minval=0.1, maxval=5.0,
      step=0.1, group=G_PIV,
-     tooltip="A level is removed when price CLOSES beyond it by ATR × this value.\n"
-             "Prevents strategy from trading at 'consumed' levels.")
-flipOnBreak = input.bool(true, "Flip: Broken Resistance → Support (and vice versa)", group=G_PIV,
-     tooltip="When price closes above a resistance level (invalidation), the level is\n"
-             "reclassified as a support level and moved to the low array (flip logic).")
+     tooltip="A level is removed when price CLOSES beyond it by ATR x this value.\nPrevents strategy from trading at consumed levels.")
+flipOnBreak = input.bool(true, "Flip: Broken Resistance becomes Support", group=G_PIV,
+     tooltip="When price closes above a resistance level it is reclassified as support.\nWhen price closes below a support level it is reclassified as resistance.")
 
 // ── Entry ─────────────────────────────────────────────────────────────────────
 entryMode = input.string("Sweep & Reverse", "Entry Mode", group=G_ENT,
      options=["Sweep & Reverse","Level Touch","Both"],
-     tooltip="Sweep & Reverse: wick crosses level, bar closes on opposite side.\n"
-             "                 Highest probability — confirms stop-hunt reversal.\n"
-             "Level Touch    : close within tolerance band, volume confirmed.\n"
-             "Both           : take either signal, whichever fires first.")
+     tooltip="Sweep & Reverse: wick crosses level, bar closes on opposite side. Highest probability - confirms stop-hunt reversal.\nLevel Touch: close within tolerance band, volume confirmed.\nBoth: take either signal, whichever fires first.")
 zonePct      = input.float(0.05, "Zone Tolerance (%)", minval=0.005, maxval=1.0,
      step=0.005, group=G_ENT,
-     tooltip="Tolerance band width as % of price for Level Touch mode.\n"
-             "0.05% = 0.5 pips on EUR/USD @ 1.15.")
+     tooltip="Tolerance band width as % of price for Level Touch mode.\n0.05% = 0.5 pips on EUR/USD at 1.15.")
 minEntryRVOL = input.float(1.2, "Min RVOL on Entry Bar", minval=0.3, maxval=10.0,
      step=0.1, group=G_ENT,
-     tooltip="Entry bar must show above-average volume participation.\n"
-             "1.2 = 20% above rolling average. Filters low-conviction reversals.")
+     tooltip="Entry bar must show above-average volume participation.\n1.2 = 20% above rolling average. Filters low-conviction reversals.")
 requireEngulf = input.bool(true, "Require Engulfing/Pin Bar Confirmation", group=G_ENT,
-     tooltip="Entry bar must close beyond the previous bar's open (engulfing), OR\n"
-             "show a significant wick (pin bar) relative to body. Reduces false sweeps.")
+     tooltip="Entry bar must close beyond the previous bar's open (engulfing), OR show a significant wick (pin bar) relative to body. Reduces false sweeps.")
 
 // ── Filters ───────────────────────────────────────────────────────────────────
 useTrend    = input.bool(true,  "Trend Filter — EMA", group=G_FILT,
@@ -119,25 +99,20 @@ useTrend    = input.bool(true,  "Trend Filter — EMA", group=G_FILT,
 trendLen    = input.int(200,    "Trend EMA Length",    minval=10, group=G_FILT)
 longOnly    = input.bool(false, "Long Only",           group=G_FILT)
 shortOnly   = input.bool(false, "Short Only",          group=G_FILT)
-minLevelTier = input.int(0,     "Min Tier at Trigger Level (0–9)", minval=0, maxval=9,
+minLevelTier = input.int(0,     "Min Tier at Trigger Level (0-9)", minval=0, maxval=9,
      group=G_FILT,
-     tooltip="Only trade setups where the triggered level's volume tier ≥ this value.\n"
-             "0 = trade all levels. 3 = only trade high-conviction institutional levels.")
+     tooltip="Only trade setups where the triggered level's volume tier >= this value.\n0 = trade all levels. 3 = only trade high-conviction institutional levels.")
 
 // ── Risk ──────────────────────────────────────────────────────────────────────
 atrLen    = input.int(14,   "ATR Length",               minval=1, group=G_RISK)
 slMult    = input.float(1.5,"Stop-Loss ATR Multiplier", minval=0.1, maxval=10.0, step=0.1,
      group=G_RISK,
-     tooltip="Stop placed beyond sweep bar's extreme by ATR × multiplier.\n"
-             "Long: stop = sweep_bar_low  − ATR × mult\n"
-             "Short: stop = sweep_bar_high + ATR × mult")
+     tooltip="Stop placed beyond sweep bar extreme by ATR x multiplier.\nLong: stop = sweep_bar_low - ATR x mult\nShort: stop = sweep_bar_high + ATR x mult")
 rrRatio   = input.float(2.0,"Minimum R:R Ratio",        minval=0.5, maxval=20.0, step=0.1,
      group=G_RISK,
-     tooltip="If no opposing level is found for TP, use Entry + (risk × R:R).\n"
-             "Also acts as a minimum: if opposing level gives R:R < this, skip trade.")
+     tooltip="If no opposing level found for TP, use Entry + (risk x R:R).\nAlso a floor: if opposing level gives R:R below this, override with R:R-based TP.")
 useOppTP  = input.bool(true,"TP at Nearest Opposing Level", group=G_RISK,
-     tooltip="Compute TP as nearest confirmed pivot on the opposite side of trade.\n"
-             "Mathematically optimal: TP = next liquidity pool in trade direction.")
+     tooltip="Compute TP as nearest confirmed pivot on the opposite side of trade.\nMathematically optimal: TP = next liquidity pool in trade direction.")
 
 // ── Visualisation ─────────────────────────────────────────────────────────────
 showBars   = input.bool(true,  "Colour Bars by Volume Tier", group=G_VIZ)
