@@ -1,0 +1,319 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mellowmichellehe — Liquidity Engineering Edition
+//@version=6
+indicator("Smart Volume Pro — Supply & Demand", shorttitle="SVP S&D", format=format.volume, overlay=true,
+     max_lines_count=100, max_labels_count=100, max_boxes_count=100)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Volume ---
+use_rvol     = input.bool(true,  "Use Relative Volume (RVOL)?",
+     tooltip="Auto-adapts to any asset. Disable to use manual thresholds.",
+     group="Volume Settings")
+vol_lookback = input.int(50, "RVOL Lookback", minval=10, group="Volume Settings")
+magnitude    = input.int(3, "Manual Magnitude (10^n)", minval=1, maxval=9,
+     tooltip="Only used if RVOL is unchecked", group="Volume Settings")
+manual_mult  = input.int(2, "Manual Multiplier", minval=1, maxval=9, group="Volume Settings")
+
+// --- Zone Structure ---
+pivot_len      = input.int(5,   "Pivot Sensitivity",
+     minval=2, maxval=20,
+     tooltip="Higher = fewer, more significant zones. Lower = more granular zones.",
+     group="Supply & Demand Zones")
+min_rvol_zone  = input.float(1.5, "Min RVOL to Draw Zone",  step=0.1, group="Supply & Demand Zones")
+rvol_moderate  = input.float(2.0, "Moderate Zone Min RVOL", step=0.5, group="Supply & Demand Zones")
+rvol_strong    = input.float(3.5, "Strong Zone Min RVOL",   step=0.5, group="Supply & Demand Zones")
+
+// --- Zone Lifecycle ---
+max_zone_tests = input.int(3, "Tests Before Zone Expires",
+     minval=1, maxval=10,
+     tooltip="How many times price can enter a zone before it is considered exhausted and removed.",
+     group="Supply & Demand Zones")
+mitigate_on    = input.bool(true, "Mitigate Zones on Body Close Through?",
+     tooltip="Marks a supply zone mitigated when a candle closes ABOVE its top. Demand zone mitigated when close is BELOW its bottom.",
+     group="Supply & Demand Zones")
+show_weak      = input.bool(false, "Show Weak Zones",
+     tooltip="Weak = RVOL between min threshold and Moderate threshold. Often noise — disable for cleaner chart.",
+     group="Supply & Demand Zones")
+
+// --- Display ---
+show_labels = input.bool(true,  "Show Zone Strength Labels", group="Display")
+show_wicks  = input.bool(true,  "Volume-Colored Candles",    group="Display")
+
+// ============================================================================
+// PRICE & VOLUME DATA
+// ============================================================================
+ticker_id = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
+ha_t      = ticker.heikinashi(ticker_id)
+ha_open   = request.security(ha_t, timeframe.period, open)
+ha_high   = request.security(ha_t, timeframe.period, high)
+ha_low    = request.security(ha_t, timeframe.period, low)
+ha_close  = request.security(ha_t, timeframe.period, close)
+
+avg_vol = ta.sma(volume, vol_lookback)
+rvol    = avg_vol > 0 ? volume / avg_vol : 0.0
+atr14   = ta.atr(14)
+
+// Volume heat for candle coloring (0–9 scale)
+var float vol_heat = 0.0
+if use_rvol
+    vol_heat := math.min(rvol * 3.0, 9.0)
+else
+    vol_heat := math.min(volume / (math.pow(10, magnitude) * manual_mult), 9.0)
+
+c_vol = color.from_gradient(vol_heat, 0, 9, color.rgb(45, 52, 54), color.rgb(255, 255, 255))
+if vol_heat >= 7
+    c_vol := color.red
+if vol_heat >= 8
+    c_vol := color.white
+
+barcolor(c_vol)
+plotcandle(show_wicks ? ha_open : na, ha_high, ha_low, ha_close,
+     title="HA Candles", color=c_vol, wickcolor=c_vol, bordercolor=c_vol)
+
+// ============================================================================
+// ZONE DATA STRUCTURE
+// ============================================================================
+// Strength levels:
+//   0 = Weak     — RVOL ≥ min_rvol_zone  (potential noise, often fades quickly)
+//   1 = Moderate — RVOL ≥ rvol_moderate  (respectable institutional interest)
+//   2 = Strong   — RVOL ≥ rvol_strong    (high-conviction liquidity node)
+//
+// Zone body (order-block style):
+//   Supply: z_top = wick high (distal), z_bot = candle body low (proximal)
+//   Demand: z_top = candle body high (proximal), z_bot = wick low (distal)
+//
+// Tests: each time price ENTERS the zone (outside→inside transition) counts as 1 test.
+//   More tests = more liquidity consumed = zone weakens.
+//   Zone expires after max_zone_tests entries or a body-close break.
+
+type Zone
+    box   bx
+    label lbl
+    float top
+    float bottom
+    bool  is_supply        // true = supply/resistance | false = demand/support
+    bool  active
+    int   tests            // number of times price entered zone
+    bool  was_in_zone      // previous-bar state for entry detection
+    float zone_rvol        // RVOL at zone origin
+    int   zone_strength    // 0 | 1 | 2
+    float departure_pts    // avg pts price moved away after origin (impulse proxy)
+
+var Zone[] zones = array.new<Zone>()
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Strength bucket from RVOL
+f_strength(rv) =>
+    rv >= rvol_strong   ? 2 :
+     rv >= rvol_moderate ? 1 : 0
+
+// Departure impulse: average range of the pivot_len bars after the pivot
+// (these are bar_index-pivot_len+1 … bar_index — already historical, no lookahead).
+// Returns absolute points moved away from the pivot price.
+f_departure(is_supply, piv_price) =>
+    float total = 0.0
+    for k = 0 to pivot_len - 1
+        total += is_supply ? math.max(piv_price - low[k],  0.0)
+                           : math.max(high[k]  - piv_price, 0.0)
+    total / float(pivot_len)
+
+// Supply zone color — alpha increases (more transparent) with each test
+f_supply_col(slevel, tested) =>
+    int alpha = math.min(tested * 18 + 35, 78)
+    slevel == 2 ? color.rgb(255, 50,  50,  alpha) :
+     slevel == 1 ? color.rgb(220, 110, 50,  alpha) :
+                   color.rgb(160, 100, 100, alpha)
+
+// Demand zone color — alpha increases (more transparent) with each test
+f_demand_col(slevel, tested) =>
+    int alpha = math.min(tested * 18 + 35, 78)
+    slevel == 2 ? color.rgb(50,  220, 95,  alpha) :
+     slevel == 1 ? color.rgb(50,  175, 140, alpha) :
+                   color.rgb(90,  140, 110, alpha)
+
+// Border color — brighter = stronger
+f_border_col(is_supply, slevel) =>
+    if is_supply
+        slevel == 2 ? color.rgb(255, 30,  30)  :
+         slevel == 1 ? color.rgb(210, 100, 50)  :
+                       color.rgb(140,  90, 90)
+    else
+        slevel == 2 ? color.rgb(30,  210, 80)  :
+         slevel == 1 ? color.rgb(40,  165, 130) :
+                       color.rgb(80,  125, 100)
+
+// ============================================================================
+// ZONE CREATION
+// ============================================================================
+addZone(is_supply, rvol_val) =>
+    // Prune oldest zone when array is full
+    if array.size(zones) >= 40
+        old = array.shift(zones)
+        box.delete(old.bx)
+        label.delete(old.lbl)
+
+    // ── Origin candle (confirmed pivot_len bars ago) ──
+    float o = open[pivot_len]
+    float c = close[pivot_len]
+    float h = high[pivot_len]
+    float l = low[pivot_len]
+
+    // Zone body: distal line = wick extreme, proximal line = candle body edge
+    //   Supply:  top=wick-high (ceiling),  bottom=body-low  (proximal — first line of defence)
+    //   Demand:  top=body-high (proximal), bottom=wick-low  (floor)
+    float z_top = is_supply ? h                  : math.max(o, c)
+    float z_bot = is_supply ? math.min(o, c)     : l
+
+    // Ensure zone has a minimum width (avoid zero-height boxes on doji candles)
+    float min_width = atr14 * 0.15
+    if z_top - z_bot < min_width
+        z_top := z_top + min_width * 0.5
+        z_bot := z_bot - min_width * 0.5
+
+    int   slevel  = f_strength(rvol_val)
+    float depart  = f_departure(is_supply, is_supply ? h : l)
+    int   bw      = slevel == 2 ? 2 : 1
+
+    color zc = is_supply ? f_supply_col(slevel, 0) : f_demand_col(slevel, 0)
+    color bc = f_border_col(is_supply, slevel)
+
+    b = box.new(
+         bar_index - pivot_len, z_top,
+         bar_index,             z_bot,
+         bgcolor      = zc,
+         border_color = bc,
+         border_width  = bw)
+
+    // ── Label ──
+    lbl_txt = ""
+    if show_labels
+        slevel_str = slevel == 2 ? "STRONG" : slevel == 1 ? "MOD" : "WEAK"
+        type_str   = is_supply ? "SUPPLY" : "DEMAND"
+        depart_str = str.format("{0,number,#.##}", depart / syminfo.mintick) + "t"
+        lbl_txt   := slevel_str + " " + type_str +
+                     "\n" + str.format("{0,number,#.##}x vol", rvol_val) +
+                     "  ↑" + depart_str
+
+    color tc = is_supply ? color.new(color.red, 0) : color.new(color.lime, 0)
+    if slevel == 2
+        tc := color.white
+    ls  = is_supply ? label.style_label_down : label.style_label_up
+    lsz = slevel == 2 ? size.small : size.tiny
+    lby = is_supply ? z_top : z_bot
+
+    lb = label.new(bar_index - pivot_len, lby, lbl_txt,
+         color     = color.new(color.black, 100),
+         textcolor = tc,
+         style     = ls,
+         size      = lsz)
+
+    array.push(zones, Zone.new(b, lb, z_top, z_bot, is_supply, true, 0, false, rvol_val, slevel, depart))
+
+// ============================================================================
+// PIVOT DETECTION  (uses real OHLC — no HA contamination)
+// ============================================================================
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low,  pivot_len, pivot_len)
+
+rvol_at_pivot = rvol[pivot_len]
+
+if not na(ph) and (not use_rvol or rvol_at_pivot >= min_rvol_zone)
+    slevel_ph = f_strength(rvol_at_pivot)
+    if show_weak or slevel_ph > 0
+        addZone(true, rvol_at_pivot)
+
+if not na(pl) and (not use_rvol or rvol_at_pivot >= min_rvol_zone)
+    slevel_pl = f_strength(rvol_at_pivot)
+    if show_weak or slevel_pl > 0
+        addZone(false, rvol_at_pivot)
+
+// ============================================================================
+// ZONE MANAGEMENT — THE LIQUIDITY ENGINE
+//
+// Logic per bar for each active zone:
+//   1. Extend box to current bar (zones are "alive" until mitigated)
+//   2. Detect zone ENTRY (outside→inside transition) → increment test counter
+//      → re-color zone to reflect weakening (fade with each test)
+//   3. Mitigation: body-close beyond distal line → mark inactive, grey out
+//   4. Exhaustion: test count ≥ max_zone_tests → same as mitigation
+// ============================================================================
+var bool alert_strong_supply = false
+var bool alert_strong_demand = false
+var bool alert_zone_mitigated = false
+
+alert_strong_supply  := false
+alert_strong_demand  := false
+alert_zone_mitigated := false
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        z = array.get(zones, i)
+
+        if z.active
+            // Extend zone rightward to current bar
+            box.set_right(z.bx, bar_index)
+
+            // ── Test Detection (entry transition) ──
+            bool in_zone_now = close >= z.bottom and close <= z.top
+
+            if in_zone_now and not z.was_in_zone
+                z.tests := z.tests + 1
+
+                // Fade zone to show liquidity consumption
+                new_col = z.is_supply
+                     ? f_supply_col(z.zone_strength, z.tests)
+                     : f_demand_col(z.zone_strength, z.tests)
+                box.set_bgcolor(z.bx, new_col)
+
+                // Alert on first test of a strong zone
+                if z.zone_strength == 2 and z.tests == 1
+                    if z.is_supply
+                        alert_strong_supply := true
+                    else
+                        alert_strong_demand := true
+
+            z.was_in_zone := in_zone_now
+
+            // ── Mitigation Check ──
+            // A zone is mitigated when a candle BODY closes through the distal line.
+            //   Supply distal = z.top   → close > z.top
+            //   Demand distal = z.bottom → close < z.bottom
+            bool mitigated = false
+            if mitigate_on
+                mitigated := z.is_supply ? close > z.top : close < z.bottom
+
+            bool exhausted = z.tests >= max_zone_tests
+
+            if mitigated or exhausted
+                z.active         := false
+                alert_zone_mitigated := true
+                // Grey out to show historical mitigated zone (informational trail)
+                box.set_bgcolor(z.bx,      color.new(color.gray, 88))
+                box.set_border_color(z.bx, color.new(color.gray, 72))
+                box.set_border_style(z.bx, line.style_dotted)
+                label.delete(z.lbl)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(rvol > rvol_strong,
+     "Extreme Volume Spike",
+     "Volume exceeded the strong RVOL threshold")
+
+alertcondition(alert_strong_supply,
+     "Price Entering Strong Supply Zone",
+     "Unmitigated high-volume supply zone is being tested for the first time")
+
+alertcondition(alert_strong_demand,
+     "Price Entering Strong Demand Zone",
+     "Unmitigated high-volume demand zone is being tested for the first time")
+
+alertcondition(alert_zone_mitigated,
+     "Zone Mitigated / Exhausted",
+     "A supply or demand zone has been fully consumed (mitigated or tested out)")
