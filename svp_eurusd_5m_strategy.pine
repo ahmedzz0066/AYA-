@@ -1,0 +1,555 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © SVP S&D — EURUSD 5M Day Trade Strategy (Liquidity Engineering Edition)
+//
+// ─── STRATEGY LOGIC (Thinking Like a Market Liquidity Engineer) ─────────────
+//
+//  CORE THESIS
+//  ──────────────────────────────────────────────────────────────────────────
+//  Institutional order flow clusters at specific price ranges (order blocks).
+//  These zones leave a "footprint" via abnormal volume. When price returns to
+//  an unmitigated zone, unfilled orders absorb price and cause a reaction.
+//  We enter on the FIRST confirmed test of a high-volume, fresh zone and ride
+//  the reaction for 3× the risk.
+//
+//  ENTRY RULES (All must be true)
+//  ──────────────────────────────────────────────────────────────────────────
+//  1. An active STRONG or MOD Supply/Demand zone exists (≥ RVOL threshold)
+//  2. Zone is FRESH (< max_tests_entry prior touches)
+//  3. Price closes INSIDE the zone on the current bar (first entry)
+//  4. Entry candle shows CONFIRMATION:
+//       DEMAND → bullish close (close > open) — buyers absorbed sellers
+//       SUPPLY → bearish close (close < open) — sellers absorbed buyers
+//  5. 15-Minute 50 EMA trend filter aligns (optional)
+//  6. Current bar is inside London (07–12 UTC) or NY session (13–16 UTC)
+//  7. Max daily trade limit not exceeded
+//  8. Not past EOD cutoff
+//
+//  STOP LOSS
+//  ──────────────────────────────────────────────────────────────────────────
+//  • LONG:  Below zone distal line (wick low) − ATR buffer
+//  • SHORT: Above zone distal line (wick high) + ATR buffer
+//  → If price closes through the distal line, the thesis is invalidated.
+//
+//  TAKE PROFIT  (3:1 Risk-to-Reward, fixed)
+//  ──────────────────────────────────────────────────────────────────────────
+//  TP = Entry ± (Entry − SL) × 3
+//  Calculated from actual fill price using strategy.position_avg_price.
+//
+//  TRADE MANAGEMENT
+//  ──────────────────────────────────────────────────────────────────────────
+//  • Max 3 trades per day (prevents revenge trading)
+//  • No new entries after 16:00 UTC (trades already open can run to TP/SL)
+//  • All positions force-closed at 17:00 UTC (avoid overnight gap risk)
+//  • Zones fade with each test — zone colour degradation is a visual cue
+//    to reduce conviction on repeatedly-tested levels
+//
+//  DISCLAIMER: For educational purposes. Past performance ≠ future results.
+//  Always use proper risk management and test on demo before live trading.
+// ────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+strategy("SVP S&D — EURUSD 5M 3:1",
+     shorttitle           = "SVP 5M 3:1",
+     overlay              = true,
+     pyramiding           = 0,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 1.0,
+     commission_type      = strategy.commission.cash_per_order,
+     commission_value     = 0.35,
+     slippage             = 1,
+     max_bars_back        = 500,
+     calc_on_order_fills  = false,
+     process_orders_on_close = false)
+
+// ============================================================================
+// INPUTS — Strategy Rules
+// ============================================================================
+rr_ratio      = input.float(3.0, "Risk : Reward Ratio",          minval=1.0, step=0.5,  group="Strategy Rules")
+risk_pct      = input.float(1.0, "Risk % per Trade",             minval=0.1, step=0.1,  group="Strategy Rules",
+     tooltip="Position size = (Equity × risk%) / Stop distance. Adjust lot size manually in broker to match.")
+stop_buf      = input.float(0.5, "SL Buffer beyond Zone (× ATR)", minval=0.0, step=0.1, group="Strategy Rules",
+     tooltip="Extra distance beyond zone distal line before placing stop. 0.5 ATR recommended for EUR/USD 5M spread+slippage.")
+min_str       = input.int(1,  "Min Zone Strength Required",      minval=0, maxval=2,    group="Strategy Rules",
+     tooltip="0=include Weak | 1=Moderate+ (recommended) | 2=Strong only")
+max_t_entry   = input.int(1,  "Max Prior Tests at Entry",        minval=1, maxval=3,    group="Strategy Rules",
+     tooltip="1 = fresh zones only (highest probability). 2 allows a second touch.")
+max_daily     = input.int(3,  "Max Trades per Day",              minval=1, maxval=10,   group="Strategy Rules")
+use_trend     = input.bool(true,  "Enable 15M 50 EMA Trend Filter?",                   group="Strategy Rules",
+     tooltip="Longs only when price is above 15M 50 EMA. Shorts only when below. Reduces counter-trend losses.")
+
+// ============================================================================
+// INPUTS — Session Windows (UTC)
+// ============================================================================
+london_open  = input.int(7,  "London Open  (UTC hour)", minval=0, maxval=23, group="Sessions (UTC)")
+london_close = input.int(12, "London Close (UTC hour)", minval=0, maxval=23, group="Sessions (UTC)")
+ny_open      = input.int(13, "NY Open      (UTC hour)", minval=0, maxval=23, group="Sessions (UTC)")
+ny_cutoff    = input.int(16, "NY Cutoff — No New Entries After (UTC)", minval=0, maxval=23, group="Sessions (UTC)",
+     tooltip="Stop entering new trades at this hour. Open positions continue to run to SL/TP.")
+eod_hour     = input.int(17, "EOD Force Flat Hour (UTC)", minval=0, maxval=23, group="Sessions (UTC)",
+     tooltip="All open positions are closed at this hour to avoid overnight gaps.")
+
+// ============================================================================
+// INPUTS — Zone Detection (mirrors the companion indicator)
+// ============================================================================
+use_rvol     = input.bool(true,  "Use Relative Volume (RVOL)?", group="Zone Settings")
+vol_lookback = input.int(50,     "RVOL Lookback",               minval=10,            group="Zone Settings")
+magnitude    = input.int(3,      "Manual Magnitude (10^n)",     minval=1, maxval=9,   group="Zone Settings",
+     tooltip="Only used when RVOL is unchecked")
+manual_mult  = input.int(2,      "Manual Multiplier",           minval=1, maxval=9,   group="Zone Settings")
+pivot_len    = input.int(5,      "Pivot Sensitivity",           minval=2, maxval=20,  group="Zone Settings")
+min_rvol_zone  = input.float(1.5, "Min RVOL to Draw Zone",     step=0.1,             group="Zone Settings")
+rvol_moderate  = input.float(2.0, "Moderate Zone Min RVOL",    step=0.5,             group="Zone Settings")
+rvol_strong    = input.float(3.5, "Strong Zone Min RVOL",      step=0.5,             group="Zone Settings")
+max_zone_tests = input.int(3,    "Tests Before Zone Expires",   minval=1, maxval=10,  group="Zone Settings")
+mitigate_on    = input.bool(true, "Mitigate Zones on Body-Close Break?",              group="Zone Settings")
+show_weak      = input.bool(false, "Show Weak Zones",                                 group="Zone Settings")
+show_labels    = input.bool(true,  "Zone Strength Labels",                            group="Zone Settings")
+show_wicks     = input.bool(true,  "Volume-Coloured Candles",                        group="Zone Settings")
+
+// ============================================================================
+// PRICE, VOLUME & INDICATOR DATA
+// ============================================================================
+ticker_id = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
+ha_t      = ticker.heikinashi(ticker_id)
+ha_open   = request.security(ha_t, timeframe.period, open)
+ha_high   = request.security(ha_t, timeframe.period, high)
+ha_low    = request.security(ha_t, timeframe.period, low)
+ha_close  = request.security(ha_t, timeframe.period, close)
+
+avg_vol = ta.sma(volume, vol_lookback)
+rvol    = avg_vol > 0 ? volume / avg_vol : 0.0
+atr14   = ta.atr(14)
+
+// Heikin Ashi candles coloured by volume heat
+var float vol_heat = 0.0
+if use_rvol
+    vol_heat := math.min(rvol * 3.0, 9.0)
+else
+    vol_heat := math.min(volume / (math.pow(10, magnitude) * manual_mult), 9.0)
+
+c_vol = color.from_gradient(vol_heat, 0, 9, color.rgb(45, 52, 54), color.rgb(255, 255, 255))
+if vol_heat >= 7
+    c_vol := color.red
+if vol_heat >= 8
+    c_vol := color.white
+
+barcolor(c_vol)
+plotcandle(show_wicks ? ha_open : na, ha_high, ha_low, ha_close,
+     title="HA Candles", color=c_vol, wickcolor=c_vol, bordercolor=c_vol)
+
+// Higher-timeframe trend filter — 15-minute 50 EMA (no lookahead)
+htf_ema50 = request.security(syminfo.tickerid, "15", ta.ema(close, 50),
+     lookahead=barmerge.lookahead_off)
+
+// ============================================================================
+// SESSION & TIME FILTERS
+// ============================================================================
+bar_h = hour(time, "UTC")
+bar_m = minute(time, "UTC")
+float bar_t = bar_h + bar_m / 60.0   // fractional UTC hour
+
+bool in_london  = bar_t >= london_open and bar_t < london_close
+bool in_ny      = bar_t >= ny_open     and bar_t < ny_cutoff
+bool in_session = in_london or in_ny
+bool eod_flat   = bar_h >= eod_hour
+
+// Force flat all positions at EOD
+if eod_flat and strategy.position_size != 0
+    strategy.close_all("EOD Flat")
+
+// ============================================================================
+// ZONE DATA TYPE
+// ============================================================================
+// zone_strength: 0=Weak | 1=Moderate | 2=Strong
+// tests:         count of distinct price entries into the zone (outside→inside)
+// was_in_zone:   previous bar state used for entry-transition detection
+// departure_pts: avg points price moved away from origin (impulse proxy)
+type Zone
+    box   bx
+    label lbl
+    float top            // distal line (wick extreme)
+    float bottom         // distal line (wick extreme)
+    bool  is_supply      // true=supply/resistance | false=demand/support
+    bool  active
+    int   tests
+    bool  was_in_zone
+    float zone_rvol
+    int   zone_strength
+    float departure_pts
+
+var Zone[] zones = array.new<Zone>()
+
+// ============================================================================
+// ZONE HELPER FUNCTIONS
+// ============================================================================
+f_strength(rv) =>
+    rv >= rvol_strong   ? 2 :
+     rv >= rvol_moderate ? 1 : 0
+
+// Departure impulse: avg pts moved away from pivot across the next pivot_len bars
+// (bars pivot_len-1 … 0 relative to current — all historical, no lookahead)
+f_departure(is_supply, piv_price) =>
+    float total = 0.0
+    for k = 0 to pivot_len - 1
+        total += is_supply ? math.max(piv_price - low[k],  0.0)
+                           : math.max(high[k]  - piv_price, 0.0)
+    total / float(pivot_len)
+
+// Zone fill colour: alpha increases with tests to show liquidity drain
+f_supply_col(slevel, tested) =>
+    int alpha = math.min(tested * 18 + 35, 78)
+    slevel == 2 ? color.rgb(255, 50,  50,  alpha) :
+     slevel == 1 ? color.rgb(220, 110, 50,  alpha) :
+                   color.rgb(160, 100, 100, alpha)
+
+f_demand_col(slevel, tested) =>
+    int alpha = math.min(tested * 18 + 35, 78)
+    slevel == 2 ? color.rgb(50,  220, 95,  alpha) :
+     slevel == 1 ? color.rgb(50,  175, 140, alpha) :
+                   color.rgb(90,  140, 110, alpha)
+
+f_border_col(is_supply, slevel) =>
+    if is_supply
+        slevel == 2 ? color.rgb(255, 30,  30)  :
+         slevel == 1 ? color.rgb(210, 100, 50)  :
+                       color.rgb(140,  90, 90)
+    else
+        slevel == 2 ? color.rgb(30,  210, 80)  :
+         slevel == 1 ? color.rgb(40,  165, 130) :
+                       color.rgb(80,  125, 100)
+
+// ============================================================================
+// ZONE CREATION
+// ============================================================================
+// Zone body uses the ORDER BLOCK definition:
+//   Supply → top = wick high (distal / ceiling)
+//             bottom = candle body low (proximal — first line of defence)
+//   Demand → top = candle body high (proximal — first line of defence)
+//             bottom = wick low (distal / floor)
+// A minimum zone height equal to 15% of ATR prevents zero-height doji boxes.
+addZone(is_supply, rvol_val) =>
+    if array.size(zones) >= 40
+        old = array.shift(zones)
+        box.delete(old.bx)
+        label.delete(old.lbl)
+
+    float o = open[pivot_len]
+    float c = close[pivot_len]
+    float h = high[pivot_len]
+    float l = low[pivot_len]
+
+    float z_top = is_supply ? h             : math.max(o, c)
+    float z_bot = is_supply ? math.min(o, c) : l
+
+    float min_h = atr14 * 0.15
+    if z_top - z_bot < min_h
+        z_top := z_top + min_h * 0.5
+        z_bot := z_bot - min_h * 0.5
+
+    int   slevel = f_strength(rvol_val)
+    float depart = f_departure(is_supply, is_supply ? h : l)
+
+    color zc = is_supply ? f_supply_col(slevel, 0) : f_demand_col(slevel, 0)
+    color bc = f_border_col(is_supply, slevel)
+    int   bw = slevel == 2 ? 2 : 1
+
+    b = box.new(bar_index - pivot_len, z_top, bar_index, z_bot,
+         bgcolor=zc, border_color=bc, border_width=bw)
+
+    lbl_txt = ""
+    if show_labels
+        slevel_str = slevel == 2 ? "STRONG" : slevel == 1 ? "MOD" : "WEAK"
+        type_str   = is_supply ? "SUPPLY" : "DEMAND"
+        dep_str    = str.format("{0,number,#.##}", depart / syminfo.mintick) + "t dep"
+        lbl_txt   := slevel_str + " " + type_str + "\n" +
+                     str.format("{0,number,#.##}x vol", rvol_val) + "  " + dep_str
+
+    color tc = is_supply ? color.new(color.red, 0) : color.new(color.lime, 0)
+    if slevel == 2
+        tc := color.white
+    ls  = is_supply ? label.style_label_down : label.style_label_up
+    lsz = slevel == 2 ? size.small : size.tiny
+    lby = is_supply ? z_top : z_bot
+
+    lb = label.new(bar_index - pivot_len, lby, lbl_txt,
+         color=color.new(color.black, 100), textcolor=tc, style=ls, size=lsz)
+
+    array.push(zones, Zone.new(b, lb, z_top, z_bot, is_supply, true, 0, false, rvol_val, slevel, depart))
+
+// ============================================================================
+// PIVOT DETECTION  (real OHLC only — no HA bias)
+// ============================================================================
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low,  pivot_len, pivot_len)
+rvol_at_pivot = rvol[pivot_len]
+
+if not na(ph) and (not use_rvol or rvol_at_pivot >= min_rvol_zone)
+    slevel_ph = f_strength(rvol_at_pivot)
+    if show_weak or slevel_ph > 0
+        addZone(true, rvol_at_pivot)
+
+if not na(pl) and (not use_rvol or rvol_at_pivot >= min_rvol_zone)
+    slevel_pl = f_strength(rvol_at_pivot)
+    if show_weak or slevel_pl > 0
+        addZone(false, rvol_at_pivot)
+
+// ============================================================================
+// STRATEGY STATE
+// ============================================================================
+var float stored_sl       = na   // SL price captured at signal bar
+var int   day_trade_count = 0
+var int   last_day        = 0
+
+// Reset daily counter at start of each new day
+if dayofmonth != last_day
+    day_trade_count := 0
+    last_day        := dayofmonth
+
+// 15M trend state
+bool trend_bull = close > htf_ema50
+bool trend_bear = close < htf_ema50
+
+// ============================================================================
+// ZONE MANAGEMENT + SIGNAL DETECTION  (single loop — O(n) per bar)
+//
+// Signal priority: if multiple zones fire the same bar, the STRONGEST zone
+// (highest zone_strength) wins. Ties resolved by the freshest zone (fewest tests).
+// ============================================================================
+bool do_long  = false
+bool do_short = false
+float sig_sl_long  = na
+float sig_sl_short = na
+int   best_long_str  = -1
+int   best_short_str = -1
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        z = array.get(zones, i)
+
+        if z.active
+            // ── Extend zone box to live bar ──
+            box.set_right(z.bx, bar_index)
+
+            // ── Entry-transition detection (outside → inside) ──
+            bool in_zone_now = close >= z.bottom and close <= z.top
+            bool first_entry = in_zone_now and not z.was_in_zone
+
+            if first_entry
+                // ── Qualify this zone for an entry signal ──
+                bool strength_ok = z.zone_strength >= min_str
+                bool fresh_ok    = z.tests < max_t_entry    // tests BEFORE this entry
+
+                if strength_ok and fresh_ok
+                    if not z.is_supply and close > open    // DEMAND — bullish bar
+                        bool trend_ok = not use_trend or trend_bull
+                        if trend_ok and z.zone_strength > best_long_str
+                            best_long_str := z.zone_strength
+                            do_long       := true
+                            // SL = below zone distal (wick low) + buffer
+                            sig_sl_long   := z.bottom - stop_buf * atr14
+
+                    if z.is_supply and close < open        // SUPPLY — bearish bar
+                        bool trend_ok2 = not use_trend or trend_bear
+                        if trend_ok2 and z.zone_strength > best_short_str
+                            best_short_str := z.zone_strength
+                            do_short       := true
+                            // SL = above zone distal (wick high) + buffer
+                            sig_sl_short   := z.top + stop_buf * atr14
+
+                // ── Increment test counter & fade zone colour ──
+                z.tests := z.tests + 1
+                new_col  = z.is_supply ? f_supply_col(z.zone_strength, z.tests)
+                                       : f_demand_col(z.zone_strength, z.tests)
+                box.set_bgcolor(z.bx, new_col)
+
+            z.was_in_zone := in_zone_now
+
+            // ── Mitigation: body-close through distal line ──
+            bool mitigated = mitigate_on and
+                 (z.is_supply ? close > z.top : close < z.bottom)
+            bool exhausted  = z.tests >= max_zone_tests
+
+            if mitigated or exhausted
+                z.active := false
+                box.set_bgcolor(z.bx,      color.new(color.gray, 88))
+                box.set_border_color(z.bx, color.new(color.gray, 72))
+                box.set_border_style(z.bx, line.style_dotted)
+                label.delete(z.lbl)
+
+// ============================================================================
+// ENTRY EXECUTION
+// ============================================================================
+bool can_enter = (not eod_flat)             // before EOD cutoff
+             and in_session                 // inside London or NY hours
+             and day_trade_count < max_daily // daily cap not reached
+             and strategy.position_size == 0 // flat only (no pyramiding)
+
+if do_long and can_enter
+    stored_sl       := sig_sl_long
+    day_trade_count += 1
+    strategy.entry("Long", strategy.long, comment="▲ DEMAND")
+
+// Only enter short if no long signal on same bar (long wins ties via trend filter)
+if do_short and can_enter and not (do_long and can_enter)
+    stored_sl       := sig_sl_short
+    day_trade_count += 1
+    strategy.entry("Short", strategy.short, comment="▼ SUPPLY")
+
+// ============================================================================
+// EXIT EXECUTION  (OCO: SL and TP simultaneously active)
+//
+// TP is calculated from actual FILL PRICE (strategy.position_avg_price),
+// not from the signal bar close — this ensures the 3:1 ratio is precise.
+// ============================================================================
+if strategy.position_size > 0 and not na(stored_sl)
+    float avg_e = strategy.position_avg_price
+    float sl_d  = avg_e - stored_sl
+    if sl_d > 0   // guard against zero/negative (gap fill edge case)
+        strategy.exit("Long Exit", "Long",
+             stop          = stored_sl,
+             limit         = avg_e + rr_ratio * sl_d,
+             comment_profit = "✓ TP 3:1",
+             comment_loss   = "✗ SL")
+
+if strategy.position_size < 0 and not na(stored_sl)
+    float avg_e = strategy.position_avg_price
+    float sl_d  = stored_sl - avg_e
+    if sl_d > 0
+        strategy.exit("Short Exit", "Short",
+             stop          = stored_sl,
+             limit         = avg_e - rr_ratio * sl_d,
+             comment_profit = "✓ TP 3:1",
+             comment_loss   = "✗ SL")
+
+// Reset SL storage when flat
+if strategy.position_size == 0
+    stored_sl := na
+
+// ============================================================================
+// TRADE VISUALISATION — Live SL & TP Lines
+// ============================================================================
+var line sl_line = na
+var line tp_line = na
+var line entry_line = na
+
+if strategy.position_size != 0 and not na(stored_sl)
+    float avg_e = strategy.position_avg_price
+    float sl_d  = math.abs(avg_e - stored_sl)
+    float tp_lvl = strategy.position_size > 0
+         ? avg_e + rr_ratio * sl_d
+         : avg_e - rr_ratio * sl_d
+
+    line.delete(sl_line)
+    line.delete(tp_line)
+    line.delete(entry_line)
+
+    entry_line := line.new(bar_index - 1, avg_e, bar_index, avg_e,
+         color=color.yellow, width=1, style=line.style_dashed)
+    sl_line := line.new(bar_index - 1, stored_sl, bar_index, stored_sl,
+         color=color.red, width=2, style=line.style_dashed)
+    tp_line := line.new(bar_index - 1, tp_lvl, bar_index, tp_lvl,
+         color=color.lime, width=2, style=line.style_dashed)
+else
+    line.delete(sl_line)
+    line.delete(tp_line)
+    line.delete(entry_line)
+    sl_line    := na
+    tp_line    := na
+    entry_line := na
+
+// Entry signal markers (non-repainting — only fire when strategy enters)
+plotshape(do_long  and can_enter, "Long Signal",
+     shape.triangleup,   location.belowbar, color.lime, size=size.small)
+plotshape(do_short and can_enter and not (do_long and can_enter), "Short Signal",
+     shape.triangledown, location.abovebar, color.red,  size=size.small)
+
+// ============================================================================
+// DASHBOARD TABLE  (top-right corner)
+// ============================================================================
+var table dash = table.new(position.top_right, 2, 9,
+     bgcolor=color.rgb(12, 14, 20, 5),
+     border_color=color.rgb(55, 58, 68),
+     border_width=1,
+     frame_color=color.rgb(55, 58, 68),
+     frame_width=1)
+
+if barstate.islast
+    // ── Header ──
+    table.cell(dash, 0, 0, "SVP 5M",        text_color=color.white,  text_size=size.small,
+         bgcolor=color.rgb(25, 28, 40))
+    table.cell(dash, 1, 0, "EUR/USD 3:1",   text_color=color.yellow, text_size=size.small,
+         bgcolor=color.rgb(25, 28, 40))
+
+    // ── Session ──
+    string sess_txt = in_london ? "London  ✓" : in_ny ? "New York  ✓" : "Off-Hours  ✗"
+    color  sess_col = in_session ? color.lime  : color.rgb(120, 120, 120)
+    table.cell(dash, 0, 1, "Session",  text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 1, sess_txt,   text_color=sess_col,   text_size=size.tiny)
+
+    // ── 15M Trend ──
+    string trend_txt = trend_bull ? "Bullish  ▲" : "Bearish  ▼"
+    color  trend_col = trend_bull ? color.lime   : color.red
+    table.cell(dash, 0, 2, "15M Trend",  text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 2, trend_txt,    text_color=trend_col,  text_size=size.tiny)
+
+    // ── Zone Counts ──
+    int n_supply = 0
+    int n_demand = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            z = array.get(zones, i)
+            if z.active
+                if z.is_supply
+                    n_supply += 1
+                else
+                    n_demand += 1
+    table.cell(dash, 0, 3, "Supply Zones", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 3, str.tostring(n_supply),
+         text_color=n_supply > 0 ? color.red : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 4, "Demand Zones", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(n_demand),
+         text_color=n_demand > 0 ? color.lime : color.gray, text_size=size.tiny)
+
+    // ── Daily Trades ──
+    bool at_cap = day_trade_count >= max_daily
+    table.cell(dash, 0, 5, "Today's Trades", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 5, str.tostring(day_trade_count) + " / " + str.tostring(max_daily),
+         text_color=at_cap ? color.red : color.yellow, text_size=size.tiny)
+
+    // ── Win Rate ──
+    int   total_closed = strategy.closedtrades
+    int   wins         = strategy.wintrades
+    float wr           = total_closed > 0 ? 100.0 * wins / total_closed : 0.0
+    table.cell(dash, 0, 6, "Win Rate",     text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 6, str.format("{0,number,#.#}%", wr),
+         text_color=wr >= 35.0 ? color.lime : color.red, text_size=size.tiny)
+    // Note: at 3:1 RR, breakeven win rate = 25%. 35% = profitable.
+
+    // ── Net P&L ──
+    float pnl = strategy.netprofit
+    table.cell(dash, 0, 7, "Net P&L",    text_color=color.gray,  text_size=size.tiny)
+    table.cell(dash, 1, 7, str.format("{0,number,#.##}", pnl),
+         text_color=pnl >= 0 ? color.lime : color.red, text_size=size.tiny)
+
+    // ── Position ──
+    string pos_txt = strategy.position_size > 0 ? "LONG  ▲" :
+                     strategy.position_size < 0 ? "SHORT ▼" : "Flat"
+    color  pos_col = strategy.position_size > 0 ? color.lime :
+                     strategy.position_size < 0 ? color.red  : color.gray
+    table.cell(dash, 0, 8, "Position",  text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 8, pos_txt,     text_color=pos_col,    text_size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(do_long  and can_enter,
+     "Long Entry — Demand Zone",
+     "SVP: Long signal at demand zone. Check SL below zone distal.")
+
+alertcondition(do_short and can_enter,
+     "Short Entry — Supply Zone",
+     "SVP: Short signal at supply zone. Check SL above zone distal.")
+
+alertcondition(rvol > rvol_strong,
+     "Extreme Volume Spike",
+     "SVP: Volume spike exceeds strong threshold — zone may form.")
