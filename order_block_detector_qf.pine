@@ -1,0 +1,291 @@
+// This work is licensed under Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// Original: © LuxAlgo  |  Quantitative enhancement: ICT/SMC + Stochastic Signal Filtering
+
+//@version=5
+indicator("Order Block Detector [QF Enhanced]"
+  , overlay          = true
+  , max_boxes_count  = 500
+  , max_labels_count = 500
+  , max_lines_count  = 500)
+
+// =============================================================================
+// SETTINGS
+// =============================================================================
+grp_ob      = "Order Block"
+grp_filter  = "Quantitative Filters"
+grp_disp    = "Display"
+
+// --- Core pivot ---
+length = input.int(5, "Pivot Length", minval=1, group=grp_ob,
+  tooltip="Pivot lookback. Controls structural granularity. Lower = tick-sensitive but noisier.")
+
+// --- Volume normalisation ---
+vol_lookback      = input.int(20,  "Volume Normalisation Window",    minval=10, group=grp_filter,
+  tooltip="Rolling window for computing volume z-score (mean + std dev). 20-50 recommended.")
+vol_zscore_thresh = input.float(1.0, "Volume Z-Score Threshold",    minval=0.5, step=0.1, group=grp_filter,
+  tooltip="Min z-score for a statistically significant volume spike. 1.0 = ~84th percentile; 1.5 = ~93rd; 2.0 = ~98th.")
+
+// --- Displacement filter ---
+use_displacement  = input.bool(true,  "Require Displacement",        group=grp_filter,
+  tooltip="OB is only valid when the displacement candle body exceeds ATR × multiplier. Filters weak pivots.")
+atr_length        = input.int(14,   "ATR Length",                    minval=5, group=grp_filter)
+disp_atr_mult     = input.float(1.5, "Displacement ATR Multiplier",  minval=0.5, step=0.1, group=grp_filter,
+  tooltip="Body ÷ ATR must exceed this value. 1.0–1.5 = selective; 2.0+ = only major impulses.")
+
+// --- FVG (imbalance) filter ---
+use_fvg = input.bool(true, "Require FVG (Imbalance)", group=grp_filter,
+  tooltip="Only accept OBs that produce a 3-bar Fair Value Gap. Ensures institutional displacement created an imbalance.")
+
+// --- Liquidity sweep filter ---
+use_liq_sweep  = input.bool(true,  "Require Liquidity Sweep",      group=grp_filter,
+  tooltip="OB must be preceded by a sweep of an equal-high/low cluster (stop-hunt). Validates institutional intent.")
+liq_lookback   = input.int(20,   "Sweep Lookback (bars)",          minval=5, group=grp_filter)
+liq_atr_frac   = input.float(0.25, "Sweep Tolerance (ATR fraction)", minval=0.05, step=0.05, group=grp_filter,
+  tooltip="How close (as fraction of ATR) price must come to prior swing to qualify as a sweep.")
+
+// --- Mitigation ---
+mitigation = input.string("Wick", "Mitigation Method", options=["Wick","Close"], group=grp_filter)
+
+// --- Display ---
+bull_ext_last  = input.int(3,                       "Bullish OB", minval=1, inline="bull", group=grp_disp)
+bg_bull_css    = input.color(color.new(#169400,80), "",            inline="bull", group=grp_disp)
+bull_css       = input.color(#169400,               "",            inline="bull", group=grp_disp)
+bull_avg_css   = input.color(color.new(#9598a1,37), "",            inline="bull", group=grp_disp)
+
+bear_ext_last  = input.int(3,                       "Bearish OB", minval=1, inline="bear", group=grp_disp)
+bg_bear_css    = input.color(color.new(#ff1100,80), "",            inline="bear", group=grp_disp)
+bear_css       = input.color(#ff1100,               "",            inline="bear", group=grp_disp)
+bear_avg_css   = input.color(color.new(#9598a1,37), "",            inline="bear", group=grp_disp)
+
+line_style     = input.string("⎯⎯⎯", "Average Line Style", options=["⎯⎯⎯","----","····"], group=grp_disp)
+line_width     = input.int(1, "Average Line Width", minval=1, group=grp_disp)
+
+// =============================================================================
+// QUANTITATIVE CALCULATIONS
+// =============================================================================
+
+// --- ATR: volatility normalisation baseline ---
+atr = ta.atr(atr_length)
+
+// --- Volume Z-Score ---
+// Instead of identifying raw volume pivots, we measure how anomalous the volume
+// is relative to its local distribution (mean + std dev over vol_lookback bars).
+// A z-score ≥ threshold flags institutional-level participation.
+//   z = (V - μ) / σ
+vol_mean   = ta.sma(volume, vol_lookback)
+vol_std    = ta.stdev(volume, vol_lookback)
+// Guard against zero std (flat volume periods) with a 1-tick floor
+vol_zscore = vol_std > 0 ? (volume - vol_mean) / vol_std : 0.0
+
+// Standard pivot-high on raw volume (original LuxAlgo gate)
+phv_raw = ta.pivothigh(volume, length, length)
+
+// ENHANCEMENT: pivot must also be a statistically significant spike
+// vol_zscore[length] indexes back to the pivot candle
+vol_significant = vol_zscore[length] >= vol_zscore_thresh
+
+// Combined volume gate: structural pivot AND institutional volume footprint
+phv = not na(phv_raw) and vol_significant
+
+// --- Displacement (momentum / delta proxy) ---
+// The candle body divided by ATR gives a normalised momentum score.
+// Large bodies = strong directional order-flow, confirming the OB is born
+// from genuine institutional aggression rather than a drift pivot.
+body_at_ob  = math.abs(close[length] - open[length])
+disp_score  = atr[length] > 0 ? body_at_ob / atr[length] : 0.0
+
+bull_displacement = close[length] > open[length] and disp_score >= disp_atr_mult
+bear_displacement = close[length] < open[length] and disp_score >= disp_atr_mult
+
+// --- FVG (Fair Value Gap / Imbalance) ---
+// A 3-bar FVG centered on the OB candle confirms structural imbalance.
+//   Candles:  [length+1] = pre-OB   |  [length] = OB   |  [length-1] = post-OB
+//
+// Bullish FVG (displacement up): post-OB low > pre-OB high
+//   → price accelerated so hard it left an untraded gap above
+// Bearish FVG (displacement down): post-OB high < pre-OB low
+//   → price accelerated so hard it left an untraded gap below
+bull_fvg = low[length - 1]  > high[length + 1]
+bear_fvg = high[length - 1] < low[length + 1]
+
+// --- Liquidity Sweep ---
+// Equal highs / equal lows represent resting stop clusters. Institutional
+// operators sweep these levels to harvest liquidity before reversing.
+// We compare the OB candle's extreme against the highest/lowest of the
+// preceding liq_lookback bars (excluding the OB candle itself).
+//
+// Bull sweep: OB candle's LOW swept below prior swing lows (stop hunt on longs)
+//   → clears sell-stops, creates a vacuum → bullish reversal OB valid
+// Bear sweep: OB candle's HIGH swept above prior swing highs (stop hunt on shorts)
+//   → clears buy-stops, creates a vacuum → bearish reversal OB valid
+liq_tol      = atr * liq_atr_frac
+prior_low    = ta.lowest(low,  liq_lookback)[length + 1]
+prior_high   = ta.highest(high, liq_lookback)[length + 1]
+
+bull_sweep   = low[length]  <= prior_low  + liq_tol
+bear_sweep   = high[length] >= prior_high - liq_tol
+
+// =============================================================================
+// MARKET STRUCTURE STATE
+// =============================================================================
+var int   os          = 0
+var float target_bull = 0.0
+var float target_bear = 0.0
+
+upper = ta.highest(length)
+lower = ta.lowest(length)
+
+if mitigation == "Close"
+    target_bull := ta.lowest(close, length)
+    target_bear := ta.highest(close, length)
+else
+    target_bull := lower
+    target_bear := upper
+
+// Structure bias: 0 = bearish swing  |  1 = bullish swing
+// (unchanged from original — displacement above upper = new bear leg, etc.)
+os := high[length] > upper ? 0 : low[length] < lower ? 1 : os[1]
+
+// =============================================================================
+// MULTI-FACTOR OB VALIDATION
+// =============================================================================
+// Each filter is individually toggleable so traders can calibrate sensitivity.
+// Default: ALL filters on → highest precision, fewest (highest-quality) signals.
+
+// Bullish OB: forms in bearish structure, all enabled qualifiers must pass
+bull_condition = phv
+  and os == 1
+  and (not use_displacement or bull_displacement)
+  and (not use_fvg         or bull_fvg)
+  and (not use_liq_sweep   or bull_sweep)
+
+// Bearish OB: forms in bullish structure, all enabled qualifiers must pass
+bear_condition = phv
+  and os == 0
+  and (not use_displacement or bear_displacement)
+  and (not use_fvg         or bear_fvg)
+  and (not use_liq_sweep   or bear_sweep)
+
+// =============================================================================
+// FUNCTIONS
+// =============================================================================
+get_line_style(style) =>
+    switch style
+        "⎯⎯⎯"  => line.style_solid
+        "----"  => line.style_dashed
+        "····"  => line.style_dotted
+
+// Volume-weighted OB midpoint
+// Instead of simple (high+low)/2, we pull the midpoint toward the body of the
+// OB candle proportionally to the z-score of volume. A higher z-score means
+// stronger institutional presence → the "fair value" is closer to the body
+// rather than the wick extremes.
+//   weight ∈ [0.35, 0.65] capped so we never flip the ordering.
+get_vwap_mid(top, btm, z) =>
+    raw_w  = 0.5 + math.min(z, 3.0) * 0.05   // +5% toward top per σ, cap at 3σ
+    weight = math.max(0.35, math.min(0.65, raw_w))
+    top * weight + btm * (1.0 - weight)
+
+// Build coordinate arrays for OB storage
+get_coordinates(condition, top, btm, ob_val) =>
+    var ob_top  = array.new_float(0)
+    var ob_btm  = array.new_float(0)
+    var ob_avg  = array.new_float(0)
+    var ob_left = array.new_int(0)
+
+    float ob = na
+
+    if condition
+        avg = get_vwap_mid(top, btm, vol_zscore[length])
+        array.unshift(ob_top,  top)
+        array.unshift(ob_btm,  btm)
+        array.unshift(ob_avg,  avg)
+        array.unshift(ob_left, time[length])
+        ob := ob_val
+
+    [ob_top, ob_btm, ob_avg, ob_left, ob]
+
+// Remove order blocks whose price level has been mitigated
+remove_mitigated(ob_top, ob_btm, ob_left, ob_avg, target, bull) =>
+    mitigated    = false
+    target_array = bull ? ob_btm : ob_top
+
+    for element in target_array
+        idx = array.indexof(target_array, element)
+        if bull ? target < element : target > element
+            mitigated := true
+            array.remove(ob_top,  idx)
+            array.remove(ob_btm,  idx)
+            array.remove(ob_avg,  idx)
+            array.remove(ob_left, idx)
+
+    mitigated
+
+// Render OB boxes and average lines
+set_order_blocks(ob_top, ob_btm, ob_left, ob_avg, ext_last, bg_css, border_css, lvl_css) =>
+    var ob_box = array.new_box(0)
+    var ob_lvl = array.new_line(0)
+
+    if barstate.isfirst
+        for i = 0 to ext_last - 1
+            array.unshift(ob_box, box.new(na, na, na, na
+              , xloc         = xloc.bar_time
+              , extend       = extend.right
+              , bgcolor      = bg_css
+              , border_color = color.new(border_css, 70)))
+
+            array.unshift(ob_lvl, line.new(na, na, na, na
+              , xloc   = xloc.bar_time
+              , extend = extend.right
+              , color  = lvl_css
+              , style  = get_line_style(line_style)
+              , width  = line_width))
+
+    if barstate.islast
+        if array.size(ob_top) > 0
+            for i = 0 to math.min(ext_last - 1, array.size(ob_top) - 1)
+                b = array.get(ob_box, i)
+                l = array.get(ob_lvl, i)
+                box.set_lefttop(b,     array.get(ob_left, i), array.get(ob_top, i))
+                box.set_rightbottom(b, array.get(ob_left, i), array.get(ob_btm, i))
+                line.set_xy1(l, array.get(ob_left, i),     array.get(ob_avg, i))
+                line.set_xy2(l, array.get(ob_left, i) + 1, array.get(ob_avg, i))
+
+// =============================================================================
+// ORDER BLOCK DETECTION
+// =============================================================================
+[bull_top, bull_btm, bull_avg, bull_left, bull_ob] =
+  get_coordinates(bull_condition, hl2[length], low[length],  low[length])
+
+[bear_top, bear_btm, bear_avg, bear_left, bear_ob] =
+  get_coordinates(bear_condition, high[length], hl2[length], high[length])
+
+// =============================================================================
+// MITIGATION
+// =============================================================================
+mitigated_bull = remove_mitigated(bull_top, bull_btm, bull_left, bull_avg, target_bull, true)
+mitigated_bear = remove_mitigated(bear_top, bear_btm, bear_left, bear_avg, target_bear, false)
+
+// =============================================================================
+// DISPLAY
+// =============================================================================
+set_order_blocks(bull_top, bull_btm, bull_left, bull_avg,
+  bull_ext_last, bg_bull_css, bull_css, bull_avg_css)
+
+set_order_blocks(bear_top, bear_btm, bear_left, bear_avg,
+  bear_ext_last, bg_bear_css, bear_css, bear_avg_css)
+
+plot(bull_ob, "Bull OB", bull_css, 2, plot.style_linebr,
+  offset = -length, display = display.none)
+
+plot(bear_ob, "Bear OB", bear_css, 2, plot.style_linebr,
+  offset = -length, display = display.none)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(bull_ob,        "Bullish OB Formed",    "Bullish order block detected")
+alertcondition(bear_ob,        "Bearish OB Formed",    "Bearish order block detected")
+alertcondition(mitigated_bull, "Bullish OB Mitigated", "Bullish order block mitigated")
+alertcondition(mitigated_bear, "Bearish OB Mitigated", "Bearish order block mitigated")
