@@ -1,0 +1,404 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ChartPrime
+
+//@version=6
+indicator("Supply & Demand: CVD Flow Pro [ChartPrime]", "S&D CVD Flow Pro [ChartPrime]", overlay = true, max_boxes_count = 5000, max_polylines_count = 100, calc_bars_count = 3000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙐𝙎𝙀𝙍 𝙄𝙉𝙋𝙐𝙏𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Detection ────────────────────────────────────────────────────────────────
+atrLen      = input.int  (14,      "ATR Length",             minval = 1,              group = "Detection")
+momMult     = input.float(1.5,     "Momentum Multiplier",    minval = 0.1, step = 0.1, group = "Detection",
+              tooltip = "Breakout body must be ≥ this × ATR.  Raise to filter weaker zones.")
+maxBoxes    = input.int  (10,      "Max Active Zones Each",  minval = 1,   maxval = 50, group = "Detection",
+              tooltip = "Max live demand AND supply zones each")
+volConfirm  = input.bool (true,    "Volume Confirmation",    group = "Detection",
+              tooltip = "Require breakout candle volume > Volume MA (helps filter noise)")
+volLen      = input.int  (20,      "Volume MA Length",       minval = 5,              group = "Detection")
+mitigType   = input.string("Close","Mitigation By",          options = ["Close","Wick"], group = "Detection",
+              tooltip = "Close: zone removed when price closes past its boundary\nWick: zone removed on any wick through boundary")
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+demandCol    = input.color(color.new(#22c58f, 85), "Demand Zone",       group = "Colors")
+supplyCol    = input.color(color.new(#ef4444, 85), "Supply Zone",       group = "Colors")
+demandBorder = input.color(color.new(#22c55e, 30), "Demand Border",     group = "Colors")
+supplyBorder = input.color(color.new(#ef4444, 30), "Supply Border",     group = "Colors")
+cvdDemandCol = input.color(color.new(#22c5af, 40), "Demand CVD Wave",   group = "Colors")
+cvdSupplyCol = input.color(color.new(#ef8844, 40), "Supply CVD Wave",   group = "Colors")
+
+// ── Display ──────────────────────────────────────────────────────────────────
+showSignals  = input.bool(true,  "Show Entry Signals",      group = "Display",
+              tooltip = "△ below demand breakouts, ▽ above supply breakouts")
+showStrength = input.bool(true,  "Show Zone Strength",      group = "Display",
+              tooltip = "●●● = high strength, ●●○ = medium, ●○○ = low (body × volume × efficiency)")
+showSweeps   = input.bool(true,  "Show Liquidity Sweeps",   group = "Display",
+              tooltip = "⚡ label when price wicks through a zone boundary but closes back inside it (stop-hunt)")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙄𝙉𝘿𝙄𝘾𝘼𝙏𝙊𝙍 𝘾𝘼𝙇𝘾𝙐𝙇𝘼𝙏𝙄𝙊𝙉𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Force historical buffer (prevents runtime offset errors)
+var float _dummy = na
+_dummy := close[2900] + open[2900] + volume[2900]
+
+// Indicators
+atr   = ta.atr(atrLen)
+volMA = ta.sma(volume, volLen)
+
+// ── Proportional Volume Delta ─────────────────────────────────────────────────
+// Range-weighted delta: estimates intrabar buy vs sell pressure more accurately
+// than simple ±volume.  Based on the bid/ask imbalance approximation:
+//   delta ≈ volume × (2·close − high − low) / (high − low)
+// When range = 0 (doji etc.) falls back to sign-of-candle.
+calcDelta(c, o, h, l, v) =>
+    r = h - l
+    r > 0 ? v * (2.0 * c - h - l) / r : (c > o ? v : c < o ? -v : 0.0)
+
+// ── Order Block Detection ────────────────────────────────────────────────────
+// A genuine order block is the LAST opposing candle before a momentum impulse:
+//   Demand OB → last bearish candle immediately before a bullish breakout
+//   Supply OB → last bullish candle immediately before a bearish breakout
+baseBearish    = close[2] < open[2]
+baseBullish    = close[2] > open[2]
+breakoutBody   = math.abs(close[1] - open[1])
+breakoutIsBull = close[1] > open[1]
+breakoutIsBear = close[1] < open[1]
+volOK          = not volConfirm or (volume[1] > volMA[1])
+
+isDemandBreakout = baseBearish and breakoutIsBull and breakoutBody >= momMult * atr[1] and volOK
+isSupplyBreakout = baseBullish and breakoutIsBear and breakoutBody >= momMult * atr[1] and volOK
+
+// ── Zone Strength Score (0 – 100) ────────────────────────────────────────────
+// Three equally-weighted components:
+//   Body ratio  (40 pts) – how large is the breakout body vs 3×ATR
+//   Volume surge(40 pts) – how much above average was breakout volume
+//   Body efficiency (20 pts) – how much of the candle range was body (low wicks = cleaner)
+zoneStrength(body, atrV, vol, volAvg, h, l) =>
+    bScore = math.min(body / (atrV * 3.0), 1.0)
+    vScore = math.min(vol  / math.max(volAvg * 1.5, 1.0), 1.0)
+    eScore = (h - l) > 0 ? math.min(body / (h - l), 1.0) : 0.5
+    math.round(bScore * 40.0 + vScore * 40.0 + eScore * 20.0)
+
+demandStr0 = isDemandBreakout ? zoneStrength(breakoutBody, atr[1], volume[1], volMA[1], high[1], low[1]) : 0
+supplyStr0 = isSupplyBreakout ? zoneStrength(breakoutBody, atr[1], volume[1], volMA[1], high[1], low[1]) : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙎𝙏𝙊𝙍𝘼𝙂𝙀 𝘼𝙍𝙍𝘼𝙔𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<box>      demandBoxes = array.new<box>()
+var array<float>    demandTops  = array.new<float>()
+var array<float>    demandBots  = array.new<float>()
+var array<int>      demandLefts = array.new<int>()
+var array<polyline> demandLines = array.new<polyline>()
+var array<int>      demandStrs  = array.new<int>()
+var array<int>      demandTchs  = array.new<int>()
+
+var array<box>      supplyBoxes = array.new<box>()
+var array<float>    supplyTops  = array.new<float>()
+var array<float>    supplyBots  = array.new<float>()
+var array<int>      supplyLefts = array.new<int>()
+var array<polyline> supplyLines = array.new<polyline>()
+var array<int>      supplyStrs  = array.new<int>()
+var array<int>      supplyTchs  = array.new<int>()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙃𝙀𝙇𝙋𝙀𝙍 𝙁𝙐𝙉𝘾𝙏𝙄𝙊𝙉𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Strength dot label
+strDots(s) =>
+    s >= 75 ? "●●●" : s >= 45 ? "●●○" : "●○○"
+
+// CVD direction arrow
+cvdArrow(v) =>
+    v > 0 ? "▲" : v < 0 ? "▼" : "—"
+
+// Strength → zone fill transparency (high strength = more opaque)
+strAlpha(s) =>
+    math.max(60, 90 - math.round(s * 0.3))
+
+// CVD Polyline updater
+// Uses proportional delta for a more accurate flow curve within the zone.
+// The wave is anchored at the zone midpoint on both ends; between anchors it
+// oscillates based on normalised cumulative delta, clamped to zone bounds.
+updatePolylines(boxLeft, zTop, zBot, oldLine, lCol, fCol, isDemand) =>
+    len = math.min(bar_index - boxLeft, 2900)
+    len := math.max(0, math.min(len, bar_index - 1))
+
+    // First pass: find normalisation scalar
+    cumD1  = 0.0
+    maxAbs = 0.0
+    for k = len to 0
+        cumD1  += calcDelta(close[k], open[k], high[k], low[k], volume[k])
+        maxAbs := math.max(maxAbs, math.abs(cumD1))
+
+    pts  = array.new<chart.point>()
+    h    = zTop - zBot
+    midY = (zTop + zBot) * 0.5
+    array.push(pts, chart.point.from_index(bar_index - len, midY))
+
+    // Second pass: build wave coordinates
+    cumD2 = 0.0
+    for k = len to 0
+        cumD2 += calcDelta(close[k], open[k], high[k], low[k], volume[k])
+        rawY   = isDemand
+                   ? zBot + (maxAbs > 0 ? (cumD2 / maxAbs) * h : 0.0)
+                   : zTop + (maxAbs > 0 ? (cumD2 / maxAbs) * h : 0.0)
+        array.push(pts, chart.point.from_index(bar_index - k, math.max(zBot, math.min(zTop, rawY))))
+
+    array.push(pts, chart.point.from_index(bar_index, midY))
+
+    if not na(oldLine)
+        polyline.delete(oldLine)
+    newLine = polyline.new(pts, closed = true, line_color = lCol, fill_color = fCol, line_width = 1)
+    [newLine, cumD2]
+
+// Trim oldest demand zone
+trimDemand() =>
+    if array.size(demandBoxes) > 0
+        b = array.shift(demandBoxes)
+        b.delete()
+        array.shift(demandTops)
+        array.shift(demandBots)
+        array.shift(demandLefts)
+        array.shift(demandStrs)
+        array.shift(demandTchs)
+        l = array.shift(demandLines)
+        if not na(l)
+            polyline.delete(l)
+
+// Trim oldest supply zone
+trimSupply() =>
+    if array.size(supplyBoxes) > 0
+        b = array.shift(supplyBoxes)
+        b.delete()
+        array.shift(supplyTops)
+        array.shift(supplyBots)
+        array.shift(supplyLefts)
+        array.shift(supplyStrs)
+        array.shift(supplyTchs)
+        l = array.shift(supplyLines)
+        if not na(l)
+            polyline.delete(l)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙑𝙄𝙎𝙐𝘼𝙇𝙄𝙕𝘼𝙏𝙄𝙊𝙉 — 𝙕𝙊𝙉𝙀 𝘾𝙍𝙀𝘼𝙏𝙄𝙊𝙉
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── DEMAND ────────────────────────────────────────────────────────────────────
+if isDemandBreakout
+    zTop = high[2]
+    zBot = low[2]
+    left = bar_index - 2
+    str  = demandStr0
+
+    overlap = false
+    if array.size(demandTops) > 0
+        for i = 0 to array.size(demandTops) - 1
+            if zBot <= array.get(demandTops, i) and zTop >= array.get(demandBots, i)
+                overlap := true
+                break
+
+    if not overlap
+        alpha = strAlpha(str)
+        b = box.new(
+              left         = left,
+              top          = zTop,
+              right        = bar_index,
+              bottom       = zBot,
+              bgcolor      = color.new(demandCol, alpha),
+              border_color = demandBorder,
+              border_width = 1,
+              extend       = extend.none,
+              text         = "Demand " + (showStrength ? strDots(str) : "") + "  |  CVD: —",
+              text_color   = color.white,
+              text_size    = size.small,
+              text_halign  = text.align_right,
+              text_valign  = text.align_bottom)
+        array.push(demandBoxes, b)
+        array.push(demandTops,  zTop)
+        array.push(demandBots,  zBot)
+        array.push(demandLefts, left)
+        array.push(demandStrs,  str)
+        array.push(demandTchs,  0)
+        array.push(demandLines, polyline.new(na))
+
+if array.size(demandBoxes) > maxBoxes
+    trimDemand()
+
+// ── SUPPLY ────────────────────────────────────────────────────────────────────
+if isSupplyBreakout
+    zTop = high[2]
+    zBot = low[2]
+    left = bar_index - 2
+    str  = supplyStr0
+
+    overlap = false
+    if array.size(supplyTops) > 0
+        for i = 0 to array.size(supplyTops) - 1
+            if zBot <= array.get(supplyTops, i) and zTop >= array.get(supplyBots, i)
+                overlap := true
+                break
+
+    if not overlap
+        alpha = strAlpha(str)
+        b = box.new(
+              left         = left,
+              top          = zTop,
+              right        = bar_index,
+              bottom       = zBot,
+              bgcolor      = color.new(supplyCol, alpha),
+              border_color = supplyBorder,
+              border_width = 1,
+              extend       = extend.none,
+              text         = "Supply " + (showStrength ? strDots(str) : "") + "  |  CVD: —",
+              text_color   = color.white,
+              text_size    = size.small,
+              text_halign  = text.align_right,
+              text_valign  = text.align_top)
+        array.push(supplyBoxes, b)
+        array.push(supplyTops,  zTop)
+        array.push(supplyBots,  zBot)
+        array.push(supplyLefts, left)
+        array.push(supplyStrs,  str)
+        array.push(supplyTchs,  0)
+        array.push(supplyLines, polyline.new(na))
+
+if array.size(supplyBoxes) > maxBoxes
+    trimSupply()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙈𝙄𝙏𝙄𝙂𝘼𝙏𝙄𝙊𝙉 𝙋𝙍𝙄𝘾𝙀𝙎 (𝘾𝙡𝙤𝙨𝙚 𝙫𝙨 𝙒𝙞𝙘𝙠)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mitLow  = mitigType == "Close" ? close : low
+mitHigh = mitigType == "Close" ? close : high
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙑𝙄𝙎𝙐𝘼𝙇𝙄𝙕𝘼𝙏𝙄𝙊𝙉 — 𝘿𝙀𝙈𝘼𝙉𝘿 𝙐𝙋𝘿𝘼𝙏𝙀 & 𝙈𝙄𝙏𝙄𝙂𝘼𝙏𝙄𝙊𝙉
+// ─────────────────────────────────────────────────────────────────────────────
+
+dSz = array.size(demandBoxes)
+if dSz > 0
+    i = dSz - 1
+    while i >= 0
+        if i < array.size(demandBoxes)
+            zBot = array.get(demandBots,  i)
+            zTop = array.get(demandTops,  i)
+            left = array.get(demandLefts, i)
+            b    = array.get(demandBoxes, i)
+            ln   = array.get(demandLines, i)
+            str  = array.get(demandStrs,  i)
+            tc   = array.get(demandTchs,  i)
+
+            if mitLow <= zBot
+                // Zone mitigated — remove it
+                b.delete()
+                if not na(ln)
+                    polyline.delete(ln)
+                array.remove(demandBoxes, i)
+                array.remove(demandTops,  i)
+                array.remove(demandBots,  i)
+                array.remove(demandLefts, i)
+                array.remove(demandStrs,  i)
+                array.remove(demandTchs,  i)
+                array.remove(demandLines, i)
+            else
+                // Touch detection: price just entered zone from above this bar
+                if low <= zTop and low[1] > zTop
+                    tc += 1
+                    array.set(demandTchs, i, tc)
+
+                box.set_right(b, bar_index)
+                [nL, cvd] = updatePolylines(left, zTop, zBot, ln, color.new(cvdDemandCol, 0), cvdDemandCol, true)
+                array.set(demandLines, i, nL)
+
+                strTxt = showStrength ? " " + strDots(str) : ""
+                tchTxt = tc > 0 ? "  ×" + str.tostring(tc) : ""
+                box.set_text(b, "Demand" + strTxt + tchTxt + "  |  CVD: " + cvdArrow(cvd) + " " + str.tostring(cvd, format.volume))
+                box.set_text_valign(b, text.align_bottom)
+        i -= 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙑𝙄𝙎𝙐𝘼𝙇𝙄𝙕𝘼𝙏𝙄𝙊𝙉 — 𝙎𝙐𝙋𝙋𝙇𝙔 𝙐𝙋𝘿𝘼𝙏𝙀 & 𝙈𝙄𝙏𝙄𝙂𝘼𝙏𝙄𝙊𝙉
+// ─────────────────────────────────────────────────────────────────────────────
+
+sSz = array.size(supplyBoxes)
+if sSz > 0
+    i = sSz - 1
+    while i >= 0
+        if i < array.size(supplyBoxes)
+            zBot = array.get(supplyBots,  i)
+            zTop = array.get(supplyTops,  i)
+            left = array.get(supplyLefts, i)
+            b    = array.get(supplyBoxes, i)
+            ln   = array.get(supplyLines, i)
+            str  = array.get(supplyStrs,  i)
+            tc   = array.get(supplyTchs,  i)
+
+            if mitHigh >= zTop
+                // Zone mitigated — remove it
+                b.delete()
+                if not na(ln)
+                    polyline.delete(ln)
+                array.remove(supplyBoxes, i)
+                array.remove(supplyTops,  i)
+                array.remove(supplyBots,  i)
+                array.remove(supplyLefts, i)
+                array.remove(supplyStrs,  i)
+                array.remove(supplyTchs,  i)
+                array.remove(supplyLines, i)
+            else
+                // Touch detection: price just entered zone from below this bar
+                if high >= zBot and high[1] < zBot
+                    tc += 1
+                    array.set(supplyTchs, i, tc)
+
+                box.set_right(b, bar_index)
+                [nL, cvd] = updatePolylines(left, zTop, zBot, ln, color.new(cvdSupplyCol, 0), cvdSupplyCol, false)
+                array.set(supplyLines, i, nL)
+
+                strTxt = showStrength ? " " + strDots(str) : ""
+                tchTxt = tc > 0 ? "  ×" + str.tostring(tc) : ""
+                box.set_text(b, "Supply" + strTxt + tchTxt + "  |  CVD: " + cvdArrow(cvd) + " " + str.tostring(cvd, format.volume))
+                box.set_text_valign(b, text.align_top)
+        i -= 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙎𝙄𝙂𝙉𝘼𝙇𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+if showSignals
+    if isDemandBreakout
+        label.new(bar_index, low,  "△", yloc = yloc.belowbar, style = label.style_none, textcolor = demandBorder, size = size.normal)
+    if isSupplyBreakout
+        label.new(bar_index, high, "▽", yloc = yloc.abovebar, style = label.style_none, textcolor = supplyBorder, size = size.normal)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙇𝙄𝙌𝙐𝙄𝘿𝙄𝙏𝙔 𝙎𝙒𝙀𝙀𝙋 𝘿𝙀𝙏𝙀𝘾𝙏𝙄𝙊𝙉
+// Fires ⚡ when price wicks through a live zone boundary but the bar closes
+// back on the "safe" side — a classic stop-hunt / liquidity grab signature.
+// ─────────────────────────────────────────────────────────────────────────────
+
+if showSweeps
+    // Demand sweep: wick below zone bot, close back above it
+    cntD = array.size(demandBoxes)
+    if cntD > 0
+        for j = 0 to cntD - 1
+            zBot = array.get(demandBots, j)
+            if low < zBot and close > zBot
+                label.new(bar_index, low, "⚡", yloc = yloc.belowbar, style = label.style_none, textcolor = color.new(#22c5af, 0), size = size.small)
+                break
+
+    // Supply sweep: wick above zone top, close back below it
+    cntS = array.size(supplyBoxes)
+    if cntS > 0
+        for j = 0 to cntS - 1
+            zTop = array.get(supplyTops, j)
+            if high > zTop and close < zTop
+                label.new(bar_index, high, "⚡", yloc = yloc.abovebar, style = label.style_none, textcolor = color.new(#ef8844, 0), size = size.small)
+                break
