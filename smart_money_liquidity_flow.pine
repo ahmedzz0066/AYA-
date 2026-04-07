@@ -1,0 +1,350 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ChartPrime
+
+//@version=6
+indicator("Smart Money Liquidity Flow [ChartPrime]", "SM Liq Flow [CP]", overlay = true,
+          max_boxes_count = 500, max_lines_count = 300, max_labels_count = 500, calc_bars_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙐𝙎𝙀𝙍 𝙄𝙉𝙋𝙐𝙏𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Detection ────────────────────────────────────────────────────────────────
+swLen    = input.int  (10,   "Swing Length",                 minval = 2,              group = "Detection",
+           tooltip = "Bars left & right required to confirm a swing pivot")
+eqTol    = input.float(0.3,  "Pool Tolerance (× ATR)",       minval = 0.05, step = 0.05, group = "Detection",
+           tooltip = "How close two swing highs (or lows) must be to be counted as an equal level — a liquidity pool")
+maxPools = input.int  (6,    "Max Liquidity Pools Each",     minval = 1, maxval = 20, group = "Detection")
+maxFVG   = input.int  (8,    "Max Imbalance Zones",          minval = 1, maxval = 30, group = "Detection")
+atrLen   = input.int  (14,   "ATR Length",                   minval = 1,              group = "Detection")
+fvgMin   = input.float(0.3,  "Min FVG Size (× ATR)",         minval = 0.05, step = 0.05, group = "Detection",
+           tooltip = "Minimum gap size (relative to ATR) required to register a Fair Value Gap / imbalance zone")
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+bullCol  = input.color(#22c58f, "Bullish",    group = "Colors")
+bearCol  = input.color(#ef4444, "Bearish",    group = "Colors")
+
+// ── Display ──────────────────────────────────────────────────────────────────
+showFVG    = input.bool(true, "Show Imbalance Zones (FVG)", group = "Display")
+showStruct = input.bool(true, "Show Market Structure",      group = "Display")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝘾𝙊𝙍𝙀 𝘾𝘼𝙇𝘾𝙐𝙇𝘼𝙏𝙄𝙊𝙉𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+atr = ta.atr(atrLen)
+
+// ── Range-Weighted Delta ──────────────────────────────────────────────────────
+// Estimates intrabar buy/sell pressure proportionally instead of assigning
+// 100% of volume to one side.  Identical kernel to the CVD Flow Pro script.
+barDelta = (high - low) > 0
+           ? volume * (2.0 * close - high - low) / (high - low)
+           : close > open ? volume : close < open ? -volume : 0.0
+
+// ── Pivot Swings ──────────────────────────────────────────────────────────────
+swH = ta.pivothigh(high, swLen, swLen)   // confirmed swLen bars ago
+swL = ta.pivotlow (low,  swLen, swLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙎𝙏𝙊𝙍𝘼𝙂𝙀
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Equal Highs (EQH) — sell-side liquidity pools above price
+var array<float> eqhLvl   = array.new<float>()
+var array<line>  eqhLine  = array.new<line>()
+var array<int>   eqhTouch = array.new<int>()   // touch count = pool quality
+
+// Equal Lows (EQL) — buy-side liquidity pools below price
+var array<float> eqlLvl   = array.new<float>()
+var array<line>  eqlLine  = array.new<line>()
+var array<int>   eqlTouch = array.new<int>()
+
+// Fair Value Gaps (unfilled imbalance zones)
+var array<box>   fvgBox   = array.new<box>()
+var array<float> fvgTop   = array.new<float>()
+var array<float> fvgBot   = array.new<float>()
+var array<bool>  fvgBull  = array.new<bool>()
+
+// Market structure tracking
+var float lastSwH = na
+var float lastSwL = na
+var float prevSwH = na
+var float prevSwL = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙇𝙄𝙌𝙐𝙄𝘿𝙄𝙏𝙔 𝙋𝙊𝙊𝙇 𝘿𝙀𝙏𝙀𝘾𝙏𝙄𝙊𝙉
+//
+// Core insight: every swing high creates a "stop farm" — retail traders place
+// buy-stop orders just above swing highs (breakout buyers) and stop-losses just
+// above swing highs (short sellers).  When two swing highs are at roughly the
+// same level, the cluster doubles.  Market makers hunt these pools.
+//
+// Pool quality rating (number of touches → line width):
+//   1 touch → thin dashed line     (single swing level)
+//   2 touches → medium dashed      (equal high/low confirmed)
+//   3+ touches → thick dashed      (high-conviction pool, major target)
+// ─────────────────────────────────────────────────────────────────────────────
+
+eqThresh = atr * eqTol
+
+if not na(swH)
+    swHBar = bar_index - swLen
+    level  = swH
+    matchIdx = -1
+    if array.size(eqhLvl) > 0
+        for i = 0 to array.size(eqhLvl) - 1
+            if math.abs(level - array.get(eqhLvl, i)) <= eqThresh
+                matchIdx := i
+                break
+    if matchIdx >= 0
+        // Existing pool — increment touch count and thicken line
+        tc = array.get(eqhTouch, matchIdx) + 1
+        array.set(eqhTouch, matchIdx, tc)
+        l  = array.get(eqhLine,  matchIdx)
+        line.set_x2(l, bar_index)
+        line.set_width(l, math.min(tc, 3))
+    else
+        // New pool
+        l = line.new(swHBar, level, bar_index, level,
+                     color  = color.new(bearCol, 45),
+                     style  = line.style_dashed,
+                     width  = 1,
+                     extend = extend.right)
+        array.push(eqhLvl,   level)
+        array.push(eqhLine,  l)
+        array.push(eqhTouch, 1)
+        label.new(swHBar, level, "EQH", style = label.style_none,
+                  textcolor = color.new(bearCol, 20), size = size.tiny)
+        if array.size(eqhLvl) > maxPools
+            dead = array.shift(eqhLine)
+            line.delete(dead)
+            array.shift(eqhLvl)
+            array.shift(eqhTouch)
+
+    prevSwH := lastSwH
+    lastSwH := level
+
+if not na(swL)
+    swLBar = bar_index - swLen
+    level  = swL
+    matchIdx = -1
+    if array.size(eqlLvl) > 0
+        for i = 0 to array.size(eqlLvl) - 1
+            if math.abs(level - array.get(eqlLvl, i)) <= eqThresh
+                matchIdx := i
+                break
+    if matchIdx >= 0
+        tc = array.get(eqlTouch, matchIdx) + 1
+        array.set(eqlTouch, matchIdx, tc)
+        l  = array.get(eqlLine,  matchIdx)
+        line.set_x2(l, bar_index)
+        line.set_width(l, math.min(tc, 3))
+    else
+        l = line.new(swLBar, level, bar_index, level,
+                     color  = color.new(bullCol, 45),
+                     style  = line.style_dashed,
+                     width  = 1,
+                     extend = extend.right)
+        array.push(eqlLvl,   level)
+        array.push(eqlLine,  l)
+        array.push(eqlTouch, 1)
+        label.new(swLBar, level, "EQL", style = label.style_none,
+                  textcolor = color.new(bullCol, 20), size = size.tiny)
+        if array.size(eqlLvl) > maxPools
+            dead = array.shift(eqlLine)
+            line.delete(dead)
+            array.shift(eqlLvl)
+            array.shift(eqlTouch)
+
+    prevSwL := lastSwL
+    lastSwL := level
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙇𝙄𝙌𝙐𝙄𝘿𝙄𝙏𝙔 𝙎𝙒𝙀𝙀𝙋 + 𝘿𝙀𝙇𝙏𝘼 𝘾𝙊𝙉𝙁𝙄𝙍𝙈𝘼𝙏𝙄𝙊𝙉
+//
+// A sweep alone is meaningless — it may be a genuine breakout.  What separates
+// a smart-money liquidity grab from a trend continuation is the DELTA:
+//
+//   Bullish Liquidity Sweep (LSB):
+//     price wicks BELOW an EQL, then CLOSES ABOVE it  +  delta is POSITIVE
+//     → sellers were absorbed; smart money accumulated while retail sold
+//
+//   Bearish Liquidity Sweep (LSS):
+//     price wicks ABOVE an EQH, then CLOSES BELOW it  +  delta is NEGATIVE
+//     → buyers were absorbed; smart money distributed while retail bought
+//
+// Both conditions must be true simultaneously.  Delta confirmation is the edge.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bullSweep  = false
+bearSweep  = false
+sweepDelta = 0.0
+
+// Check EQL pools for bullish sweep
+eqlSz = array.size(eqlLvl)
+if eqlSz > 0
+    for j = 0 to eqlSz - 1
+        lvl = array.get(eqlLvl, j)
+        if low < lvl and close > lvl and barDelta > 0
+            bullSweep  := true
+            sweepDelta := barDelta
+            ln = array.get(eqlLine, j)
+            line.delete(ln)
+            array.remove(eqlLvl,   j)
+            array.remove(eqlLine,  j)
+            array.remove(eqlTouch, j)
+            break
+
+// Check EQH pools for bearish sweep
+eqhSz = array.size(eqhLvl)
+if eqhSz > 0
+    for j = 0 to eqhSz - 1
+        lvl = array.get(eqhLvl, j)
+        if high > lvl and close < lvl and barDelta < 0
+            bearSweep  := true
+            sweepDelta := barDelta
+            ln = array.get(eqhLine, j)
+            line.delete(ln)
+            array.remove(eqhLvl,   j)
+            array.remove(eqhLine,  j)
+            array.remove(eqhTouch, j)
+            break
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙎𝙒𝙀𝙀𝙋 𝙎𝙄𝙂𝙉𝘼𝙇𝙎
+// ─────────────────────────────────────────────────────────────────────────────
+
+if bullSweep
+    label.new(bar_index, low,
+              "LSB ▲\n" + str.tostring(sweepDelta, format.volume),
+              yloc      = yloc.belowbar,
+              style     = label.style_label_up,
+              color     = color.new(bullCol, 75),
+              textcolor = bullCol,
+              size      = size.small)
+
+if bearSweep
+    label.new(bar_index, high,
+              "LSS ▼\n" + str.tostring(sweepDelta, format.volume),
+              yloc      = yloc.abovebar,
+              style     = label.style_label_down,
+              color     = color.new(bearCol, 75),
+              textcolor = bearCol,
+              size      = size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙁𝘼𝙄𝙍 𝙑𝘼𝙇𝙐𝙀 𝙂𝘼𝙋𝙎 (𝙄𝙢𝙗𝙖𝙡𝙖𝙣𝙘𝙚 𝙕𝙤𝙣𝙚𝙨)
+//
+// An FVG is a three-candle imbalance: bar[2].high < bar[0].low (bullish) or
+// bar[2].low > bar[0].high (bearish).  No trades occurred in that gap, so
+// price is drawn back to fill it — these become magnet levels for re-tests.
+//
+// Mitigation:
+//   Bull FVG: removed when price closes back through its lower boundary
+//   Bear FVG: removed when price closes back through its upper boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+if showFVG
+    // Step 1: mitigate existing FVGs (iterate backward to safely remove)
+    fSz = array.size(fvgBox)
+    if fSz > 0
+        j = fSz - 1
+        while j >= 0
+            if j < array.size(fvgBox)
+                fT   = array.get(fvgTop,  j)
+                fB   = array.get(fvgBot,  j)
+                bull = array.get(fvgBull, j)
+                // Close-based mitigation: body must re-enter the gap
+                filled = bull ? (close < fB) : (close > fT)
+                if filled
+                    b = array.get(fvgBox, j)
+                    box.delete(b)
+                    array.remove(fvgBox,  j)
+                    array.remove(fvgTop,  j)
+                    array.remove(fvgBot,  j)
+                    array.remove(fvgBull, j)
+            j -= 1
+
+    // Step 2: detect new FVGs
+    minGap   = atr * fvgMin
+    isBullFVG = low > high[2] and (low - high[2]) >= minGap
+    isBearFVG = high < low[2] and (low[2] - high) >= minGap
+
+    if isBullFVG
+        b = box.new(bar_index - 2, low, bar_index, high[2],
+                    bgcolor      = color.new(bullCol, 88),
+                    border_color = color.new(bullCol, 60),
+                    border_width = 1,
+                    extend       = extend.right)
+        array.push(fvgBox,  b)
+        array.push(fvgTop,  low)
+        array.push(fvgBot,  high[2])
+        array.push(fvgBull, true)
+        if array.size(fvgBox) > maxFVG
+            old = array.shift(fvgBox)
+            box.delete(old)
+            array.shift(fvgTop)
+            array.shift(fvgBot)
+            array.shift(fvgBull)
+
+    if isBearFVG
+        b = box.new(bar_index - 2, low[2], bar_index, high,
+                    bgcolor      = color.new(bearCol, 88),
+                    border_color = color.new(bearCol, 60),
+                    border_width = 1,
+                    extend       = extend.right)
+        array.push(fvgBox,  b)
+        array.push(fvgTop,  low[2])
+        array.push(fvgBot,  high)
+        array.push(fvgBull, false)
+        if array.size(fvgBox) > maxFVG
+            old = array.shift(fvgBox)
+            box.delete(old)
+            array.shift(fvgTop)
+            array.shift(fvgBot)
+            array.shift(fvgBull)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 📌 𝙈𝘼𝙍𝙆𝙀𝙏 𝙎𝙏𝙍𝙐𝘾𝙏𝙐𝙍𝙀  (𝘽𝙊𝙎 / 𝘾𝙃𝙤𝘾𝙃)
+//
+// BOS  (Break of Structure): price closes beyond the last confirmed pivot.
+//   → Trend continuation.  The broken level often flips to support/resistance.
+//
+// CHoCH (Change of Character): price is making HH/HL (uptrend) but then
+//   closes below the last swing low — trend is reversing.  Or LH/LL flips
+//   above the last swing high.
+//
+// Only the LAST four swings are tracked to keep labels uncluttered.
+// Broken structure levels are drawn as dotted horizontal lines (SR flip).
+// ─────────────────────────────────────────────────────────────────────────────
+
+if showStruct and not na(lastSwH) and not na(lastSwL)
+    // ── Bullish BOS ───────────────────────────────────────────────────────────
+    if close > lastSwH and close[1] <= lastSwH
+        // Broken resistance becomes support — mark the level
+        line.new(bar_index - 10, lastSwH, bar_index, lastSwH,
+                 color = color.new(bullCol, 50), width = 1, style = line.style_dotted, extend = extend.right)
+        label.new(bar_index, lastSwH, "BOS",
+                  style = label.style_none, textcolor = bullCol, size = size.tiny)
+
+    // ── Bearish BOS ───────────────────────────────────────────────────────────
+    if close < lastSwL and close[1] >= lastSwL
+        // Broken support becomes resistance — mark the level
+        line.new(bar_index - 10, lastSwL, bar_index, lastSwL,
+                 color = color.new(bearCol, 50), width = 1, style = line.style_dotted, extend = extend.right)
+        label.new(bar_index, lastSwL, "BOS",
+                  style = label.style_none, textcolor = bearCol, size = size.tiny)
+
+    // ── Bullish CHoCH ─────────────────────────────────────────────────────────
+    // Uptrend (lastSwL < prevSwL → HL structure) broken below lastSwL
+    if not na(prevSwL) and lastSwL < prevSwL and close < lastSwL and close[1] >= lastSwL
+        label.new(bar_index, lastSwL, "CHoCH ▼",
+                  style = label.style_label_up, color = color.new(bearCol, 75),
+                  textcolor = bearCol, size = size.small)
+
+    // ── Bearish CHoCH ─────────────────────────────────────────────────────────
+    // Downtrend (lastSwH > prevSwH → LH structure) broken above lastSwH
+    if not na(prevSwH) and lastSwH > prevSwH and close > lastSwH and close[1] <= lastSwH
+        label.new(bar_index, lastSwH, "CHoCH ▲",
+                  style = label.style_label_down, color = color.new(bullCol, 75),
+                  textcolor = bullCol, size = size.small)
