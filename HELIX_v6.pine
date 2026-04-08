@@ -163,20 +163,20 @@ deltaZ     = deltaStd > 0 ? (netDelta - deltaMean) / deltaStd : 0.0
 
 // ── Absorption: large volume + tiny body + neither aggressively directional
 //    Market maker is absorbing retail flow without moving price
-isAbsorption = volume  >  volMean  * i_absorbMult   and
-               priceRange < rangeMean * 0.70         and
-               math.abs(close - open) < priceRange   * 0.30
+isAbsorption = (volume     >  volMean  * i_absorbMult and
+                priceRange <  rangeMean * 0.70        and
+                math.abs(close - open) < priceRange   * 0.30)
 
 // ── Aggression: large volume + wide range + decisive close
-isBullAgg = volume > volMean * i_absorbMult and
-            close  > open                   and
-            buyPct > 0.70                   and
-            priceRange > rangeMean
+isBullAgg = (volume    > volMean * i_absorbMult and
+             close    > open                   and
+             buyPct   > 0.70                   and
+             priceRange > rangeMean)
 
-isBearAgg = volume > volMean * i_absorbMult and
-            close  < open                   and
-            sellPct > 0.70                  and
-            priceRange > rangeMean
+isBearAgg = (volume    > volMean * i_absorbMult and
+             close    < open                   and
+             sellPct  > 0.70                   and
+             priceRange > rangeMean)
 
 // ── Exhaustion (climax): very high volume but price closes AGAINST the push
 //    Smart money distributing/accumulating at extremes
@@ -195,13 +195,13 @@ sweepTolPrice = atr * (i_sweepTol / 100.0)
 
 // Bullish sweep: price briefly violates a prior swing low then closes above it
 //   (liquidity was taken from sellers → smart money now long)
-sweptLow  = low < nz(ta.valuewhen(not na(pl), pl, 0)) - sweepTolPrice and
-            close > nz(ta.valuewhen(not na(pl), pl, 0))
+sweptLow  = (low   < nz(ta.valuewhen(not na(pl), pl, 0)) - sweepTolPrice and
+             close > nz(ta.valuewhen(not na(pl), pl, 0)))
 
 // Bearish sweep: price briefly violates a prior swing high then closes below it
 //   (liquidity was taken from buyers → smart money now short)
-sweptHigh = high > nz(ta.valuewhen(not na(ph), ph, 0)) + sweepTolPrice and
-            close < nz(ta.valuewhen(not na(ph), ph, 0))
+sweptHigh = (high  > nz(ta.valuewhen(not na(ph), ph, 0)) + sweepTolPrice and
+             close < nz(ta.valuewhen(not na(ph), ph, 0)))
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 8 ▸ PROBABILISTIC EDGE MODEL  (Geometric-mean Bayesian composite)
@@ -244,19 +244,19 @@ probability = 0.30 + rawProb * 0.65
 //     Stop  = swept candle extreme ± ATR buffer
 //     Target = entry + (entry − stop) × minRR   → guaranteed ≥ 1:5 RR
 // ══════════════════════════════════════════════════════════════════════════════
-longCond  = sweptLow   and
-            isCompression                               and
-            (isAbsorption or isBearExhaust or isBearAgg) and
-            deltaZ     > 0.0                            and
-            probability >= i_minProb                    and
-            not isTurbulent
+longCond  = (sweptLow                                       and
+             isCompression                              and
+             (isAbsorption or isBearExhaust or isBearAgg) and
+             deltaZ      > 0.0                          and
+             probability >= i_minProb                   and
+             not isTurbulent)
 
-shortCond = sweptHigh  and
-            isCompression                               and
-            (isAbsorption or isBullExhaust or isBullAgg) and
-            deltaZ     < 0.0                            and
-            probability >= i_minProb                    and
-            not isTurbulent
+shortCond = (sweptHigh                                       and
+             isCompression                               and
+             (isAbsorption or isBullExhaust or isBullAgg) and
+             deltaZ      < 0.0                           and
+             probability >= i_minProb                    and
+             not isTurbulent)
 
 // Stop levels
 longStop  = low  - atr * i_stopMult
