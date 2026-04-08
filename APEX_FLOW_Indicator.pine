@@ -1,0 +1,797 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║         APEX-FLOW | Adaptive Price Energy eXtraction System             ║
+// ║         Institutional Liquidity Engine — Pine Script v5                 ║
+// ║                                                                          ║
+// ║  Framework: A.P.E.X-F.L.O.W                                             ║
+// ║  Adaptive Price Energy eXtraction via Flow Liquidity Order Weight-map   ║
+// ║                                                                          ║
+// ║  Built on:                                                               ║
+// ║   • Hydrostatic Pressure Model (fluid dynamics)                          ║
+// ║   • Hamiltonian Energy Conservation (physics)                            ║
+// ║   • Order-Flow Delta Intelligence                                        ║
+// ║   • Probabilistic Confluence Scoring                                     ║
+// ║   • ICT-grade Liquidity Engineering                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+indicator("APEX-FLOW | Institutional Liquidity Engine [AYA]",
+     overlay          = true,
+     max_bars_back    = 5000,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 300)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 0 — INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════════════
+string G_CORE   = "⚙  CORE ENGINE"
+string G_LIQ    = "💧 LIQUIDITY MODEL"
+string G_ENERGY = "⚡ ENERGY MODEL"
+string G_VOL    = "📊 VOLUME INTELLIGENCE"
+string G_PROB   = "🎯 PROBABILITY FILTER"
+string G_EXEC   = "🏹 EXECUTION LAYER"
+string G_VP     = "📈 VOLUME PROFILE (UPGRADED)"
+string G_VIS    = "🎨 VISUALS"
+
+// ── Core ──────────────────────────────────────────────────────────────────
+int   i_atr_len    = input.int  (14,   "ATR Length",               group=G_CORE, minval=5,  maxval=50)
+int   i_vol_len    = input.int  (20,   "Volume MA Length",          group=G_CORE, minval=5,  maxval=100)
+int   i_swing_len  = input.int  (10,   "Swing Detection Length",    group=G_CORE, minval=3,  maxval=30)
+int   i_vp_levels  = input.int  (24,   "Volume Profile Levels",     group=G_CORE, minval=8,  maxval=48)
+bool  i_show_table = input.bool (true,  "Show Info Table",           group=G_CORE)
+
+// ── Liquidity Model ───────────────────────────────────────────────────────
+bool  i_show_liq   = input.bool (true,  "Show Liquidity Pools",      group=G_LIQ)
+bool  i_show_sweep = input.bool (true,  "Show Sweep Signals",        group=G_LIQ)
+int   i_eq_ticks   = input.int  (3,    "Equal H/L Tolerance (ticks)",group=G_LIQ, minval=1, maxval=15,
+     tooltip="How many ticks apart two swing highs/lows must be to count as 'equal' (inducement)")
+int   i_liq_pools  = input.int  (5,    "Max Liquidity Pools Shown",  group=G_LIQ, minval=2, maxval=12)
+color i_bsl_col    = input.color(color.new(#00e5ff,60), "Buy-Side Liq Color",  group=G_LIQ)
+color i_ssl_col    = input.color(color.new(#ff1744,60), "Sell-Side Liq Color", group=G_LIQ)
+
+// ── Energy Model ──────────────────────────────────────────────────────────
+bool  i_show_energy = input.bool (true, "Show Energy Background",    group=G_ENERGY)
+float i_comp_thr    = input.float(0.40, "Compression Threshold",     group=G_ENERGY,
+     minval=0.10, maxval=0.90, step=0.05,
+     tooltip="bar_range/ATR below this → Potential Energy accumulating (purple bg)")
+float i_exp_thr     = input.float(1.80, "Expansion Threshold",       group=G_ENERGY,
+     minval=1.20, maxval=5.00, step=0.10,
+     tooltip="bar_range/ATR above this → Kinetic Energy releasing (orange bg)")
+color i_comp_col    = input.color(color.new(#7b1fa2,88), "Compression Color",  group=G_ENERGY)
+color i_exp_col     = input.color(color.new(#e65100,85), "Expansion Color",    group=G_ENERGY)
+
+// ── Volume Intelligence ───────────────────────────────────────────────────
+bool  i_show_delta  = input.bool (true,  "Color Bars by Delta Bias",  group=G_VOL)
+float i_rvol_thr    = input.float(1.60,  "Relative Volume Threshold", group=G_VOL,
+     minval=1.00, maxval=5.00, step=0.10)
+bool  i_show_absorb = input.bool (true,  "Mark Absorption Candles",   group=G_VOL)
+bool  i_show_aggr   = input.bool (true,  "Mark Aggression Candles",   group=G_VOL)
+
+// ── Probability Filter ────────────────────────────────────────────────────
+int   i_min_score  = input.int  (65,   "Min Signal Score (0-100)",   group=G_PROB,
+     minval=40, maxval=95,
+     tooltip="Signal only fires when confluence score >= this value. Higher = rarer, cleaner signals.")
+bool  i_use_sess   = input.bool (true,  "Session Filter (London/NY)", group=G_PROB)
+bool  i_use_trend  = input.bool (true,  "Trend Alignment Filter",     group=G_PROB)
+int   i_trend_len  = input.int  (50,   "Trend EMA Length",            group=G_PROB, minval=20, maxval=200)
+
+// ── Execution Layer ───────────────────────────────────────────────────────
+bool  i_show_sig   = input.bool (true,  "Show Entry Signals",         group=G_EXEC)
+bool  i_show_tp    = input.bool (true,  "Show TP/SL Levels",          group=G_EXEC)
+float i_atr_sl     = input.float(0.50,  "Stop ATR Multiplier",        group=G_EXEC,
+     minval=0.10, maxval=2.00, step=0.10,
+     tooltip="Stop placed swept_level ± (ATR × this multiplier)")
+float i_rr_min     = input.float(5.00,  "Minimum R:R to Display",     group=G_EXEC,
+     minval=2.00, maxval=20.0, step=0.50)
+int   i_sig_limit  = input.int  (10,   "Max Visible Signals",         group=G_EXEC, minval=2, maxval=30)
+
+// ── Volume Profile ────────────────────────────────────────────────────────
+bool  i_vp_on      = input.bool (true,  "Show Volume Profile",        group=G_VP)
+bool  i_poc_on     = input.bool (true,  "Show POC Line",              group=G_VP)
+bool  i_vah_val_on = input.bool (true,  "Show VAH / VAL",             group=G_VP)
+bool  i_heatmap_on = input.bool (true,  "Show HeatMap Fill",          group=G_VP)
+bool  i_vp_right   = input.bool (false, "Profile on Right Side",      group=G_VP)
+int   i_vp_bars    = input.int  (300,   "Profile Lookback (bars)",    group=G_VP,
+     minval=50, maxval=3000,
+     tooltip="Number of bars back to compute volume profile. Use 0 for full history.")
+color i_bull_col   = input.color(#1b5e20, "Bullish Color",            group=G_VP)
+color i_bear_col   = input.color(#b71c1c, "Bearish Color",            group=G_VP)
+color i_poc_col    = input.color(#ffd600, "POC Color",                group=G_VP)
+color i_vah_col    = input.color(color.new(#00e5ff,40), "VAH Color",  group=G_VP)
+color i_val_col    = input.color(color.new(#ff1744,40), "VAL Color",  group=G_VP)
+color i_heat_lo    = input.color(color.new(#131722,80), "Heat Low",   group=G_VP)
+color i_heat_hi    = input.color(color.new(#f57f17,50), "Heat High",  group=G_VP)
+
+// ── Visuals ───────────────────────────────────────────────────────────────
+bool  i_show_ema   = input.bool (true,  "Show Trend EMA",             group=G_VIS)
+color i_ema_col    = input.color(color.new(#90caf9,30), "EMA Color",  group=G_VIS)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 1 — TYPE DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+type LiqPool
+    float  level
+    int    bar_idx
+    bool   swept
+    float  vol_at_create
+    bool   is_bsl           // true = Buy-Side Liquidity (above), false = SSL (below)
+
+type EnergyState
+    float  potential        // 0-100: accumulated compression energy
+    float  kinetic          // 0-100: current release force
+    int    comp_bars        // consecutive compressed bars
+    bool   compressed
+    bool   releasing
+
+type VolDelta
+    float  ratio            // -1 to +1  (buy pressure minus sell pressure)
+    float  rvol             // relative volume
+    bool   absorbing        // high vol, tight range
+    bool   bull_aggr        // high vol, bull expansion
+    bool   bear_aggr        // high vol, bear expansion
+    bool   bull_div         // delta diverges bullish
+    bool   bear_div         // delta diverges bearish
+
+type Signal
+    int    bar_idx
+    float  entry
+    float  sl
+    float  tp1
+    float  tp2
+    float  tp3
+    int    score
+    bool   is_long
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 2 — CORE MATH / PHYSICS CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Base measurements ─────────────────────────────────────────────────────
+float atr        = ta.atr(i_atr_len)
+float vol_ma     = ta.sma(volume, i_vol_len)
+float rvol       = volume / math.max(vol_ma, 1.0)
+float bar_rng    = high - low
+float body_rng   = math.abs(close - open)
+float body_ratio = bar_rng > 0 ? body_rng / bar_rng : 0.0
+float energy_r   = atr > 0 ? bar_rng / atr : 0.0   // bar_range / ATR = energy density
+
+// ── Trend EMA ─────────────────────────────────────────────────────────────
+float trend_ema  = ta.ema(close, i_trend_len)
+bool  bull_trend = close > trend_ema
+bool  bear_trend = close < trend_ema
+
+plot(i_show_ema ? trend_ema : na, "Trend EMA", color=i_ema_col, linewidth=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 3 — ENERGY MODEL  (Hamiltonian H = T + V)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Physics basis:
+//    Potential Energy V = f(compression duration, trapped volume)
+//    Kinetic Energy  T = f(range expansion, body ratio, relative volume)
+//    Total H = T + V is conserved → when V peaks, T release is imminent
+//
+//  Compression ratio R_c = bar_range / ATR
+//    R_c < comp_threshold → market in potential-energy state
+//    R_c > exp_threshold  → kinetic release confirmed
+//
+//  Potential Energy Score (0-100):
+//    PE = min(100,  comp_bars × 8  ×  clamp(rvol, 0.5, 2.0))
+//
+//  Kinetic Energy Score (0-100):
+//    KE = min(100,  energy_r × 20  ×  body_ratio  ×  clamp(rvol, 0.5, 3.0))
+
+var EnergyState eng = EnergyState.new(0.0, 0.0, 0, false, false)
+
+bool is_comp     = energy_r < i_comp_thr
+bool is_expand   = energy_r > i_exp_thr and body_ratio > 0.55
+
+eng.comp_bars   := is_comp ? eng.comp_bars + 1 : 0
+eng.compressed  := is_comp
+eng.releasing   := is_expand
+eng.potential   := math.min(100.0, eng.comp_bars * 8.0 * math.max(0.5, math.min(2.0, rvol)))
+eng.kinetic     := math.min(100.0, energy_r * 20.0 * body_ratio * math.max(0.5, math.min(3.0, rvol)))
+
+bool disp_bull   = is_expand and close > open
+bool disp_bear   = is_expand and close < open
+
+// Energy background shading
+bgcolor(i_show_energy and is_comp    ? i_comp_col : na, title="Compression Zone")
+bgcolor(i_show_energy and is_expand  ? i_exp_col  : na, title="Expansion Zone")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 4 — VOLUME INTELLIGENCE LAYER
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Volume Delta Approximation (no tick data required):
+//    close_pct = (close - low) / bar_range  → [0,1]
+//    buy_vol  ≈ volume × close_pct
+//    sell_vol ≈ volume × (1 - close_pct)
+//    delta_ratio = (buy - sell) / volume   → [-1, +1]
+//
+//  Absorption:  rvol > threshold  AND  body_ratio < 0.30
+//               → trapped side absorbing supply/demand → reversal likely
+//
+//  Aggression:  rvol > threshold  AND  body_ratio > 0.60  AND  direction
+//               → institutional commitment to directional move
+//
+//  Delta Divergence:
+//    Price makes extreme, but delta does NOT confirm → hidden distribution
+//    Used as early warning, adds to probability score
+
+var VolDelta vd = VolDelta.new(0.0, 0.0, false, false, false, false, false)
+
+float close_pct     = bar_rng > 0 ? (close - low) / bar_rng : 0.5
+float buy_vol_est   = volume * close_pct
+float sell_vol_est  = volume * (1.0 - close_pct)
+float delta_ratio   = volume > 0 ? (buy_vol_est - sell_vol_est) / volume : 0.0
+float cum_delta     = ta.ema(delta_ratio, 5)
+
+float delta_hi5     = ta.highest(delta_ratio, 5)
+float delta_lo5     = ta.lowest (delta_ratio, 5)
+float price_hi5     = ta.highest(high,        5)
+float price_lo5     = ta.lowest (low,         5)
+
+vd.ratio      := delta_ratio
+vd.rvol       := rvol
+vd.absorbing  := rvol > i_rvol_thr and body_ratio < 0.30
+vd.bull_aggr  := rvol > i_rvol_thr and body_ratio > 0.60 and close > open
+vd.bear_aggr  := rvol > i_rvol_thr and body_ratio > 0.60 and close < open
+vd.bull_div   := low  <= price_lo5 and delta_ratio > delta_lo5 + 0.25
+vd.bear_div   := high >= price_hi5 and delta_ratio < delta_hi5 - 0.25
+
+// Delta-based bar coloring
+color delta_bar_col = delta_ratio >  0.25 ? color.new(i_bull_col, 20) :
+                      delta_ratio < -0.25 ? color.new(i_bear_col, 20) :
+                      color.new(color.gray, 40)
+
+barcolor(i_show_delta ? delta_bar_col : na, title="Delta Bar Color")
+
+// Absorption / Aggression markers
+plotshape(i_show_absorb and vd.absorbing,  "Absorption",
+     shape.circle,    location.abovebar, color.new(#ab47bc,40), size=size.tiny)
+plotshape(i_show_aggr  and vd.bull_aggr,   "Bull Aggression",
+     shape.triangleup, location.belowbar, color.new(#1de9b6,50), size=size.tiny)
+plotshape(i_show_aggr  and vd.bear_aggr,   "Bear Aggression",
+     shape.triangledown, location.abovebar, color.new(#ff5252,50), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 5 — LIQUIDITY ENGINEERING MODEL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Market Maker Thesis:
+//    Price does NOT move randomly. It is engineered to:
+//      1. INDUCE retail traders to place stops at obvious levels
+//      2. ENGINEER a sweep through those stop clusters
+//      3. DISPLACE in the opposite direction (true move)
+//
+//  BSL (Buy-Side Liquidity)  = stop clusters ABOVE swing highs
+//  SSL (Sell-Side Liquidity) = stop clusters BELOW swing lows
+//
+//  Equal Highs / Equal Lows = highest-probability inducement targets
+//    Detected when: |level_A - level_B| < i_eq_ticks × syminfo.mintick
+//
+//  Sweep Confirmation:
+//    Bull Sweep: low < SSL level  AND  close > SSL level
+//                → wick below, close above = engineered stop grab
+//    Bear Sweep: high > BSL level AND  close < BSL level
+//                → wick above, close below = engineered stop grab
+
+// ── Swing detection ───────────────────────────────────────────────────────
+float ph = ta.pivothigh(high, i_swing_len, i_swing_len)
+float pl = ta.pivotlow (low,  i_swing_len, i_swing_len)
+
+var array<LiqPool> bsl_pools = array.new<LiqPool>()   // above price → short targets
+var array<LiqPool> ssl_pools = array.new<LiqPool>()   // below price → long targets
+
+var array<box>     liq_boxes = array.new<box>()
+
+// Register new pivots as liquidity pools
+if not na(ph)
+    bsl_pools.push(LiqPool.new(ph, bar_index[i_swing_len], false, volume[i_swing_len], true))
+    if bsl_pools.size() > i_liq_pools
+        box.delete(liq_boxes.size() > 0 ? liq_boxes.shift() : na)
+        bsl_pools.shift()
+
+if not na(pl)
+    ssl_pools.push(LiqPool.new(pl, bar_index[i_swing_len], false, volume[i_swing_len], false))
+    if ssl_pools.size() > i_liq_pools
+        box.delete(liq_boxes.size() > 0 ? liq_boxes.shift() : na)
+        ssl_pools.shift()
+
+// Draw liquidity zone boxes (thin band around the level)
+float tick_tol = syminfo.mintick * i_eq_ticks
+
+if i_show_liq and (not na(ph) or not na(pl))
+    if not na(ph)
+        liq_boxes.push(box.new(
+             bar_index[i_swing_len] - i_swing_len,
+             ph + tick_tol,
+             bar_index,
+             ph - tick_tol,
+             border_color = i_bsl_col,
+             bgcolor      = color.new(i_bsl_col, 80),
+             border_width = 1,
+             extend       = extend.right,
+             xloc         = xloc.bar_index))
+    if not na(pl)
+        liq_boxes.push(box.new(
+             bar_index[i_swing_len] - i_swing_len,
+             pl + tick_tol,
+             bar_index,
+             pl - tick_tol,
+             border_color = i_ssl_col,
+             bgcolor      = color.new(i_ssl_col, 80),
+             border_width = 1,
+             extend       = extend.right,
+             xloc         = xloc.bar_index))
+
+// Limit box count
+if liq_boxes.size() > i_liq_pools * 4
+    box.delete(liq_boxes.shift())
+
+// ── Sweep Detection ───────────────────────────────────────────────────────
+bool  swept_bull  = false
+bool  swept_bear  = false
+float swept_ssl   = float(na)
+float swept_bsl   = float(na)
+
+// Check SSL (below) for bull sweep
+for i = 0 to ssl_pools.size() - 1
+    p = ssl_pools.get(i)
+    if not p.swept and low < p.level and close > p.level
+        swept_bull := true
+        swept_ssl  := p.level
+        p.swept    := true
+        break
+
+// Check BSL (above) for bear sweep
+for i = 0 to bsl_pools.size() - 1
+    p = bsl_pools.get(i)
+    if not p.swept and high > p.level and close < p.level
+        swept_bear := true
+        swept_bsl  := p.level
+        p.swept    := true
+        break
+
+// Sweep visual markers
+plotshape(i_show_sweep and swept_bull, "SSL Sweep (Long Setup)",
+     shape.triangleup, location.belowbar,
+     color.new(i_ssl_col, 0), size=size.small, text="⚡SSL")
+plotshape(i_show_sweep and swept_bear, "BSL Sweep (Short Setup)",
+     shape.triangledown, location.abovebar,
+     color.new(i_bsl_col, 0), size=size.small, text="⚡BSL")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 6 — PROBABILISTIC EDGE MODEL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Scoring System (0 – 100):
+//  ┌─────────────────────────────────────────┬──────┐
+//  │ Factor                                  │ Pts  │
+//  ├─────────────────────────────────────────┼──────┤
+//  │ 1. Liquidity Sweep confirmed            │  25  │
+//  │ 2. Energy compression pre-setup (≥3 bars│  20  │
+//  │    compressed)                          │      │
+//  │ 3. Volume confirmation (aggression /    │  20  │
+//  │    delta divergence / elevated RVOL)    │      │
+//  │ 4. Session alignment (London / NY kill  │  15  │
+//  │    zone)                                │      │
+//  │ 5. Displacement candle post-sweep       │  10  │
+//  │ 6. Trend alignment (above/below EMA)    │  10  │
+//  └─────────────────────────────────────────┴──────┘
+//  Total possible = 100. Default threshold = 65 (configurable).
+
+// Session filter  (UTC hours — adjust offset if on different exchange)
+bool in_london  = (hour >= 7  and hour < 12) and dayofweek >= 2 and dayofweek <= 6
+bool in_ny      = (hour >= 12 and hour < 17) and dayofweek >= 2 and dayofweek <= 6
+bool valid_sess = i_use_sess ? (in_london or in_ny) : true
+
+// ── Bull score ────────────────────────────────────────────────────────────
+int bull_s1 = swept_bull                                       ? 25 : 0
+int bull_s2 = eng.comp_bars >= 3 ? 20 : eng.comp_bars >= 1    ? 10 : 0
+int bull_s3 = vd.bull_aggr or vd.bull_div ? 20 : rvol > 1.2   ? 10 : 0
+int bull_s4 = valid_sess                                       ? 15 : 0
+int bull_s5 = disp_bull                                        ? 10 : 0
+int bull_s6 = (i_use_trend ? bull_trend : true)                ? 10 : 0
+int bull_score = bull_s1 + bull_s2 + bull_s3 + bull_s4 + bull_s5 + bull_s6
+
+// ── Bear score ────────────────────────────────────────────────────────────
+int bear_s1 = swept_bear                                       ? 25 : 0
+int bear_s2 = eng.comp_bars >= 3 ? 20 : eng.comp_bars >= 1    ? 10 : 0
+int bear_s3 = vd.bear_aggr or vd.bear_div ? 20 : rvol > 1.2   ? 10 : 0
+int bear_s4 = valid_sess                                       ? 15 : 0
+int bear_s5 = disp_bear                                        ? 10 : 0
+int bear_s6 = (i_use_trend ? bear_trend : true)                ? 10 : 0
+int bear_score = bear_s1 + bear_s2 + bear_s3 + bear_s4 + bear_s5 + bear_s6
+
+// ── Signal gates ──────────────────────────────────────────────────────────
+bool bull_sig = i_show_sig and swept_bull and bull_score >= i_min_score
+bool bear_sig = i_show_sig and swept_bear and bear_score >= i_min_score
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 7 — EXECUTION LAYER
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Entry:   close of the sweep candle (confirmed reversal bar)
+//  Stop:    swept level ± (ATR × sl_multiplier)
+//           Bull: stop = swept_ssl - atr × mult  (below the grab)
+//           Bear: stop = swept_bsl + atr × mult  (above the grab)
+//  Risk(R): |entry - stop|
+//  TP1:     entry ± 2R   (partial take, move SL to BE)
+//  TP2:     entry ± 3R   (partial take)
+//  TP3:     entry ± 5R   (full target — minimum 1:5 RR)
+//
+//  Only displayed if achieved RR ≥ i_rr_min
+
+var array<Signal> signals = array.new<Signal>()
+var array<line>   sig_lines = array.new<line>()
+var array<label>  sig_labels = array.new<label>()
+
+// Clean up old signals beyond limit
+clean_drawings() =>
+    while sig_lines.size()  > i_sig_limit * 4
+        line.delete(sig_lines.shift())
+    while sig_labels.size() > i_sig_limit * 2
+        label.delete(sig_labels.shift())
+
+if bull_sig
+    float entry  = close
+    float sl     = (not na(swept_ssl) ? swept_ssl : low) - atr * i_atr_sl
+    float risk   = entry - sl
+    float tp1    = entry + risk * 2.0
+    float tp2    = entry + risk * 3.0
+    float tp3    = entry + risk * i_rr_min
+
+    if i_show_tp
+        sig_lines.push(line.new(bar_index, sl,   bar_index + 40, sl,   color=color.new(#ef5350,20), style=line.style_solid,  width=1))
+        sig_lines.push(line.new(bar_index, tp1,  bar_index + 40, tp1,  color=color.new(#66bb6a,50), style=line.style_dashed, width=1))
+        sig_lines.push(line.new(bar_index, tp2,  bar_index + 40, tp2,  color=color.new(#42a5f5,40), style=line.style_dashed, width=2))
+        sig_lines.push(line.new(bar_index, tp3,  bar_index + 40, tp3,  color=color.new(#26c6da,20), style=line.style_solid,  width=2))
+
+    sig_labels.push(label.new(bar_index, low - atr * 1.5,
+         "▲ LONG\nScore: " + str.tostring(bull_score) + "/100\n" +
+         "SL: "  + str.tostring(math.round(sl,  2)) + "\n" +
+         "TP3("  + str.tostring(i_rr_min, "#.#") + "R): " + str.tostring(math.round(tp3, 2)),
+         style     = label.style_label_up,
+         color     = color.new(#1b5e20, 15),
+         textcolor = color.white,
+         size      = size.normal))
+    clean_drawings()
+
+if bear_sig
+    float entry  = close
+    float sl     = (not na(swept_bsl) ? swept_bsl : high) + atr * i_atr_sl
+    float risk   = sl - entry
+    float tp1    = entry - risk * 2.0
+    float tp2    = entry - risk * 3.0
+    float tp3    = entry - risk * i_rr_min
+
+    if i_show_tp
+        sig_lines.push(line.new(bar_index, sl,   bar_index + 40, sl,   color=color.new(#ef5350,20), style=line.style_solid,  width=1))
+        sig_lines.push(line.new(bar_index, tp1,  bar_index + 40, tp1,  color=color.new(#66bb6a,50), style=line.style_dashed, width=1))
+        sig_lines.push(line.new(bar_index, tp2,  bar_index + 40, tp2,  color=color.new(#42a5f5,40), style=line.style_dashed, width=2))
+        sig_lines.push(line.new(bar_index, tp3,  bar_index + 40, tp3,  color=color.new(#26c6da,20), style=line.style_solid,  width=2))
+
+    sig_labels.push(label.new(bar_index, high + atr * 1.5,
+         "▼ SHORT\nScore: " + str.tostring(bear_score) + "/100\n" +
+         "SL: "  + str.tostring(math.round(sl,  2)) + "\n" +
+         "TP3("  + str.tostring(i_rr_min, "#.#") + "R): " + str.tostring(math.round(tp3, 2)),
+         style     = label.style_label_down,
+         color     = color.new(#b71c1c, 15),
+         textcolor = color.white,
+         size      = size.normal))
+    clean_drawings()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 8 — UPGRADED VOLUME PROFILE ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Improvements over original:
+//   1. BUG FIX: was using volume[x] (level index) instead of volume[i] (bar index)
+//   2. Adaptive lookback: i_vp_bars replaces rigid StartTime/EndTime
+//   3. Delta-split VP: bull/bear volume per level (proper delta profile)
+//   4. Value Area: VAH (70%) and VAL drawn as zones, not just POC
+//   5. HeatMap now uses delta-ratio coloring, not just count-based
+//   6. POC shown as a persistent line across visible range
+
+if barstate.islast and i_vp_on
+    // ── 1. Define lookback range ──────────────────────────────────────────
+    int   look     = math.min(i_vp_bars, bar_index)
+    int   p_start  = bar_index - look + 1
+    int   p_end    = bar_index
+
+    // ── 2. Collect price/volume data ──────────────────────────────────────
+    var array<float> p_highs  = array.new_float()
+    var array<float> p_lows   = array.new_float()
+    var array<float> p_closes = array.new_float()
+    var array<float> p_vols   = array.new_float()
+    var array<float> p_cpcts  = array.new_float()   // close_pct for delta
+
+    p_highs .clear()
+    p_lows  .clear()
+    p_closes.clear()
+    p_vols  .clear()
+    p_cpcts .clear()
+
+    for i = 0 to look - 1
+        p_highs .push(high  [i])
+        p_lows  .push(low   [i])
+        p_closes.push(close [i])
+        p_vols  .push(volume[i])
+        rng_i = high[i] - low[i]
+        cpct_i = rng_i > 0 ? (close[i] - low[i]) / rng_i : 0.5
+        p_cpcts.push(cpct_i)
+
+    float range_hi  = p_highs .max()
+    float range_lo  = p_lows  .min()
+    float step      = (range_hi - range_lo) / i_vp_levels
+
+    if step > 0
+        // ── 3. Bucket volumes ─────────────────────────────────────────────
+        array<float> lev_vol_bull = array.new_float(i_vp_levels, 0.0)
+        array<float> lev_vol_bear = array.new_float(i_vp_levels, 0.0)
+        array<float> lev_vol_tot  = array.new_float(i_vp_levels, 0.0)
+        array<int>   lev_count    = array.new_int  (i_vp_levels, 0)
+
+        for i = 0 to p_closes.size() - 1
+            c  = p_closes.get(i)
+            v  = p_vols  .get(i)
+            cp = p_cpcts .get(i)
+            bv = v * cp
+            sv = v * (1.0 - cp)
+
+            // ── FIX from original: use bar index i, not level index x ──
+            bucket = int(math.floor((c - range_lo) / step))
+            bucket := math.max(0, math.min(i_vp_levels - 1, bucket))
+
+            lev_vol_tot .set(bucket, lev_vol_tot .get(bucket) + v )
+            lev_vol_bull.set(bucket, lev_vol_bull.get(bucket) + bv)
+            lev_vol_bear.set(bucket, lev_vol_bear.get(bucket) + sv)
+            lev_count   .set(bucket, lev_count   .get(bucket) + 1 )
+
+        // ── 4. Find POC (highest total volume bucket) ─────────────────────
+        float max_vol   = lev_vol_tot.max()
+        int   poc_idx   = lev_vol_tot.indexof(max_vol)
+        float poc_price = range_lo + poc_idx * step + step * 0.5
+
+        // ── 5. Value Area (70% of total volume around POC) ────────────────
+        float total_vol  = lev_vol_tot.sum()
+        float va_target  = total_vol  * 0.70
+        float va_accum   = lev_vol_tot.get(poc_idx)
+        int   vah_idx    = poc_idx
+        int   val_idx    = poc_idx
+
+        // Expand outward from POC until 70% volume captured
+        while va_accum < va_target
+            bool can_up   = vah_idx < i_vp_levels - 1
+            bool can_down = val_idx  > 0
+            if not can_up and not can_down
+                break
+            float up_vol   = can_up   ? lev_vol_tot.get(vah_idx + 1) : 0.0
+            float down_vol = can_down ? lev_vol_tot.get(val_idx  - 1) : 0.0
+            if up_vol >= down_vol and can_up
+                vah_idx   += 1
+                va_accum  += up_vol
+            else if can_down
+                val_idx   -= 1
+                va_accum  += down_vol
+            else
+                break
+
+        float vah_price = range_lo + (vah_idx + 1) * step
+        float val_price = range_lo + val_idx        * step
+
+        // ── 6. Draw Profile Boxes ─────────────────────────────────────────
+        float max_draw_width = look * 0.30   // profile uses max 30% of lookback width
+        var array<box>  vp_boxes  = array.new<box>()
+        var array<line> vp_lines  = array.new<line>()
+        var array<linefill> vp_fills = array.new<linefill>()
+
+        // Delete old drawings
+        for b in vp_boxes  : box     .delete(b)
+        for l in vp_lines  : line    .delete(l)
+        for f in vp_fills  : linefill.delete(f)
+        vp_boxes .clear()
+        vp_lines .clear()
+        vp_fills .clear()
+
+        for lv = 0 to i_vp_levels - 1
+            lv_bot = range_lo + lv       * step
+            lv_top = range_lo + (lv + 1) * step
+            tv     = lev_vol_tot.get(lv)
+            bv_l   = lev_vol_bull.get(lv)
+            sv_l   = lev_vol_bear.get(lv)
+
+            // Width proportional to volume
+            bar_w  = max_vol > 0 ? int(tv / max_vol * max_draw_width) : 1
+            bar_w  := math.max(bar_w, 1)
+
+            // Delta gradient: positive = green, negative = red
+            lv_delta = tv > 0 ? (bv_l - sv_l) / tv : 0.0
+            lv_col   = color.from_gradient(lv_delta, -1.0, 1.0, i_bear_col, i_bull_col)
+
+            bar_left  = i_vp_right ? p_end            : p_start - bar_w
+            bar_right = i_vp_right ? p_end  + bar_w   : p_start
+
+            if tv > 0
+                vp_boxes.push(box.new(
+                     bar_left, lv_top, bar_right, lv_bot,
+                     border_color = color.new(lv_col, 60),
+                     bgcolor      = color.new(lv_col, 55),
+                     xloc         = xloc.bar_index))
+
+        // HeatMap lines
+        if i_heatmap_on
+            for lv = 0 to i_vp_levels - 1
+                tv   = lev_vol_tot.get(lv)
+                lyp  = range_lo + lv * step
+                l_ln = line.new(p_start, lyp, p_end, lyp,
+                         color=color.new(color.black, 100), xloc=xloc.bar_index)
+                vp_lines.push(l_ln)
+
+            for lv = 0 to i_vp_levels - 2
+                tv_lv = lev_vol_tot.get(lv)
+                heat_c = color.from_gradient(tv_lv, 0, max_vol, i_heat_lo, i_heat_hi)
+                vp_fills.push(linefill.new(
+                     vp_lines.get(lv), vp_lines.get(lv + 1), heat_c))
+
+        // ── 7. POC Line ────────────────────────────────────────────────────
+        if i_poc_on
+            vp_lines.push(line.new(p_start, poc_price, p_end, poc_price,
+                 color=i_poc_col, width=2, style=line.style_solid,
+                 xloc=xloc.bar_index))
+            vp_boxes.push(box.new(p_start, poc_price + step * 0.5,
+                 p_end, poc_price - step * 0.5,
+                 border_color=color.new(i_poc_col,50),
+                 bgcolor=color.new(i_poc_col,88),
+                 text="POC", text_color=i_poc_col,
+                 text_size=size.small, text_halign=text.align_right,
+                 xloc=xloc.bar_index))
+
+        // ── 8. VAH / VAL Zones ────────────────────────────────────────────
+        if i_vah_val_on
+            vp_lines.push(line.new(p_start, vah_price, p_end, vah_price,
+                 color=i_vah_col, width=1, style=line.style_dashed,
+                 xloc=xloc.bar_index))
+            vp_lines.push(line.new(p_start, val_price, p_end, val_price,
+                 color=i_val_col, width=1, style=line.style_dashed,
+                 xloc=xloc.bar_index))
+            vp_boxes.push(box.new(p_end - 5, vah_price + tick_tol,
+                 p_end, vah_price - tick_tol,
+                 border_color=color.new(i_vah_col,30),
+                 bgcolor=color.new(i_vah_col,75),
+                 text="VAH", text_color=i_vah_col,
+                 text_size=size.tiny, text_halign=text.align_right,
+                 xloc=xloc.bar_index))
+            vp_boxes.push(box.new(p_end - 5, val_price + tick_tol,
+                 p_end, val_price - tick_tol,
+                 border_color=color.new(i_val_col,30),
+                 bgcolor=color.new(i_val_col,75),
+                 text="VAL", text_color=i_val_col,
+                 text_size=size.tiny, text_halign=text.align_right,
+                 xloc=xloc.bar_index))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 9 — INFO TABLE  (top-right dashboard)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 3, 9,
+     bgcolor      = color.new(#0d1117, 75),
+     border_color = color.new(#30363d, 80),
+     border_width = 1,
+     frame_color  = color.new(#58a6ff, 60),
+     frame_width  = 1)
+
+f_cell(int col, int row, string txt, color tc, color bg) =>
+    table.cell(dash, col, row, txt, text_color=tc, bgcolor=bg, text_size=size.small)
+
+if barstate.islast and i_show_table
+    // Header
+    f_cell(0,0, "APEX-FLOW",    color.new(#58a6ff,0), color.new(#161b22,60))
+    f_cell(1,0, "STATE",        color.new(#8b949e,0), color.new(#161b22,60))
+    f_cell(2,0, "VALUE",        color.new(#8b949e,0), color.new(#161b22,60))
+
+    // Energy
+    string eng_state = eng.compressed ? "COMPRESSED" : eng.releasing ? "EXPANDING" : "NEUTRAL"
+    color  eng_col   = eng.compressed ? #ab47bc     : eng.releasing  ? #ef6c00    : #8b949e
+    f_cell(0,1, "Energy",   color.white,        color.new(#0d1117,60))
+    f_cell(1,1, eng_state,  color.new(eng_col,0), color.new(#0d1117,60))
+    f_cell(2,1, "PE:" + str.tostring(int(eng.potential)) + " KE:" + str.tostring(int(eng.kinetic)),
+         color.white, color.new(#0d1117,60))
+
+    // RVOL
+    color rv_col = rvol >= i_rvol_thr ? #ef6c00 : #8b949e
+    f_cell(0,2, "RVOL",    color.white, color.new(#0d1117,60))
+    f_cell(1,2, rvol >= i_rvol_thr ? "ELEVATED" : "NORMAL", color.new(rv_col,0), color.new(#0d1117,60))
+    f_cell(2,2, str.tostring(math.round(rvol,2)) + "×",      color.white,         color.new(#0d1117,60))
+
+    // Delta
+    color d_col = vd.ratio > 0.1 ? #3fb950 : vd.ratio < -0.1 ? #f85149 : #8b949e
+    f_cell(0,3, "Delta",    color.white, color.new(#0d1117,60))
+    f_cell(1,3, vd.ratio > 0.1 ? "BUY PRES." : vd.ratio < -0.1 ? "SELL PRES." : "NEUTRAL",
+         color.new(d_col,0), color.new(#0d1117,60))
+    f_cell(2,3, str.tostring(math.round(vd.ratio * 100, 1)) + "%", color.white, color.new(#0d1117,60))
+
+    // Absorption / Aggression
+    string va_state = vd.absorbing ? "ABSORPTION" : vd.bull_aggr ? "BULL AGGR" : vd.bear_aggr ? "BEAR AGGR" : "—"
+    color  va_col   = vd.absorbing ? #ab47bc : vd.bull_aggr ? #3fb950 : vd.bear_aggr ? #f85149 : #8b949e
+    f_cell(0,4, "Vol Type",  color.white,         color.new(#0d1117,60))
+    f_cell(1,4, va_state,    color.new(va_col,0),  color.new(#0d1117,60))
+    f_cell(2,4, "RVOL:" + str.tostring(math.round(rvol,1)), color.white, color.new(#0d1117,60))
+
+    // Session
+    string sess_name = in_london ? "LONDON" : in_ny ? "NEW YORK" : "OFF-PEAK"
+    color  sess_col  = (in_london or in_ny) ? #f0c040 : #8b949e
+    f_cell(0,5, "Session",   color.white,          color.new(#0d1117,60))
+    f_cell(1,5, sess_name,   color.new(sess_col,0), color.new(#0d1117,60))
+    f_cell(2,5, valid_sess ? "✓ ACTIVE" : "✗ OFF",
+         valid_sess ? color.new(#3fb950,0) : color.new(#8b949e,0), color.new(#0d1117,60))
+
+    // Trend
+    f_cell(0,6, "Trend",     color.white, color.new(#0d1117,60))
+    f_cell(1,6, bull_trend ? "BULLISH" : "BEARISH",
+         bull_trend ? color.new(#3fb950,0) : color.new(#f85149,0), color.new(#0d1117,60))
+    f_cell(2,6, "EMA(" + str.tostring(i_trend_len) + "): " + str.tostring(math.round(trend_ema,2)),
+         color.white, color.new(#0d1117,60))
+
+    // Bull score
+    bull_score_pct = str.tostring(bull_score) + "/100"
+    f_cell(0,7, "Bull Score", color.white, color.new(#0d1117,60))
+    f_cell(1,7, bull_score >= i_min_score ? "✓ VALID" : "✗ BELOW",
+         bull_score >= i_min_score ? color.new(#3fb950,0) : color.new(#8b949e,0), color.new(#0d1117,60))
+    f_cell(2,7, bull_score_pct, bull_score >= i_min_score ? color.new(#3fb950,0) : color.white, color.new(#0d1117,60))
+
+    // Bear score
+    bear_score_pct = str.tostring(bear_score) + "/100"
+    f_cell(0,8, "Bear Score", color.white, color.new(#0d1117,60))
+    f_cell(1,8, bear_score >= i_min_score ? "✓ VALID" : "✗ BELOW",
+         bear_score >= i_min_score ? color.new(#f85149,0) : color.new(#8b949e,0), color.new(#0d1117,60))
+    f_cell(2,8, bear_score_pct, bear_score >= i_min_score ? color.new(#f85149,0) : color.white, color.new(#0d1117,60))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ░░  SECTION 10 — ALERT CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+alertcondition(bull_sig,
+     "APEX-FLOW ▲ LONG Signal",
+     "APEX-FLOW: High-probability LONG setup fired. " +
+     "Liquidity sweep below SSL confirmed. " +
+     "Confluence score meets threshold.")
+
+alertcondition(bear_sig,
+     "APEX-FLOW ▼ SHORT Signal",
+     "APEX-FLOW: High-probability SHORT setup fired. " +
+     "Liquidity sweep above BSL confirmed. " +
+     "Confluence score meets threshold.")
+
+alertcondition(swept_bull and not bull_sig,
+     "APEX-FLOW — SSL Sweep (score below threshold)",
+     "APEX-FLOW: SSL swept but score below minimum threshold. Monitor for confirmation.")
+
+alertcondition(swept_bear and not bear_sig,
+     "APEX-FLOW — BSL Sweep (score below threshold)",
+     "APEX-FLOW: BSL swept but score below minimum threshold. Monitor for confirmation.")
+
+alertcondition(eng.comp_bars == 5,
+     "APEX-FLOW — Compression Warning (5 bars)",
+     "APEX-FLOW: Price has compressed for 5 consecutive bars. Expansion imminent.")
+
+alertcondition(vd.bull_div,
+     "APEX-FLOW — Bullish Delta Divergence",
+     "APEX-FLOW: Bullish delta divergence detected. Price making low, delta rising.")
+
+alertcondition(vd.bear_div,
+     "APEX-FLOW — Bearish Delta Divergence",
+     "APEX-FLOW: Bearish delta divergence detected. Price making high, delta falling.")
+
+// ── Expose key values for strategy use ────────────────────────────────────
+plot(bull_score,  "Bull Confluence Score", display=display.data_window, color=color.green)
+plot(bear_score,  "Bear Confluence Score", display=display.data_window, color=color.red)
+plot(eng.potential, "Potential Energy",    display=display.data_window, color=color.purple)
+plot(eng.kinetic,   "Kinetic Energy",      display=display.data_window, color=color.orange)
+plot(vd.ratio * 100,"Delta Ratio (%)",     display=display.data_window, color=color.blue)
