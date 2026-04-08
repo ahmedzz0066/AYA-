@@ -3,7 +3,7 @@
 //
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║   H E L I X  —  Hydraulic Energy Liquidity Intelligence eXtraction     ║
-// ║   Version 6.0  |  Pine Script v5                                        ║
+// ║   Version 6.0  |  Pine Script v6                                        ║
 // ║                                                                          ║
 // ║   New Concept Author: AYA Research                                       ║
 // ║   Theory Base: Fluid Dynamics + Smart Money + Bayesian Probability       ║
@@ -20,7 +20,7 @@
 //
 // Minimum signal RR is user-configurable (default 1:5).
 //
-//@version=5
+//@version=6
 indicator("HELIX — Market Hydraulics v6",
      shorttitle = "HELIX v6",
      overlay    = true,
@@ -346,8 +346,8 @@ plotshape(i_showSignals and shortCond,
 // ══════════════════════════════════════════════════════════════════════════════
 // 15 ▸ ENTRY / SL / TP LABELS  (drawn on signal bar only)
 // ══════════════════════════════════════════════════════════════════════════════
-probStr(p) => str.tostring(math.round(p * 100, 1)) + "%"
-priceStr(p)=> str.tostring(math.round(p / syminfo.mintick) * syminfo.mintick)
+probStr(p)  => str.format("{0,number,#.#}%",  p * 100)
+priceStr(p) => str.tostring(p, format.mintick)
 
 if i_showLevels and longCond
     label.new(bar_index, longTarget,
@@ -438,25 +438,25 @@ if barstate.islast and i_showDash
 
     // Row 2 — Hydraulic Pressure
     table.cell(dash, 0, 2, "Hydraulic P",   text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
-    table.cell(dash, 1, 2, str.tostring(math.round(smoothP, 2)),
+    table.cell(dash, 1, 2, str.format("{0,number,#.##}", smoothP),
          text_color = smoothP > 1.0 ? color.new(C_BEAR,0) : smoothP > 0 ? color.new(C_COMPRESS,0) : color.gray,
          text_size=size.small, bgcolor=DB_BG)
 
     // Row 3 — Energy Ratio
     table.cell(dash, 0, 3, "Energy Ratio",  text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
-    table.cell(dash, 1, 3, str.tostring(math.round(energyRatio * 100, 1)) + "% PE",
+    table.cell(dash, 1, 3, str.format("{0,number,#.#}% PE", energyRatio * 100),
          text_color = energyRatio > 0.6 ? color.new(C_COMPRESS,0) : color.new(#42a5f5,0),
          text_size=size.small, bgcolor=DB_BG)
 
     // Row 4 — Kinetic Energy z-score
     table.cell(dash, 0, 4, "KE z-score",    text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
-    table.cell(dash, 1, 4, str.tostring(math.round(keNorm, 2)),
+    table.cell(dash, 1, 4, str.format("{0,number,#.##}", keNorm),
          text_color = keNorm > i_energyThresh ? color.new(C_BULL,0) : color.gray,
          text_size=size.small, bgcolor=DB_BG)
 
     // Row 5 — Delta z-score
     table.cell(dash, 0, 5, "Delta z",       text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
-    table.cell(dash, 1, 5, str.tostring(math.round(deltaZ, 2)),
+    table.cell(dash, 1, 5, str.format("{0,number,#.##}", deltaZ),
          text_color = deltaZ > 0 ? color.new(C_BULL,0) : color.new(C_BEAR,0),
          text_size=size.small, bgcolor=DB_BG)
 
