@@ -215,9 +215,9 @@ sweptHigh = (high  > nz(ta.valuewhen(not na(ph), ph, 0)) + sweepTolPrice and
 pEnergy = math.min(energyRatio * 1.60, 1.0)
 
 // Component 2 — Volume intent
-pVolume = isAbsorption    ? 0.82 :
-          isBullExhaust or isBearExhaust ? 0.78 :
-          isBullAgg or isBearAgg         ? 0.62 : 0.30
+pVolume = (isAbsorption                       ? 0.82 :
+           isBullExhaust or isBearExhaust ? 0.78 :
+           isBullAgg     or isBearAgg     ? 0.62 : 0.30)
 
 // Component 3 — Liquidity structure (sweep present = high probability trap)
 pStructure = sweptHigh or sweptLow ? 0.88 : 0.38
@@ -273,18 +273,18 @@ shortTarget = close - shortRisk * i_minRR
 // ══════════════════════════════════════════════════════════════════════════════
 // 10 ▸ BAR COLOURING  (energy-state driven)
 // ══════════════════════════════════════════════════════════════════════════════
-barCol = isExpansion  ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
-         isCompression? color.new(C_COMPRESS, 40) :
-         color.new(C_NEUTRAL, 60)
+barCol = (isExpansion   ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
+          isCompression ? color.new(C_COMPRESS, 40) :
+          color.new(C_NEUTRAL, 60))
 
 barcolor(i_showBars ? barCol : na, editable=false)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 11 ▸ BACKGROUND ZONES
 // ══════════════════════════════════════════════════════════════════════════════
-bgCol = isExpansion   ? (close >= open ? C_ZONE_BULL : C_ZONE_BEAR) :
-        isCompression ? C_ZONE_COMP :
-        C_TRANS
+bgCol = (isExpansion   ? (close >= open ? C_ZONE_BULL : C_ZONE_BEAR) :
+         isCompression ? C_ZONE_COMP :
+         C_TRANS)
 
 bgcolor(i_showBG ? bgCol : na, editable=false)
 
@@ -386,25 +386,25 @@ if i_showLevels and shortCond
 // ══════════════════════════════════════════════════════════════════════════════
 // Helpers
 stateStr()  =>
-    isExpansion   ? (close >= open ? "EXPANSION ▲" : "EXPANSION ▼") :
-    isCompression ? "COMPRESSION" : "NEUTRAL"
+    (isExpansion   ? (close >= open ? "EXPANSION ▲" : "EXPANSION ▼") :
+     isCompression ? "COMPRESSION" : "NEUTRAL")
 
 stateCol()  =>
-    isExpansion   ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
-    isCompression ? color.new(C_COMPRESS, 0) : color.gray
+    (isExpansion   ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
+     isCompression ? color.new(C_COMPRESS, 0) : color.gray)
 
 volStr()    =>
-    isAbsorption  ? "ABSORBING"   :
-    isBullAgg     ? "BULL AGGR"   :
-    isBearAgg     ? "BEAR AGGR"   :
-    isBullExhaust ? "BULL EXHAUST":
-    isBearExhaust ? "BEAR EXHAUST": "NEUTRAL"
+    (isAbsorption  ? "ABSORBING"    :
+     isBullAgg     ? "BULL AGGR"    :
+     isBearAgg     ? "BEAR AGGR"    :
+     isBullExhaust ? "BULL EXHAUST" :
+     isBearExhaust ? "BEAR EXHAUST" : "NEUTRAL")
 
 volCol()    =>
-    isAbsorption ? color.new(C_COMPRESS, 0) :
-    isBullAgg    ? color.new(C_BULL,     0) :
-    isBearAgg    ? color.new(C_BEAR,     0) :
-    isBullExhaust or isBearExhaust ? color.new(#ce93d8, 0) : color.gray
+    (isAbsorption                       ? color.new(C_COMPRESS, 0) :
+     isBullAgg                          ? color.new(C_BULL,     0) :
+     isBearAgg                          ? color.new(C_BEAR,     0) :
+     isBullExhaust or isBearExhaust     ? color.new(#ce93d8,   0) : color.gray)
 
 reStr()     => isTurbulent ? "TURBULENT" : isLaminar ? "LAMINAR" : "MIXED"
 reCol()     => isTurbulent ? color.new(C_BEAR,0) : isLaminar ? color.new(C_COMPRESS,0) : color.gray
