@@ -341,22 +341,24 @@ float swept_ssl   = float(na)
 float swept_bsl   = float(na)
 
 // Check SSL (below) for bull sweep
-for i = 0 to ssl_pools.size() - 1
-    p = ssl_pools.get(i)
-    if not p.swept and low < p.level and close > p.level
-        swept_bull := true
-        swept_ssl  := p.level
-        p.swept    := true
-        break
+if ssl_pools.size() > 0
+    for i = 0 to ssl_pools.size() - 1
+        p = ssl_pools.get(i)
+        if not p.swept and low < p.level and close > p.level
+            swept_bull := true
+            swept_ssl  := p.level
+            p.swept    := true
+            break
 
 // Check BSL (above) for bear sweep
-for i = 0 to bsl_pools.size() - 1
-    p = bsl_pools.get(i)
-    if not p.swept and high > p.level and close < p.level
-        swept_bear := true
-        swept_bsl  := p.level
-        p.swept    := true
-        break
+if bsl_pools.size() > 0
+    for i = 0 to bsl_pools.size() - 1
+        p = bsl_pools.get(i)
+        if not p.swept and high > p.level and close < p.level
+            swept_bear := true
+            swept_bsl  := p.level
+            p.swept    := true
+            break
 
 // Sweep visual markers
 plotshape(i_show_sweep and swept_bull, "SSL Sweep (Long Setup)",
@@ -538,21 +540,22 @@ if barstate.islast and i_vp_on
         array<float> lev_vol_tot  = array.new_float(i_vp_levels, 0.0)
         array<int>   lev_count    = array.new_int  (i_vp_levels, 0)
 
-        for i = 0 to p_closes.size() - 1
-            c  = p_closes.get(i)
-            v  = p_vols  .get(i)
-            cp = p_cpcts .get(i)
-            bv = v * cp
-            sv = v * (1.0 - cp)
+        if p_closes.size() > 0
+            for i = 0 to p_closes.size() - 1
+                c  = p_closes.get(i)
+                v  = p_vols  .get(i)
+                cp = p_cpcts .get(i)
+                bv = v * cp
+                sv = v * (1.0 - cp)
 
-            // ── FIX from original: use bar index i, not level index x ──
-            bucket = int(math.floor((c - range_lo) / step))
-            bucket := math.max(0, math.min(i_vp_levels - 1, bucket))
+                // ── FIX from original: use bar index i, not level index x ──
+                bucket = int(math.floor((c - range_lo) / step))
+                bucket := math.max(0, math.min(i_vp_levels - 1, bucket))
 
-            lev_vol_tot .set(bucket, lev_vol_tot .get(bucket) + v )
-            lev_vol_bull.set(bucket, lev_vol_bull.get(bucket) + bv)
-            lev_vol_bear.set(bucket, lev_vol_bear.get(bucket) + sv)
-            lev_count   .set(bucket, lev_count   .get(bucket) + 1 )
+                lev_vol_tot .set(bucket, lev_vol_tot .get(bucket) + v )
+                lev_vol_bull.set(bucket, lev_vol_bull.get(bucket) + bv)
+                lev_vol_bear.set(bucket, lev_vol_bear.get(bucket) + sv)
+                lev_count   .set(bucket, lev_count   .get(bucket) + 1 )
 
         // ── 4. Find POC (highest total volume bucket) ─────────────────────
         float max_vol   = lev_vol_tot.max()
