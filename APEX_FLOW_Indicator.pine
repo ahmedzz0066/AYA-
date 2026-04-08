@@ -592,13 +592,13 @@ if barstate.islast and i_vp_on
         var array<line> vp_lines  = array.new<line>()
         var array<linefill> vp_fills = array.new<linefill>()
 
-        // Delete old drawings
-        for bx in vp_boxes  : box     .delete(bx)
-        for ln in vp_lines  : line    .delete(ln)
-        for fl in vp_fills  : linefill.delete(fl)
-        vp_boxes .clear()
-        vp_lines .clear()
-        vp_fills .clear()
+        // Delete old drawings (while+pop is v6-safe; avoids for-in type-qualifier parse errors)
+        while vp_boxes.size() > 0
+            box.delete(vp_boxes.pop())
+        while vp_lines.size() > 0
+            line.delete(vp_lines.pop())
+        while vp_fills.size() > 0
+            linefill.delete(vp_fills.pop())
 
         for lv = 0 to i_vp_levels - 1
             lv_bot = range_lo + lv       * step
