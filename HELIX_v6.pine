@@ -1,0 +1,491 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║   H E L I X  —  Hydraulic Energy Liquidity Intelligence eXtraction     ║
+// ║   Version 6.0  |  Pine Script v5                                        ║
+// ║                                                                          ║
+// ║   New Concept Author: AYA Research                                       ║
+// ║   Theory Base: Fluid Dynamics + Smart Money + Bayesian Probability       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// HELIX is a next-generation market-dynamics framework that treats price as a
+// hydraulic fluid system.  Pressure builds inside compression zones (potential
+// energy), then releases as directional expansion (kinetic energy).  Every
+// signal requires four independent components to align before a trade is shown:
+//   1. Hydraulic Pressure  (is energy accumulating?)
+//   2. Volume Intelligence (what is the intent behind the volume?)
+//   3. Liquidity Sweep     (has the stop-run trap been sprung?)
+//   4. Probabilistic Gate  (does the composite score exceed the threshold?)
+//
+// Minimum signal RR is user-configurable (default 1:5).
+//
+//@version=5
+indicator("HELIX — Market Hydraulics v6",
+     shorttitle = "HELIX v6",
+     overlay    = true,
+     max_bars_back      = 500,
+     max_lines_count    = 200,
+     max_labels_count   = 200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 0 ▸ COLOUR PALETTE
+// ══════════════════════════════════════════════════════════════════════════════
+C_BULL      = #00e676
+C_BEAR      = #ff1744
+C_COMPRESS  = #ffab00
+C_NEUTRAL   = #546e7a
+C_WHITE     = #ffffff
+C_SWEEP_H   = color.new(#ff1744, 0)
+C_SWEEP_L   = color.new(#00e676, 0)
+C_ABSORB    = color.new(#ffab00, 20)
+C_ZONE_BULL = color.new(#00e676, 88)
+C_ZONE_BEAR = color.new(#ff1744, 88)
+C_ZONE_COMP = color.new(#ffab00, 88)
+C_TRANS     = color.new(color.black, 100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1 ▸ INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+g1 = "━━━  Hydraulic Pressure Engine  ━━━"
+i_pressureLen   = input.int  (20,   "Pressure Window",           minval=5,   maxval=200,  group=g1)
+i_energyThresh  = input.float(1.5,  "Energy Release Threshold σ",minval=0.5, maxval=5.0,  step=0.1, group=g1,
+     tooltip="Number of standard deviations above mean kinetic energy required to confirm expansion.")
+
+g2 = "━━━  Volume Intelligence  ━━━"
+i_volLen        = input.int  (14,   "Volume Base Period",         minval=5,   maxval=100,  group=g2)
+i_absorbMult    = input.float(1.2,  "Absorption Volume Mult",     minval=1.0, maxval=5.0,  step=0.1, group=g2,
+     tooltip="Volume must be this multiple of its mean to qualify as absorption or aggression.")
+i_exhaustMult   = input.float(2.0,  "Exhaustion Volume Mult",     minval=1.5, maxval=6.0,  step=0.1, group=g2)
+
+g3 = "━━━  Liquidity Engineering  ━━━"
+i_pivotLen      = input.int  (10,   "Swing Pivot Length",         minval=3,   maxval=50,   group=g3)
+i_sweepTol      = input.float(0.10, "Sweep Tolerance %",          minval=0.01,maxval=1.0,  step=0.01, group=g3,
+     tooltip="How far past the swing level price must pierce to qualify as a liquidity sweep (% of ATR).")
+
+g4 = "━━━  Probabilistic Gate  ━━━"
+i_minProb       = input.float(0.65, "Minimum Signal Probability", minval=0.5, maxval=0.95, step=0.01, group=g4,
+     tooltip="Composite Bayesian score required to show an entry signal.")
+i_minRR         = input.float(5.0,  "Minimum Risk : Reward",      minval=2.0, maxval=15.0, step=0.5,  group=g4)
+
+g5 = "━━━  Execution Engine  ━━━"
+i_atrLen        = input.int  (14,   "ATR Length",                 minval=5,   maxval=50,   group=g5)
+i_stopMult      = input.float(1.5,  "Stop-Loss ATR Multiplier",   minval=0.5, maxval=4.0,  step=0.1,  group=g5)
+
+g6 = "━━━  Display  ━━━"
+i_showBars      = input.bool (true,  "Colour Bars by Energy State",                        group=g6)
+i_showBG        = input.bool (true,  "Background: Compression / Expansion Zones",          group=g6)
+i_showSweeps    = input.bool (true,  "Mark Liquidity Sweeps",                               group=g6)
+i_showAbsorb    = input.bool (true,  "Mark Absorption Candles",                             group=g6)
+i_showSignals   = input.bool (true,  "Show Entry Signals",                                  group=g6)
+i_showLevels    = input.bool (true,  "Draw Entry / SL / TP Lines",                          group=g6)
+i_showDash      = input.bool (true,  "Show Dashboard",                                      group=g6)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2 ▸ BASE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+atr         = ta.atr(i_atrLen)
+priceRange  = high - low
+volMean     = ta.sma (volume, i_pressureLen)
+volStd      = ta.stdev(volume, i_pressureLen)
+rangeMean   = ta.sma (priceRange, i_pressureLen)
+rangeStd    = ta.stdev(priceRange, i_pressureLen)
+
+// ── Volume z-score (density)
+volDensity  = volStd > 0 ? (volume - volMean) / volStd : 0.0
+
+// ── Price range z-score (compression = negative range z-score)
+rangeZ      = rangeStd > 0 ? (priceRange - rangeMean) / rangeStd : 0.0
+compression = -rangeZ     // positive → compressed candle
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3 ▸ HYDRAULIC PRESSURE ENGINE
+//     Analogy: P = ρ · g · h
+//     Market:  MP = VolumeDensity × PriceCompression × TimeDecayWeight
+//     High positive MP → pressure is building → expect expansion soon
+// ══════════════════════════════════════════════════════════════════════════════
+hydraulicP  = volDensity * (1.0 + math.max(compression, 0.0))
+smoothP     = ta.ema(hydraulicP, 5)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4 ▸ ENERGY STATE MODEL  (Physics: PE + KE = constant)
+//     Potential Energy (PE): stored in tight consolidation
+//     Kinetic Energy   (KE): released as fast directional movement
+// ══════════════════════════════════════════════════════════════════════════════
+normVol     = volMean > 0 ? volume / volMean : 1.0
+priceVel    = atr > 0 ? math.abs(close - close[1]) / atr : 0.0
+
+// KE = ½ · m · v²  →  Market: normVol × velocity²
+kineticE    = 0.5 * normVol * math.pow(priceVel, 2)
+
+// PE = m · g · h  →  Market: normVol × compressionLevel × range/ATR
+potentialE  = normVol * math.max(compression, 0.0) * (atr > 0 ? priceRange / atr : 0.0)
+
+totalE      = kineticE + potentialE
+energyRatio = totalE > 0 ? potentialE / totalE : 0.5  // >0.6 → PE dominant
+
+keMean  = ta.sma  (kineticE, i_pressureLen)
+keStd   = ta.stdev(kineticE, i_pressureLen)
+keNorm  = keStd > 0 ? (kineticE - keMean) / keStd : 0.0  // z-score of KE
+
+// State flags
+isCompression = energyRatio > 0.60 and compression > 0.0
+isExpansion   = keNorm > i_energyThresh and priceVel > 1.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5 ▸ REYNOLDS NUMBER  (Turbulence vs Laminar Flow)
+//     Re = (velocity × density) / viscosity
+//     Market: Re = (priceVel × normVol) / (ATR normalised range)
+//     High Re → turbulent (choppy, avoid) | Low Re → laminar (trending, trade)
+// ══════════════════════════════════════════════════════════════════════════════
+viscosity   = rangeMean > 0 ? atr / rangeMean : 1.0
+Re          = viscosity > 0 ? (priceVel * normVol) / viscosity : 0.0
+reMean      = ta.sma(Re, i_pressureLen)
+isTurbulent = Re > reMean * 2.0
+isLaminar   = Re < reMean * 0.5
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 6 ▸ VOLUME INTELLIGENCE LAYER
+//     Buying/selling pressure estimated from close position within range
+//     (delta proxy without tick data)
+// ══════════════════════════════════════════════════════════════════════════════
+buyPct  = priceRange > 0 ? (close - low)  / priceRange : 0.5   // 0→1
+sellPct = 1.0 - buyPct
+
+buyVol  = volume * buyPct
+sellVol = volume * sellPct
+
+// Rolling net delta (z-score)
+netDelta   = buyVol - sellVol
+deltaMean  = ta.sma  (netDelta, i_pressureLen)
+deltaStd   = ta.stdev(netDelta, i_pressureLen)
+deltaZ     = deltaStd > 0 ? (netDelta - deltaMean) / deltaStd : 0.0
+
+// ── Absorption: large volume + tiny body + neither aggressively directional
+//    Market maker is absorbing retail flow without moving price
+isAbsorption = volume  >  volMean  * i_absorbMult   and
+               priceRange < rangeMean * 0.70         and
+               math.abs(close - open) < priceRange   * 0.30
+
+// ── Aggression: large volume + wide range + decisive close
+isBullAgg = volume > volMean * i_absorbMult and
+            close  > open                   and
+            buyPct > 0.70                   and
+            priceRange > rangeMean
+
+isBearAgg = volume > volMean * i_absorbMult and
+            close  < open                   and
+            sellPct > 0.70                  and
+            priceRange > rangeMean
+
+// ── Exhaustion (climax): very high volume but price closes AGAINST the push
+//    Smart money distributing/accumulating at extremes
+isBullExhaust = volume > volMean * i_exhaustMult and close < open and buyPct  < 0.40
+isBearExhaust = volume > volMean * i_exhaustMult and close > open and sellPct < 0.40
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 7 ▸ LIQUIDITY ENGINEERING MODEL
+//     Equal highs/lows = stop-loss clusters = institutional targets
+//     A sweep = price takes the level then closes back inside → trap sprung
+// ══════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, i_pivotLen, i_pivotLen)
+pl = ta.pivotlow (low,  i_pivotLen, i_pivotLen)
+
+sweepTolPrice = atr * (i_sweepTol / 100.0)
+
+// Bullish sweep: price briefly violates a prior swing low then closes above it
+//   (liquidity was taken from sellers → smart money now long)
+sweptLow  = low < nz(ta.valuewhen(not na(pl), pl, 0)) - sweepTolPrice and
+            close > nz(ta.valuewhen(not na(pl), pl, 0))
+
+// Bearish sweep: price briefly violates a prior swing high then closes below it
+//   (liquidity was taken from buyers → smart money now short)
+sweptHigh = high > nz(ta.valuewhen(not na(ph), ph, 0)) + sweepTolPrice and
+            close < nz(ta.valuewhen(not na(ph), ph, 0))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8 ▸ PROBABILISTIC EDGE MODEL  (Geometric-mean Bayesian composite)
+//     P_total = (P_energy × P_volume × P_structure × P_delta)^(1/4) × Re_penalty
+//
+//     Each component is an independent conditional probability.
+//     Geometric mean (rather than arithmetic) penalises any weak leg heavily.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Component 1 — Energy (is PE dominant? is the spring loaded?)
+pEnergy = math.min(energyRatio * 1.60, 1.0)
+
+// Component 2 — Volume intent
+pVolume = isAbsorption    ? 0.82 :
+          isBullExhaust or isBearExhaust ? 0.78 :
+          isBullAgg or isBearAgg         ? 0.62 : 0.30
+
+// Component 3 — Liquidity structure (sweep present = high probability trap)
+pStructure = sweptHigh or sweptLow ? 0.88 : 0.38
+
+// Component 4 — Delta alignment
+pDelta = math.abs(deltaZ) > 1.5 ? 0.78 : 0.40
+
+// Reynolds turbulence penalty (turbulent markets reduce all probabilities)
+rePenalty = isTurbulent ? 0.72 : 1.0
+
+// Composite (geometric mean of four components × turbulence penalty)
+rawProb     = math.pow(pEnergy * pVolume * pStructure * pDelta, 0.25) * rePenalty
+
+// Map to realistic trading probability range [0.30 … 0.95]
+probability = 0.30 + rawProb * 0.65
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9 ▸ EXECUTION ENGINE
+//     Long:  swept low  + compression + (absorption OR bear exhaustion)
+//            + positive delta + probability gate + not turbulent
+//     Short: swept high + compression + (absorption OR bull exhaustion)
+//            + negative delta + probability gate + not turbulent
+//
+//     Stop  = swept candle extreme ± ATR buffer
+//     Target = entry + (entry − stop) × minRR   → guaranteed ≥ 1:5 RR
+// ══════════════════════════════════════════════════════════════════════════════
+longCond  = sweptLow   and
+            isCompression                               and
+            (isAbsorption or isBearExhaust or isBearAgg) and
+            deltaZ     > 0.0                            and
+            probability >= i_minProb                    and
+            not isTurbulent
+
+shortCond = sweptHigh  and
+            isCompression                               and
+            (isAbsorption or isBullExhaust or isBullAgg) and
+            deltaZ     < 0.0                            and
+            probability >= i_minProb                    and
+            not isTurbulent
+
+// Stop levels
+longStop  = low  - atr * i_stopMult
+shortStop = high + atr * i_stopMult
+
+// Risk per unit
+longRisk  = close - longStop
+shortRisk = shortStop - close
+
+// Target levels (minimum RR enforced)
+longTarget  = close + longRisk  * i_minRR
+shortTarget = close - shortRisk * i_minRR
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 10 ▸ BAR COLOURING  (energy-state driven)
+// ══════════════════════════════════════════════════════════════════════════════
+barCol = isExpansion  ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
+         isCompression? color.new(C_COMPRESS, 40) :
+         color.new(C_NEUTRAL, 60)
+
+barcolor(i_showBars ? barCol : na, editable=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 11 ▸ BACKGROUND ZONES
+// ══════════════════════════════════════════════════════════════════════════════
+bgCol = isExpansion   ? (close >= open ? C_ZONE_BULL : C_ZONE_BEAR) :
+        isCompression ? C_ZONE_COMP :
+        C_TRANS
+
+bgcolor(i_showBG ? bgCol : na, editable=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 12 ▸ SWEEP MARKERS
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(i_showSweeps and sweptHigh,
+     title    = "Swept High",
+     style    = shape.xcross,
+     location = location.abovebar,
+     color    = C_SWEEP_H,
+     size     = size.small)
+
+plotshape(i_showSweeps and sweptLow,
+     title    = "Swept Low",
+     style    = shape.xcross,
+     location = location.belowbar,
+     color    = C_SWEEP_L,
+     size     = size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 13 ▸ ABSORPTION / EXHAUSTION DOT
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(i_showAbsorb and isAbsorption,
+     title    = "Absorption",
+     style    = shape.circle,
+     location = location.belowbar,
+     color    = C_ABSORB,
+     size     = size.tiny)
+
+plotshape(i_showAbsorb and (isBullExhaust or isBearExhaust),
+     title    = "Exhaustion",
+     style    = shape.diamond,
+     location = location.abovebar,
+     color    = color.new(#ce93d8, 0),
+     size     = size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 14 ▸ ENTRY SIGNAL SHAPES
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(i_showSignals and longCond,
+     title     = "HELIX Long",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(C_BULL, 0),
+     size      = size.large,
+     text      = "HELIX ▲",
+     textcolor = color.new(C_BULL, 0))
+
+plotshape(i_showSignals and shortCond,
+     title     = "HELIX Short",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(C_BEAR, 0),
+     size      = size.large,
+     text      = "HELIX ▼",
+     textcolor = color.new(C_BEAR, 0))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 15 ▸ ENTRY / SL / TP LABELS  (drawn on signal bar only)
+// ══════════════════════════════════════════════════════════════════════════════
+probStr(p) => str.tostring(math.round(p * 100, 1)) + "%"
+priceStr(p)=> str.tostring(math.round(p / syminfo.mintick) * syminfo.mintick)
+
+if i_showLevels and longCond
+    label.new(bar_index, longTarget,
+         "TP  " + priceStr(longTarget) + "  |  P=" + probStr(probability),
+         style     = label.style_label_down,
+         color     = color.new(C_BULL, 15),
+         textcolor = C_WHITE,
+         size      = size.small)
+    label.new(bar_index, longStop,
+         "SL  " + priceStr(longStop),
+         style     = label.style_label_up,
+         color     = color.new(C_BEAR, 15),
+         textcolor = C_WHITE,
+         size      = size.small)
+    line.new(bar_index, close,  bar_index + 1, close,
+         color=color.new(C_BULL, 30), style=line.style_dashed, width=1, extend=extend.right)
+
+if i_showLevels and shortCond
+    label.new(bar_index, shortTarget,
+         "TP  " + priceStr(shortTarget) + "  |  P=" + probStr(probability),
+         style     = label.style_label_up,
+         color     = color.new(C_BULL, 15),
+         textcolor = C_WHITE,
+         size      = size.small)
+    label.new(bar_index, shortStop,
+         "SL  " + priceStr(shortStop),
+         style     = label.style_label_down,
+         color     = color.new(C_BEAR, 15),
+         textcolor = C_WHITE,
+         size      = size.small)
+    line.new(bar_index, close, bar_index + 1, close,
+         color=color.new(C_BEAR, 30), style=line.style_dashed, width=1, extend=extend.right)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 16 ▸ DASHBOARD  (top-right table, last bar only)
+// ══════════════════════════════════════════════════════════════════════════════
+// Helpers
+stateStr()  =>
+    isExpansion   ? (close >= open ? "EXPANSION ▲" : "EXPANSION ▼") :
+    isCompression ? "COMPRESSION" : "NEUTRAL"
+
+stateCol()  =>
+    isExpansion   ? (close >= open ? color.new(C_BULL, 0) : color.new(C_BEAR, 0)) :
+    isCompression ? color.new(C_COMPRESS, 0) : color.gray
+
+volStr()    =>
+    isAbsorption  ? "ABSORBING"   :
+    isBullAgg     ? "BULL AGGR"   :
+    isBearAgg     ? "BEAR AGGR"   :
+    isBullExhaust ? "BULL EXHAUST":
+    isBearExhaust ? "BEAR EXHAUST": "NEUTRAL"
+
+volCol()    =>
+    isAbsorption ? color.new(C_COMPRESS, 0) :
+    isBullAgg    ? color.new(C_BULL,     0) :
+    isBearAgg    ? color.new(C_BEAR,     0) :
+    isBullExhaust or isBearExhaust ? color.new(#ce93d8, 0) : color.gray
+
+reStr()     => isTurbulent ? "TURBULENT" : isLaminar ? "LAMINAR" : "MIXED"
+reCol()     => isTurbulent ? color.new(C_BEAR,0) : isLaminar ? color.new(C_COMPRESS,0) : color.gray
+
+probCol(p)  => p >= i_minProb ? color.new(C_BULL,0) : color.new(C_BEAR,0)
+
+// Dashboard colours
+DB_BG    = color.new(#0d1117, 70)
+DB_HDR   = color.new(#1e2a38, 60)
+DB_LABEL = color.new(#90a4ae, 0)
+
+var table dash = table.new(position.top_right, 2, 11,
+     bgcolor      = DB_BG,
+     border_color = color.new(#37474f, 60),
+     border_width = 1,
+     frame_color  = color.new(C_COMPRESS, 50),
+     frame_width  = 1)
+
+if barstate.islast and i_showDash
+    // Header
+    table.cell(dash, 0, 0, "HELIX v6",
+         text_color=color.new(C_COMPRESS,0), text_size=size.normal,
+         bgcolor=DB_HDR, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "Market Hydraulics",
+         text_color=color.new(C_COMPRESS,0), text_size=size.small,
+         bgcolor=DB_HDR, text_halign=text.align_center)
+
+    // Row 1 — Market State
+    table.cell(dash, 0, 1, "Market State",  text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 1, stateStr(),      text_color=stateCol(),  text_size=size.small, bgcolor=DB_BG)
+
+    // Row 2 — Hydraulic Pressure
+    table.cell(dash, 0, 2, "Hydraulic P",   text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 2, str.tostring(math.round(smoothP, 2)),
+         text_color = smoothP > 1.0 ? color.new(C_BEAR,0) : smoothP > 0 ? color.new(C_COMPRESS,0) : color.gray,
+         text_size=size.small, bgcolor=DB_BG)
+
+    // Row 3 — Energy Ratio
+    table.cell(dash, 0, 3, "Energy Ratio",  text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 3, str.tostring(math.round(energyRatio * 100, 1)) + "% PE",
+         text_color = energyRatio > 0.6 ? color.new(C_COMPRESS,0) : color.new(#42a5f5,0),
+         text_size=size.small, bgcolor=DB_BG)
+
+    // Row 4 — Kinetic Energy z-score
+    table.cell(dash, 0, 4, "KE z-score",    text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 4, str.tostring(math.round(keNorm, 2)),
+         text_color = keNorm > i_energyThresh ? color.new(C_BULL,0) : color.gray,
+         text_size=size.small, bgcolor=DB_BG)
+
+    // Row 5 — Delta z-score
+    table.cell(dash, 0, 5, "Delta z",       text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 5, str.tostring(math.round(deltaZ, 2)),
+         text_color = deltaZ > 0 ? color.new(C_BULL,0) : color.new(C_BEAR,0),
+         text_size=size.small, bgcolor=DB_BG)
+
+    // Row 6 — Reynolds Number
+    table.cell(dash, 0, 6, "Reynolds #",    text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 6, reStr(), text_color=reCol(), text_size=size.small, bgcolor=DB_BG)
+
+    // Row 7 — Volume Intent
+    table.cell(dash, 0, 7, "Vol Intent",    text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 7, volStr(), text_color=volCol(), text_size=size.small, bgcolor=DB_BG)
+
+    // Row 8 — Liquidity Sweeps
+    table.cell(dash, 0, 8, "Liq Sweep",     text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 8,
+         sweptHigh ? "HIGH SWEPT" : sweptLow ? "LOW SWEPT" : "NONE",
+         text_color = sweptHigh ? color.new(C_BEAR,0) : sweptLow ? color.new(C_BULL,0) : color.gray,
+         text_size=size.small, bgcolor=DB_BG)
+
+    // Row 9 — Composite Probability
+    table.cell(dash, 0, 9, "Probability",   text_color=DB_LABEL, text_size=size.small, bgcolor=DB_BG)
+    table.cell(dash, 1, 9, probStr(probability),
+         text_color=probCol(probability), text_size=size.small, bgcolor=DB_BG)
+
+    // Row 10 — Signal
+    _sigStr = longCond  ? "▲ LONG  HELIX" : shortCond ? "▼ SHORT HELIX" : "── NO SIGNAL"
+    _sigCol = longCond  ? color.new(C_BULL,0) : shortCond ? color.new(C_BEAR,0) : color.gray
+    table.cell(dash, 0, 10, "Signal",        text_color=DB_LABEL, text_size=size.small, bgcolor=DB_HDR)
+    table.cell(dash, 1, 10, _sigStr,         text_color=_sigCol,  text_size=size.small, bgcolor=DB_HDR)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END — HELIX v6
+// ══════════════════════════════════════════════════════════════════════════════
