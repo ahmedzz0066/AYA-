@@ -1,0 +1,374 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// © BigBeluga (original)
+// Upgraded by AYA — adds predefined Fib levels, accurate delta-volume math, POC, and enhanced diagnostics.
+
+//@version=6
+indicator('Premium & Discount Delta Volume PRO [AYA]', overlay = true, max_lines_count = 50, max_boxes_count = 50, max_bars_back = 500, max_labels_count = 100)
+
+// ====================================================================================================================
+// INPUTS
+// ====================================================================================================================
+// --- Range settings ---------------------------------------------------------------------------------------------------
+bool   showSR        = input.bool(true,  '', inline = '0',  group = 'Ranges')
+int    srPeriod      = input.int(50,   'Premium & Discount Lookback Period', minval = 10, step = 10, inline = '0', group = 'Ranges', tooltip = 'Lookback period for Premium & Discount Levels with Delta Volume')
+bool   showMacro     = input.bool(true,  '', inline = '1',  group = 'Ranges')
+int    macroPeriod   = input.int(200,  'Macro Lookback Period',              minval = 10, step = 10, inline = '1', group = 'Ranges', tooltip = 'Lookback period for Macro Highs/Lows and Delta Volume')
+
+// --- Predefined Fibonacci levels (NEW) --------------------------------------------------------------------------------
+bool   showFibs      = input.bool(true,  'Show Predefined Fib Levels', group = 'Predefined Levels', tooltip = 'Draws 0.236 / 0.382 / 0.5 / 0.618 / 0.786 retracement levels inside the Premium/Discount zone')
+bool   showEqZone    = input.bool(true,  'Show Equilibrium Zone (0.45–0.55)', group = 'Predefined Levels')
+bool   showPOC       = input.bool(true,  'Show Volume Point of Control (POC)', group = 'Predefined Levels', tooltip = 'Highest-volume price node inside the lookback window')
+int    pocBins       = input.int(30,    'POC Resolution (bins)', minval = 10, maxval = 100, step = 5, group = 'Predefined Levels')
+bool   extendLevels  = input.bool(true,  'Extend Levels to the Right', group = 'Predefined Levels')
+
+// --- Delta calculation settings (NEW) ---------------------------------------------------------------------------------
+string deltaMethod   = input.string('Body-Weighted', 'Delta Volume Method', options = ['Classic (BigBeluga)', 'Close-Open Sign', 'Body-Weighted', 'Range-Weighted'], group = 'Delta Volume', tooltip = 'Body-Weighted and Range-Weighted give finer estimates of buy/sell pressure than pure close>open classification')
+float  deltaThresh   = input.float(25,  'Strong Delta Threshold (%)', minval = 5, maxval = 90, step = 5, group = 'Delta Volume')
+
+// --- Alerts -----------------------------------------------------------------------------------------------------------
+bool   alertOnPrem   = input.bool(true,  'Alert on Premium touch + bearish delta', group = 'Alerts')
+bool   alertOnDisc   = input.bool(true,  'Alert on Discount touch + bullish delta', group = 'Alerts')
+
+// --- Colors -----------------------------------------------------------------------------------------------------------
+color  upColor       = input.color(#79c1f1, 'Discount', inline = 'col', group = 'Color')
+color  downColor     = input.color(#f19579, 'Premium',  inline = 'col', group = 'Color')
+color  fibColor      = input.color(color.new(color.gray, 30), 'Fib Levels', group = 'Color')
+color  eqColor       = input.color(color.new(color.yellow, 80), 'Equilibrium', group = 'Color')
+color  pocColor      = input.color(#ffd166, 'POC', group = 'Color')
+
+// ====================================================================================================================
+// ARRAYS
+// ====================================================================================================================
+var array<float> srHighs      = array.new_float(0)
+var array<float> srLows       = array.new_float(0)
+var array<float> macroHighs   = array.new_float(0)
+var array<float> macroLows    = array.new_float(0)
+
+var array<float> posVolSR     = array.new_float(0)
+var array<float> negVolSR     = array.new_float(0)
+var array<float> posVolMacro  = array.new_float(0)
+var array<float> negVolMacro  = array.new_float(0)
+
+// Arrays to aggregate volume per price-bin for POC (NEW)
+var array<float> binPrices    = array.new_float(0)
+var array<float> binVolumes   = array.new_float(0)
+
+// ====================================================================================================================
+// UTILITY — accurate per-bar buy/sell volume estimation (NEW)
+// ====================================================================================================================
+// @function Returns [buyVol, sellVol] for a given lookback offset i using the selected method.
+f_bullBear(int i) =>
+    float o  = open[i]
+    float h  = high[i]
+    float l  = low[i]
+    float c  = close[i]
+    float v  = volume[i]
+    float rng = math.max(h - l, syminfo.mintick)
+    float body = math.abs(c - o)
+    float bull = 0.
+    float bear = 0.
+    if deltaMethod == 'Classic (BigBeluga)' or deltaMethod == 'Close-Open Sign'
+        if c > o
+            bull := v
+        else if c < o
+            bear := v
+    else if deltaMethod == 'Body-Weighted'
+        // Split by body direction, weight by body/range ratio; wick portion split 50/50.
+        float bodyRatio = body / rng
+        float wickRatio = 1.0 - bodyRatio
+        if c > o
+            bull := v * (bodyRatio + wickRatio * 0.5)
+            bear := v * (wickRatio * 0.5)
+        else if c < o
+            bear := v * (bodyRatio + wickRatio * 0.5)
+            bull := v * (wickRatio * 0.5)
+        else
+            bull := v * 0.5
+            bear := v * 0.5
+    else  // Range-Weighted (uses position of close within bar range)
+        float pos = (c - l) / rng      // 0 = at low, 1 = at high
+        bull := v * pos
+        bear := v * (1.0 - pos)
+    [bull, bear]
+
+// @function Accurate delta percentage from accumulated buy/sell volume.
+f_deltaPct(float buy, float sell) =>
+    float total = buy + sell
+    total == 0 ? 0.0 : (buy - sell) / total * 100.0
+
+// ====================================================================================================================
+// CORE STATE
+// ====================================================================================================================
+var float deltaVolSR    = na
+var float deltaVolMacro = na
+var float buyVolSR      = 0.
+var float sellVolSR     = 0.
+var float buyVolMacro   = 0.
+var float sellVolMacro  = 0.
+
+int srStartIdx    = bar_index - srPeriod
+int srEndIdx      = bar_index + (extendLevels ? 100 : 50)
+int macroStartIdx = bar_index - macroPeriod
+int macroEndIdx   = bar_index + (extendLevels ? 120 : 70)
+
+var box  srUpperBox    = na
+var box  srLowerBox    = na
+var box  macroUpperBox = na
+var box  macroLowerBox = na
+var box  midBox        = na
+var box  eqBox         = na
+
+// Predefined-level lines (NEW)
+var line fib0236 = na
+var line fib0382 = na
+var line fib0500 = na
+var line fib0618 = na
+var line fib0786 = na
+var line pocLine = na
+var label pocLbl = na
+
+// ATR for vertical scaling of boxes
+float atrValue = ta.atr(200) * 0.8
+
+// ====================================================================================================================
+// DATA COLLECTION — fills arrays on the last bar, with accurate volume split
+// ====================================================================================================================
+// Macro
+if barstate.islast and showMacro
+    array.clear(macroHighs)
+    array.clear(macroLows)
+    array.clear(posVolMacro)
+    array.clear(negVolMacro)
+    buyVolMacro  := 0.
+    sellVolMacro := 0.
+    for int i = 0 to macroPeriod - 1
+        array.push(macroHighs, high[i])
+        array.push(macroLows,  low[i])
+        [b, s] = f_bullBear(i)
+        array.push(posVolMacro, b)
+        array.push(negVolMacro, -s)
+        buyVolMacro  += b
+        sellVolMacro += s
+    deltaVolMacro := f_deltaPct(buyVolMacro, sellVolMacro)
+
+// S/R
+if barstate.islast and showSR
+    array.clear(srHighs)
+    array.clear(srLows)
+    array.clear(posVolSR)
+    array.clear(negVolSR)
+    buyVolSR  := 0.
+    sellVolSR := 0.
+    for int i = 0 to srPeriod - 1
+        array.push(srHighs, high[i])
+        array.push(srLows,  low[i])
+        [b, s] = f_bullBear(i)
+        array.push(posVolSR, b)
+        array.push(negVolSR, -s)
+        buyVolSR  += b
+        sellVolSR += s
+    deltaVolSR := f_deltaPct(buyVolSR, sellVolSR)
+
+// ====================================================================================================================
+// POC CALCULATION (NEW) — uses srPeriod window and pocBins resolution
+// ====================================================================================================================
+float pocPrice = na
+if barstate.islast and showPOC and showSR and srHighs.size() > 0
+    float hh = srHighs.max()
+    float ll = srLows.min()
+    float binSize = (hh - ll) / pocBins
+    if binSize > 0
+        array.clear(binPrices)
+        array.clear(binVolumes)
+        for int k = 0 to pocBins - 1
+            array.push(binPrices,  ll + binSize * (k + 0.5))
+            array.push(binVolumes, 0.0)
+        // Distribute each bar's volume across the bins its range spans
+        for int i = 0 to srPeriod - 1
+            float bh = high[i]
+            float bl = low[i]
+            float bv = volume[i]
+            int   kLo = math.max(0, int(math.floor((bl - ll) / binSize)))
+            int   kHi = math.min(pocBins - 1, int(math.floor((bh - ll) / binSize)))
+            int   spread = math.max(1, kHi - kLo + 1)
+            float vPerBin = bv / spread
+            for int k = kLo to kHi
+                binVolumes.set(k, binVolumes.get(k) + vPerBin)
+        int pocIdx = 0
+        float pocMax = 0.
+        for int k = 0 to pocBins - 1
+            if binVolumes.get(k) > pocMax
+                pocMax := binVolumes.get(k)
+                pocIdx := k
+        pocPrice := binPrices.get(pocIdx)
+
+// ====================================================================================================================
+// BOX BOUND UPDATES
+// ====================================================================================================================
+if not na(srUpperBox) and not na(srLowerBox) and not na(macroUpperBox) and not na(macroLowerBox)
+    bool cross = ta.crossover(low, box.get_top(srUpperBox)) or ta.crossunder(high, box.get_bottom(srLowerBox)) or bar_index % 100 == 0
+    if cross and srHighs.size() > 0 and macroHighs.size() > 0
+        box.set_top(srUpperBox,    srHighs.max() + atrValue)
+        box.set_bottom(srUpperBox, srHighs.max())
+        box.set_top(srLowerBox,    srLows.min())
+        box.set_bottom(srLowerBox, srLows.min() - atrValue)
+
+        box.set_top(macroUpperBox,    macroHighs.max() + atrValue)
+        box.set_bottom(macroUpperBox, macroHighs.max())
+        box.set_top(macroLowerBox,    macroLows.min())
+        box.set_bottom(macroLowerBox, macroLows.min() - atrValue)
+
+// ====================================================================================================================
+// DRAW S/R BOXES
+// ====================================================================================================================
+if barstate.islast and showSR and srHighs.size() > 0
+    float hh = srHighs.max()
+    float ll = srLows.min()
+    float buyFmt  = buyVolSR
+    float sellFmt = sellVolSR
+
+    if na(srLowerBox)
+        srLowerBox := box.new(srStartIdx, ll, srEndIdx, ll - atrValue, upColor, 1, bgcolor = color.new(upColor, 100), text = 'DISCOUNT: ' + str.tostring(buyFmt, format.volume), text_size = size.small, text_color = chart.fg_color, force_overlay = true)
+    else
+        box.set_text(srLowerBox, 'DISCOUNT: ' + str.tostring(buyFmt, format.volume))
+        box.set_left(srLowerBox,  srStartIdx)
+        box.set_right(srLowerBox, srEndIdx)
+        box.set_top(srLowerBox,   ll)
+        box.set_bottom(srLowerBox, ll - atrValue)
+
+    if na(srUpperBox)
+        srUpperBox := box.new(srStartIdx, hh + atrValue, srEndIdx, hh, downColor, 1, bgcolor = color.new(downColor, 100), text = 'PREMIUM: ' + str.tostring(sellFmt, format.volume), text_size = size.small, text_color = chart.fg_color, force_overlay = true)
+    else
+        box.set_text(srUpperBox, 'PREMIUM: ' + str.tostring(sellFmt, format.volume))
+        box.set_left(srUpperBox,  srStartIdx)
+        box.set_right(srUpperBox, srEndIdx)
+        box.set_top(srUpperBox,    hh + atrValue)
+        box.set_bottom(srUpperBox, hh)
+
+// ====================================================================================================================
+// DRAW MACRO BOXES
+// ====================================================================================================================
+if barstate.islast and showMacro and macroHighs.size() > 0
+    float mhh = macroHighs.max()
+    float mll = macroLows.min()
+    if na(macroUpperBox)
+        macroUpperBox := box.new(macroStartIdx, mhh + atrValue, macroEndIdx, mhh, downColor, 0, bgcolor = color.new(downColor, 60), text = str.tostring(sellVolMacro, format.volume), text_size = size.small, text_color = chart.fg_color, text_halign = showSR ? text.align_right : text.align_center)
+    else
+        box.set_text(macroUpperBox, str.tostring(sellVolMacro, format.volume))
+        box.set_left(macroUpperBox,  macroStartIdx)
+        box.set_right(macroUpperBox, macroEndIdx)
+        box.set_top(macroUpperBox,    mhh + atrValue)
+        box.set_bottom(macroUpperBox, mhh)
+
+    if na(macroLowerBox)
+        macroLowerBox := box.new(macroStartIdx, mll, macroEndIdx, mll - atrValue, upColor, 0, bgcolor = color.new(upColor, 60), text = str.tostring(buyVolMacro, format.volume), text_size = size.small, text_color = chart.fg_color, text_halign = showSR ? text.align_right : text.align_center)
+    else
+        box.set_text(macroLowerBox, str.tostring(buyVolMacro, format.volume))
+        box.set_left(macroLowerBox,  macroStartIdx)
+        box.set_right(macroLowerBox, macroEndIdx)
+        box.set_top(macroLowerBox,    mll)
+        box.set_bottom(macroLowerBox, mll - atrValue)
+
+// ====================================================================================================================
+// PREDEFINED FIB LEVELS + EQUILIBRIUM ZONE + POC (NEW)
+// ====================================================================================================================
+if barstate.islast and showSR and srHighs.size() > 0
+    float hi = srHighs.max()
+    float lo = srLows.min()
+    float rng = hi - lo
+    float l0236 = lo + rng * 0.236
+    float l0382 = lo + rng * 0.382
+    float l0500 = lo + rng * 0.500
+    float l0618 = lo + rng * 0.618
+    float l0786 = lo + rng * 0.786
+
+    // Delete previous levels
+    line.delete(fib0236)
+    line.delete(fib0382)
+    line.delete(fib0500)
+    line.delete(fib0618)
+    line.delete(fib0786)
+    line.delete(pocLine)
+    label.delete(pocLbl)
+    box.delete(eqBox)
+
+    if showFibs
+        fib0236 := line.new(srStartIdx, l0236, srEndIdx, l0236, color = color.new(upColor,  50), style = line.style_dotted)
+        fib0382 := line.new(srStartIdx, l0382, srEndIdx, l0382, color = fibColor,                 style = line.style_dotted)
+        fib0500 := line.new(srStartIdx, l0500, srEndIdx, l0500, color = chart.fg_color,           style = line.style_dashed, width = 1)
+        fib0618 := line.new(srStartIdx, l0618, srEndIdx, l0618, color = fibColor,                 style = line.style_dotted)
+        fib0786 := line.new(srStartIdx, l0786, srEndIdx, l0786, color = color.new(downColor, 50), style = line.style_dotted)
+
+    if showEqZone
+        float eqTop = lo + rng * 0.55
+        float eqBot = lo + rng * 0.45
+        eqBox := box.new(srStartIdx, eqTop, srEndIdx, eqBot, border_color = na, bgcolor = eqColor)
+
+    if showPOC and not na(pocPrice)
+        pocLine := line.new(srStartIdx, pocPrice, srEndIdx, pocPrice, color = pocColor, style = line.style_solid, width = 2)
+        pocLbl  := label.new(srEndIdx, pocPrice, 'POC ' + str.tostring(pocPrice, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, textcolor = chart.fg_color, color = color.new(pocColor, 70), size = size.small)
+
+// ====================================================================================================================
+// EQUILIBRIUM DASHED LINE + MID DELTA BOX
+// ====================================================================================================================
+if barstate.islast and showSR and not na(srLowerBox) and not na(srUpperBox)
+    float mid = math.avg(box.get_top(srLowerBox), box.get_bottom(srUpperBox))
+    line.delete(line.new(srStartIdx, mid, srEndIdx, mid, color = chart.fg_color, style = line.style_dashed)[1])
+
+    string deltaTxt = 'Delta Volume\n' + str.tostring(deltaVolSR, format.percent) + (math.abs(deltaVolSR) >= deltaThresh ? ' *' : '')
+    midBox := box.new(srStartIdx, box.get_bottom(srUpperBox), srEndIdx, box.get_top(srLowerBox), na, 0, bgcolor = color.new(deltaVolSR > 0 ? upColor : downColor, 93), text = deltaTxt, text_size = size.normal, text_color = deltaVolSR > 0 ? upColor : downColor, text_halign = text.align_right, text_valign = text.align_bottom)
+    box.delete(midBox[1])
+
+// Macro-only equilibrium if S/R hidden
+if not showSR and showMacro and barstate.islast and not na(macroLowerBox) and not na(macroUpperBox)
+    float midMacro = math.avg(box.get_top(macroLowerBox), box.get_bottom(macroUpperBox))
+    line.delete(line.new(macroStartIdx, midMacro, macroEndIdx, midMacro, color = chart.fg_color, style = line.style_dashed)[1])
+
+// ====================================================================================================================
+// STATS TABLE (upgraded)
+// ====================================================================================================================
+if showMacro and barstate.islast
+    var table deltaTable = table.new(position.top_right, 2, 6, border_width = 1)
+    table.cell(deltaTable, 0, 0, text = 'Metric',            text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 90))
+    table.cell(deltaTable, 1, 0, text = 'Value',             text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 90))
+
+    table.cell(deltaTable, 0, 1, text = 'Macro Delta',       text_color = chart.fg_color, text_size = size.small)
+    table.cell(deltaTable, 1, 1, text = str.tostring(deltaVolMacro, format.percent), text_color = deltaVolMacro > 0 ? upColor : downColor, text_size = size.small)
+
+    table.cell(deltaTable, 0, 2, text = 'S/R Delta',         text_color = chart.fg_color, text_size = size.small)
+    table.cell(deltaTable, 1, 2, text = str.tostring(deltaVolSR, format.percent),    text_color = deltaVolSR    > 0 ? upColor : downColor, text_size = size.small)
+
+    // Position within range (0 = at Discount, 100 = at Premium)
+    float pct = na
+    if showSR and not na(srLowerBox) and not na(srUpperBox)
+        float hi = box.get_bottom(srUpperBox)
+        float lo = box.get_top(srLowerBox)
+        pct := (close - lo) / math.max(hi - lo, syminfo.mintick) * 100
+    table.cell(deltaTable, 0, 3, text = 'Price Location',    text_color = chart.fg_color, text_size = size.small)
+    table.cell(deltaTable, 1, 3, text = na(pct) ? 'n/a' : str.tostring(pct, format.percent), text_color = chart.fg_color, text_size = size.small)
+
+    // Bias
+    string bias = 'NEUTRAL'
+    color  biasColor = chart.fg_color
+    if deltaVolSR > deltaThresh and deltaVolMacro > 0
+        bias := 'BULLISH'
+        biasColor := upColor
+    else if deltaVolSR < -deltaThresh and deltaVolMacro < 0
+        bias := 'BEARISH'
+        biasColor := downColor
+    table.cell(deltaTable, 0, 4, text = 'Bias',              text_color = chart.fg_color, text_size = size.small)
+    table.cell(deltaTable, 1, 4, text = bias,                text_color = biasColor,      text_size = size.small)
+
+    table.cell(deltaTable, 0, 5, text = 'POC',               text_color = chart.fg_color, text_size = size.small)
+    table.cell(deltaTable, 1, 5, text = na(pocPrice) ? 'n/a' : str.tostring(pocPrice, format.mintick), text_color = pocColor, text_size = size.small)
+
+// ====================================================================================================================
+// ALERTS (NEW)
+// ====================================================================================================================
+bool inPremium  = showSR and not na(srUpperBox) and high  >= box.get_bottom(srUpperBox)
+bool inDiscount = showSR and not na(srLowerBox) and low   <= box.get_top(srLowerBox)
+
+alertcondition(alertOnPrem and inPremium,  title = 'Premium Zone Touch',  message = 'Price tagged Premium zone — watch for bearish reaction')
+alertcondition(alertOnDisc and inDiscount, title = 'Discount Zone Touch', message = 'Price tagged Discount zone — watch for bullish reaction')
+alertcondition(deltaVolSR >  deltaThresh,  title = 'Strong Bullish Delta', message = 'S/R delta volume exceeds bullish threshold')
+alertcondition(deltaVolSR < -deltaThresh,  title = 'Strong Bearish Delta', message = 'S/R delta volume exceeds bearish threshold')
