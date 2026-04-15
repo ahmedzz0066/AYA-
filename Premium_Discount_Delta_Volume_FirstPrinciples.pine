@@ -1,0 +1,326 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// © BigBeluga (original concept)
+// Rebuilt from First Principles by AYA.
+//
+// FIRST PRINCIPLES REASONING
+// --------------------------------------------------------------------------------------------------------------------
+// 1. Range is NOT max(high)..min(low) — one wick defines nothing. Range is where volume was ACCEPTED.
+//      => Use Volume Profile Value Area (70%): VAH / VAL / POC.
+// 2. Equilibrium is NOT the geometric midpoint. It is where supply met demand = VWAP.
+//      => Anchor VWAP to the lookback window, plot ±σ bands.
+// 3. Delta is NOT sign(close-open). The last tick doesn't reveal who won. It is PROBABILISTIC.
+//      => Estimate with close position within bar range; weight with exponential time-decay.
+// 4. Every bar should NOT weigh equally. Order flow is non-stationary.
+//      => Apply half-life decay so recent bars dominate.
+// 5. Lookback in bars is dimensionally wrong across timeframes.
+//      => Adaptive window: expand when vol contracts, contract when vol expands.
+// 6. "Strong" delta is NOT a fixed percent. It is statistical rarity.
+//      => Z-score delta against its own rolling distribution.
+// 7. A signal from ONE factor is noisy. Independent signals compound.
+//      => Confluence score 0..100 = weighted sum of 4 orthogonal factors.
+// --------------------------------------------------------------------------------------------------------------------
+
+//@version=6
+indicator('Premium & Discount Delta Volume — First Principles [AYA]', overlay = true, max_lines_count = 100, max_boxes_count = 50, max_bars_back = 1000, max_labels_count = 100)
+
+// ====================================================================================================================
+// INPUTS
+// ====================================================================================================================
+// --- Core ---
+int   baseLookback = input.int(100, 'Base Lookback', minval = 20, step = 10, group = 'Core', tooltip = 'Nominal window. Adaptive mode rescales this by volatility.')
+bool  adaptive     = input.bool(true, 'Volatility-Adaptive Lookback', group = 'Core', tooltip = 'Expands window in quiet regimes, contracts in volatile regimes.')
+float halfLife     = input.float(30, 'Time-Decay Half-Life (bars)', minval = 1, step = 1, group = 'Core', tooltip = 'After this many bars, a sample has half the weight. Set very large to disable decay.')
+
+// --- Value Area ---
+float vaPct        = input.float(70, 'Value Area %', minval = 50, maxval = 95, step = 5, group = 'Volume Profile')
+int   vpBins       = input.int(40, 'Profile Resolution (bins)', minval = 10, maxval = 120, step = 5, group = 'Volume Profile')
+bool  showVA       = input.bool(true, 'Show Value Area Zone', group = 'Volume Profile')
+bool  showPOC      = input.bool(true, 'Show POC Line', group = 'Volume Profile')
+
+// --- VWAP ---
+bool  showVWAP     = input.bool(true, 'Show Anchored VWAP + σ Bands', group = 'VWAP')
+float vwapSigma    = input.float(1.5, 'σ Band Multiplier', minval = 0.5, step = 0.5, group = 'VWAP')
+
+// --- Statistical delta ---
+int   zWindow      = input.int(50, 'Delta Z-Score Window', minval = 10, group = 'Statistics', tooltip = 'Bars used to compute mean/stdev of delta for z-score normalization.')
+float zStrong      = input.float(1.5, 'Strong Signal Z-Threshold', minval = 0.5, step = 0.5, group = 'Statistics')
+
+// --- Confluence ---
+bool  showTable    = input.bool(true, 'Show Confluence Dashboard', group = 'Dashboard')
+
+// --- Colors ---
+color upColor  = input.color(#79c1f1, 'Discount / Bull', inline = 'c', group = 'Color')
+color downColor= input.color(#f19579, 'Premium / Bear',  inline = 'c', group = 'Color')
+color vaColor  = input.color(color.new(#aaaaaa, 85), 'Value Area', group = 'Color')
+color vwapColor= input.color(#ffd166, 'VWAP', group = 'Color')
+color pocColor = input.color(#b388ff, 'POC',  group = 'Color')
+
+// ====================================================================================================================
+// FIRST PRINCIPLE #5 — Volatility-adaptive lookback
+// ATR-ratio normalizes the window: high vol compresses it, low vol stretches it.
+// ====================================================================================================================
+float atrFast = ta.atr(14)
+float atrSlow = ta.atr(200)
+float volRatio = atrSlow == 0 ? 1.0 : atrFast / atrSlow
+int   lookback = adaptive ? math.max(20, math.min(500, int(baseLookback / math.max(0.5, volRatio)))) : baseLookback
+
+// ====================================================================================================================
+// FIRST PRINCIPLE #3 — Probabilistic delta (close position within range)
+// FIRST PRINCIPLE #4 — Exponential time-decay weighting
+// ====================================================================================================================
+// @function Returns decay-weighted buy/sell for a bar at offset i, with weight w applied.
+f_bullBear(int i, float w) =>
+    float h = high[i]
+    float l = low[i]
+    float c = close[i]
+    float v = volume[i] * w
+    float rng = math.max(h - l, syminfo.mintick)
+    float pos = (c - l) / rng     // 0 = close at low, 1 = close at high
+    [v * pos, v * (1.0 - pos)]    // [buy, sell]
+
+// Decay weight: w(i) = 0.5 ^ (i / halfLife)   (i in bars back)
+f_decay(int i) =>
+    halfLife <= 0 ? 1.0 : math.pow(0.5, i / halfLife)
+
+// ====================================================================================================================
+// STATE
+// ====================================================================================================================
+var array<float> binPrice  = array.new_float(0)
+var array<float> binVolume = array.new_float(0)
+
+var float vwapVal  = na
+var float vwapUp   = na
+var float vwapDn   = na
+var float pocPrice = na
+var float valPrice = na
+var float vahPrice = na
+var float buyTot   = 0.
+var float sellTot  = 0.
+var float deltaPct = na
+var float deltaZ   = na
+
+// Rolling delta for z-score (recomputed on last bar)
+var array<float> deltaHist = array.new_float(0)
+
+// Drawing objects
+var line lnVWAP = na
+var line lnUp   = na
+var line lnDn   = na
+var line lnPOC  = na
+var box  vaBox  = na
+var line lnVAH  = na
+var line lnVAL  = na
+var label lblPOC= na
+var table dash  = na
+
+// ====================================================================================================================
+// COMPUTE ON LAST BAR
+// ====================================================================================================================
+if barstate.islast
+    int N = lookback
+    int startIdx = bar_index - N
+    int endIdx   = bar_index + 30
+
+    // ---- First principle #2 & #3: Anchored VWAP + probabilistic delta + decay ----------------------------------------
+    float sumPV   = 0.
+    float sumV    = 0.
+    float sumPPV  = 0.
+    float buyAcc  = 0.
+    float sellAcc = 0.
+    float hiRaw   = -1e20
+    float loRaw   =  1e20
+    for int i = 0 to N - 1
+        float w = f_decay(i)
+        float tp = (high[i] + low[i] + close[i]) / 3.0
+        float v  = volume[i] * w
+        sumPV   += tp * v
+        sumPPV  += tp * tp * v
+        sumV    += v
+        [b, s] = f_bullBear(i, w)
+        buyAcc  += b
+        sellAcc += s
+        hiRaw := math.max(hiRaw, high[i])
+        loRaw := math.min(loRaw, low[i])
+
+    vwapVal := sumV == 0 ? close : sumPV / sumV
+    float variance = sumV == 0 ? 0 : math.max(0, sumPPV / sumV - vwapVal * vwapVal)
+    float sd = math.sqrt(variance)
+    vwapUp  := vwapVal + sd * vwapSigma
+    vwapDn  := vwapVal - sd * vwapSigma
+    buyTot  := buyAcc
+    sellTot := sellAcc
+    float total = buyAcc + sellAcc
+    deltaPct := total == 0 ? 0 : (buyAcc - sellAcc) / total * 100
+
+    // ---- First principle #1: Value Area via volume profile ----------------------------------------------------------
+    float binSize = (hiRaw - loRaw) / vpBins
+    if binSize > 0
+        array.clear(binPrice)
+        array.clear(binVolume)
+        for int k = 0 to vpBins - 1
+            array.push(binPrice, loRaw + binSize * (k + 0.5))
+            array.push(binVolume, 0.0)
+        for int i = 0 to N - 1
+            float w  = f_decay(i)
+            float bh = high[i]
+            float bl = low[i]
+            float bv = volume[i] * w
+            int   kLo = math.max(0, int(math.floor((bl - loRaw) / binSize)))
+            int   kHi = math.min(vpBins - 1, int(math.floor((bh - loRaw) / binSize)))
+            int   spread = math.max(1, kHi - kLo + 1)
+            float vPer = bv / spread
+            for int k = kLo to kHi
+                binVolume.set(k, binVolume.get(k) + vPer)
+
+        // POC
+        int   pocIdx = 0
+        float pocMax = 0.0
+        for int k = 0 to vpBins - 1
+            if binVolume.get(k) > pocMax
+                pocMax := binVolume.get(k)
+                pocIdx := k
+        pocPrice := binPrice.get(pocIdx)
+
+        // Value area expansion from POC until it contains vaPct% of total volume
+        float vpTotal = 0.0
+        for int k = 0 to vpBins - 1
+            vpTotal += binVolume.get(k)
+        float target = vpTotal * (vaPct / 100.0)
+        float acc    = binVolume.get(pocIdx)
+        int   lo     = pocIdx
+        int   hi     = pocIdx
+        while acc < target and (lo > 0 or hi < vpBins - 1)
+            float lv = lo > 0         ? binVolume.get(lo - 1) : -1
+            float hv = hi < vpBins -1 ? binVolume.get(hi + 1) : -1
+            if hv >= lv
+                hi  := hi + 1
+                acc += math.max(0, hv)
+            else
+                lo  := lo - 1
+                acc += math.max(0, lv)
+        valPrice := binPrice.get(lo) - binSize * 0.5
+        vahPrice := binPrice.get(hi) + binSize * 0.5
+
+    // ---- First principle #6: Delta z-score --------------------------------------------------------------------------
+    array.clear(deltaHist)
+    for int j = 0 to math.min(zWindow - 1, N - 1)
+        // Build per-bar delta% without decay for statistical sampling
+        float b2 = 0., s2 = 0.
+        [bj, sj] = f_bullBear(j, 1.0)
+        b2 := bj
+        s2 := sj
+        float t2 = b2 + s2
+        array.push(deltaHist, t2 == 0 ? 0 : (b2 - s2) / t2 * 100)
+    float mu = deltaHist.avg()
+    float sig = deltaHist.stdev()
+    deltaZ := sig == 0 ? 0 : (deltaPct - mu) / sig
+
+    // ================================================================================================================
+    // DRAW — Value Area zone
+    // ================================================================================================================
+    box.delete(vaBox)
+    line.delete(lnVAH)
+    line.delete(lnVAL)
+    if showVA and not na(vahPrice) and not na(valPrice)
+        vaBox := box.new(startIdx, vahPrice, endIdx, valPrice, border_color = na, bgcolor = vaColor)
+        lnVAH := line.new(startIdx, vahPrice, endIdx, vahPrice, color = downColor, width = 2)
+        lnVAL := line.new(startIdx, valPrice, endIdx, valPrice, color = upColor,   width = 2)
+
+    // POC
+    line.delete(lnPOC)
+    label.delete(lblPOC)
+    if showPOC and not na(pocPrice)
+        lnPOC  := line.new(startIdx, pocPrice, endIdx, pocPrice, color = pocColor, style = line.style_solid, width = 2)
+        lblPOC := label.new(endIdx, pocPrice, 'POC ' + str.tostring(pocPrice, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, textcolor = chart.fg_color, color = color.new(pocColor, 70), size = size.small)
+
+    // VWAP + sigma bands
+    line.delete(lnVWAP)
+    line.delete(lnUp)
+    line.delete(lnDn)
+    if showVWAP
+        lnVWAP := line.new(startIdx, vwapVal, endIdx, vwapVal, color = vwapColor, width = 2)
+        lnUp   := line.new(startIdx, vwapUp,  endIdx, vwapUp,  color = color.new(vwapColor, 40), style = line.style_dotted)
+        lnDn   := line.new(startIdx, vwapDn,  endIdx, vwapDn,  color = color.new(vwapColor, 40), style = line.style_dotted)
+
+// ====================================================================================================================
+// FIRST PRINCIPLE #7 — Confluence Score
+// Four orthogonal factors, each ∈ [-1, +1], summed and scaled to [-100, +100].
+//   F1  VWAP side:     sign(close − vwap) × min(1, |close-vwap|/σ)
+//   F2  Value Area:    above VAH → -1 (premium stretch), below VAL → +1 (discount), inside → linear
+//   F3  Delta z-score: clamp(deltaZ / zStrong, -1, +1)
+//   F4  POC distance:  sign(pocPrice − close) × min(1, |pocPrice-close|/σ)   (pull toward POC)
+// ====================================================================================================================
+float confluence = na
+string bias = 'NEUTRAL'
+color biasColor = chart.fg_color
+if barstate.islast
+    float sd = (vwapUp - vwapVal) / math.max(vwapSigma, 0.001)
+    float f1 = sd == 0 ? 0 : math.max(-1, math.min(1, (close - vwapVal) / sd))
+    float rng = math.max(vahPrice - valPrice, syminfo.mintick)
+    float f2 = 0.0
+    if close > vahPrice
+        f2 := -math.min(1, (close - vahPrice) / rng)
+    else if close < valPrice
+        f2 :=  math.min(1, (valPrice - close) / rng)
+    else
+        f2 := (math.avg(vahPrice, valPrice) - close) / (rng / 2) * 0.5
+    float f3 = math.max(-1, math.min(1, deltaZ / zStrong))
+    float f4 = sd == 0 ? 0 : math.max(-1, math.min(1, (pocPrice - close) / sd))
+
+    // Weights: delta z-score and VWAP get the highest weight because they are the most statistically meaningful
+    confluence := (f1 * 0.25 + f2 * 0.25 + f3 * 0.35 + f4 * 0.15) * 100
+
+    if confluence >  40
+        bias := 'STRONG BULL'
+        biasColor := upColor
+    else if confluence >  15
+        bias := 'BULLISH'
+        biasColor := upColor
+    else if confluence < -40
+        bias := 'STRONG BEAR'
+        biasColor := downColor
+    else if confluence < -15
+        bias := 'BEARISH'
+        biasColor := downColor
+
+// ====================================================================================================================
+// DASHBOARD
+// ====================================================================================================================
+if barstate.islast and showTable
+    var table t = table.new(position.top_right, 2, 9, border_width = 1)
+    table.cell(t, 0, 0, text = 'Metric',              text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 88))
+    table.cell(t, 1, 0, text = 'Value',               text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(chart.fg_color, 88))
+
+    table.cell(t, 0, 1, text = 'Adaptive Lookback',   text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 1, text = str.tostring(lookback) + ' bars', text_color = chart.fg_color, text_size = size.small)
+
+    table.cell(t, 0, 2, text = 'Vol Ratio (ATR14/200)', text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 2, text = str.tostring(volRatio, '#.##'), text_color = volRatio > 1 ? downColor : upColor, text_size = size.small)
+
+    table.cell(t, 0, 3, text = 'Delta %',             text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 3, text = str.tostring(deltaPct, format.percent), text_color = deltaPct > 0 ? upColor : downColor, text_size = size.small)
+
+    table.cell(t, 0, 4, text = 'Delta Z-Score',       text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 4, text = str.tostring(deltaZ, '#.##') + 'σ' + (math.abs(deltaZ) >= zStrong ? ' *' : ''), text_color = deltaZ > 0 ? upColor : downColor, text_size = size.small)
+
+    table.cell(t, 0, 5, text = 'VWAP',                text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 5, text = str.tostring(vwapVal, format.mintick) + (close > vwapVal ? '  ▲' : '  ▼'), text_color = close > vwapVal ? upColor : downColor, text_size = size.small)
+
+    table.cell(t, 0, 6, text = 'Value Area',          text_color = chart.fg_color, text_size = size.small)
+    string vaState = close > vahPrice ? 'Above VAH (Premium)' : close < valPrice ? 'Below VAL (Discount)' : 'Inside VA'
+    color  vaStateC = close > vahPrice ? downColor : close < valPrice ? upColor : chart.fg_color
+    table.cell(t, 1, 6, text = vaState, text_color = vaStateC, text_size = size.small)
+
+    table.cell(t, 0, 7, text = 'Confluence',          text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 7, text = str.tostring(confluence, '#') + '/100', text_color = biasColor, text_size = size.small)
+
+    table.cell(t, 0, 8, text = 'Bias',                text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 8, text = bias, text_color = biasColor, text_size = size.small, bgcolor = color.new(biasColor, 85))
+
+// ====================================================================================================================
+// ALERTS
+// ====================================================================================================================
+alertcondition(deltaZ >  zStrong, title = 'Statistically Strong Bullish Delta', message = 'Delta z-score > threshold — rare bullish pressure')
+alertcondition(deltaZ < -zStrong, title = 'Statistically Strong Bearish Delta', message = 'Delta z-score < -threshold — rare bearish pressure')
+alertcondition(close > vahPrice and deltaZ < 0, title = 'Premium Stretch with Bearish Delta', message = 'Price above Value Area High while delta is negative — mean-reversion setup')
+alertcondition(close < valPrice and deltaZ > 0, title = 'Discount Stretch with Bullish Delta', message = 'Price below Value Area Low while delta is positive — mean-reversion setup')
