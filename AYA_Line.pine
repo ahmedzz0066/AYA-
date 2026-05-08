@@ -221,9 +221,9 @@ if not na(pl15)
     legLo := pl15
     legBar := bar_index
 
-zoneTop = na
-zoneBot = na
-zoneSweet = na
+float zoneTop   = na
+float zoneBot   = na
+float zoneSweet = na
 if not na(legHi) and not na(legLo)
     leg = legHi - legLo
     if dir == 1
@@ -434,10 +434,10 @@ plotshape(mssDn, title="MSS down", style=shape.labeldown,
 // 10. DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
 posMap(s) =>
-    s == "top_left"     ? position.top_left :
+    (s == "top_left"     ? position.top_left :
     s == "bottom_right" ? position.bottom_right :
     s == "bottom_left"  ? position.bottom_left :
-    s == "middle_right" ? position.middle_right : position.top_right
+    s == "middle_right" ? position.middle_right : position.top_right)
 
 var table dash = table.new(posMap(dashPos), 2, 9,
      border_width=1, frame_color=color.new(color.gray, 50),
