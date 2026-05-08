@@ -432,10 +432,12 @@ plotshape(bosDn, title="BOS Down",
 
 // Origin validated
 originJustValid = originState == 3 and originState[1] != 3
-plotshape(originJustValid, title="Origin Accepted",
-     style=shape.flag,
-     location=(originDir == 1 ? location.belowbar : location.abovebar),
-     color=(originDir == 1 ? colBull : colBear), size=size.small)
+plotshape(originJustValid and originDir ==  1, title="Origin Accepted Bull",
+     style=shape.flag, location=location.belowbar,
+     color=colBull, size=size.small)
+plotshape(originJustValid and originDir == -1, title="Origin Accepted Bear",
+     style=shape.flag, location=location.abovebar,
+     color=colBear, size=size.small)
 
 // Invalidation flash
 originJustInv = originState == -1 and originState[1] != -1
