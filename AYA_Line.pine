@@ -139,8 +139,8 @@ var int   confScore = 0
 var bool  invalidated = false
 
 rawBias = abovePv and emaUp ? 1 : belowPv and emaDn ? -1 : 0
-rawConf = rawBias ==  1 ? confBull :
-          rawBias == -1 ? confBear : 0
+rawConf = (rawBias ==  1 ? confBull :
+          rawBias == -1 ? confBear : 0)
 
 // recompute on a new 1H bar
 new1H = ta.change(time("60")) != 0
@@ -165,16 +165,16 @@ aVwapNum += typPrice * volProxy
 aVwapDen += volProxy
 aVwap = aVwapDen > 0 ? aVwapNum / aVwapDen : close
 
-ayaLine = ayaMode == "Daily Pivot"            ? dailyPivot :
+ayaLine = (ayaMode == "Daily Pivot"            ? dailyPivot :
           ayaMode == "Anchored VWAP (session)" ? aVwap :
           ayaMode == "Prior Day Mid"           ? priorMid :
-          ayaManual > 0                        ? ayaManual : dailyPivot
+          ayaManual > 0                        ? ayaManual : dailyPivot)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. INVALIDATION  (1H full-body close only)
 // ─────────────────────────────────────────────────────────────────────────────
-invLevel = biasState ==  1 ? swingLo1H :
-           biasState == -1 ? swingHi1H : na
+invLevel = (biasState ==  1 ? swingLo1H :
+           biasState == -1 ? swingHi1H : na)
 
 h1Range = h1High - h1Low
 h1Body  = math.abs(h1Close - h1Open)
@@ -201,8 +201,8 @@ dir = biasState   //  1 / -1 / 0
 tp1 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP1 * R
 tp2 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP2 * R
 tp3 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP3 * R
-extDist = na(R) ? na :
-     useATRd ? math.max(rrExt * R, atrD) : rrExt * R
+extDist = (na(R) ? na :
+     useATRd ? math.max(rrExt * R, atrD) : rrExt * R)
 tpExt = na(extDist) or dir == 0 ? na : ayaLine + dir * extDist
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,16 +303,13 @@ atrSlowV = ta.atr(atrSlow)
 atrRatio = atrSlowV > 0 ? atrFastV / atrSlowV : 1.0
 
 inPriorRange = close <= pdH and close >= pdL
-mState = atrRatio >= trendK ? "TRENDING" :
+mState = (atrRatio >= trendK ? "TRENDING" :
          atrRatio <= weakK  ? "WEAK MOMENTUM" :
-         inPriorRange       ? "ROTATIONAL" : "MIXED"
+         inPriorRange       ? "ROTATIONAL" : "MIXED")
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. DRAWING LAYER
 // ─────────────────────────────────────────────────────────────────────────────
-biasColor = biasState ==  1 ? colBull :
-            biasState == -1 ? colBear : colNeut
-
 // Persistent objects — rebuilt each bar (kept light: a handful of lines/boxes)
 var line  lnAya  = na
 var line  lnInv  = na
@@ -446,22 +443,22 @@ var table dash = table.new(posMap(dashPos), 2, 9,
      border_width=1, frame_color=color.new(color.gray, 50),
      border_color=color.new(color.gray, 70))
 
-biasTxt = invalidated ? "DEFENSIVE — STAND DOWN" :
+biasTxt = (invalidated ? "DEFENSIVE — STAND DOWN" :
           biasState ==  1 ? "BULLISH ▲" :
-          biasState == -1 ? "BEARISH ▼" : "NEUTRAL ◇"
-biasBg  = invalidated ? color.new(color.orange, 50) :
+          biasState == -1 ? "BEARISH ▼" : "NEUTRAL ◇")
+biasBg  = (invalidated ? color.new(color.orange, 50) :
           biasState ==  1 ? color.new(colBull, 60) :
           biasState == -1 ? color.new(colBear, 60) :
-                            color.new(colNeut, 60)
+                            color.new(colNeut, 60))
 
-trigTxt = revStep == 0 ? "—" :
+trigTxt = (revStep == 0 ? "—" :
           revStep == 1 ? "1/4 sweep ✓" :
           revStep == 2 ? "2/4 sweep + MSS ✓" :
-          revStep == 3 ? "3/4 sweep + MSS + reclaim ✓" : "ARMED"
+          revStep == 3 ? "3/4 sweep + MSS + reclaim ✓" : "ARMED")
 
-dntTxt = mState == "WEAK MOMENTUM" ? "weak ATR — stand down" :
+dntTxt = (mState == "WEAK MOMENTUM" ? "weak ATR — stand down" :
          invalidated                ? "wait reclaim sequence" :
-         dir == 0                   ? "no bias — observe" : "—"
+         dir == 0                   ? "no bias — observe" : "—")
 
 f_cell(int r, int c, string txt, color bg, color tc) =>
     table.cell(dash, c, r, txt, bgcolor=bg, text_color=tc, text_size=size.small)
@@ -493,10 +490,10 @@ if showDash and barstate.islast
          color.new(colTP, 60), color.white)
 
     f_cell(5, 0, "STATE",        color.new(color.black, 30), color.white)
-    stateBg = mState == "TRENDING"      ? color.new(colBull,  70) :
+    stateBg = (mState == "TRENDING"      ? color.new(colBull,  70) :
               mState == "WEAK MOMENTUM" ? color.new(color.orange, 60) :
               mState == "ROTATIONAL"    ? color.new(colNeut,  70) :
-                                          color.new(color.gray, 60)
+                                          color.new(color.gray, 60))
     f_cell(5, 1, mState + "  (ATR×" + str.tostring(atrRatio, "#.##") + ")",
          stateBg, color.white)
 
