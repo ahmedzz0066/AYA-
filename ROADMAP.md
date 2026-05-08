@@ -1,241 +1,207 @@
-# AYA Line — Trading Model Roadmap & Logical Approach
+# AYA Line — Volume-Engine Roadmap & Logical Approach
 
 > "Less is better. Precision over frequency. Protect capital first."
 >
 > — AYA Line core philosophy
 
-This document is the engineering blueprint behind the **AYA Line** Pine Script v6
-indicator (`AYA_Line.pine`). It translates the institutional-style intraday
-framework into deterministic, chartable logic so every component on the chart can
-be reasoned about, audited, and back-tested.
+This document is the engineering blueprint behind the **AYA Line — Volume Engine**
+Pine Script v6 indicator (`AYA_Line.pine`). The model is **100 % volume-driven**:
+no EMAs, no ATR, no daily pivots. Every gate uses one of five volume tools.
 
 ---
 
 ## 1. Mission Statement
 
-AYA Line is **not** a signal generator. It is a *decision-support* indicator that
-mechanizes the discretionary process of an institutional intraday operator:
+AYA Line is a *decision-support* indicator that mechanizes an institutional
+intraday operator's read of the order book through volume:
 
-1. Establish a **directional bias** at the start of the session (the *AYA Arrow*).
-2. Anchor the bias to a **single core level** (the *AYA Line*).
-3. Define an **invalidation** rule that only the 1H full-body close can break.
-4. Project **probabilistic targets** (TP1 → TP2 → TP3 → Extended).
-5. Highlight **pullback / pickup zones** that satisfy the asymmetric (≥1:4 RR)
-   trade philosophy.
-6. Read **market state** (trending / rotational / weak momentum) and surface it.
-7. Print **risk notes**: what invalidates, what confirms, when *not* to trade.
-
-Everything below is what the script must compute, in the order it computes it.
+1. Establish a **volume bias** (the *AYA Arrow*) from the consensus of three
+   orderflow signals.
+2. Anchor the bias to a **single core level** (the *AYA Line*) sourced from
+   volume — anchored session VWAP, volume POC, or manual.
+3. Define an **invalidation** rule that only the 1H full-body close past a
+   volume reference (VAL/VAH, nearest HVN, or POC) can break.
+4. Project **R-multiple targets** (TP1 → TP2 → TP3, ≥ 1:4).
+5. Highlight **supply / demand zones** + **HVN levels** as confluence pickups.
+6. Print **risk notes**: what invalidates, what confirms, when *not* to trade.
 
 ---
 
-## 2. Timeframe Stack
+## 2. Volume Inputs (the only inputs)
 
-| TF       | Role                                  | Used for                                              |
-|----------|---------------------------------------|--------------------------------------------------------|
-| Daily    | Macro bias anchor                     | Prior day OHLC, ATR(D), session pivots                 |
-| 1H       | Directional control / invalidation    | **Only TF** allowed to invalidate the AYA Line         |
-| 15m      | Structural read                       | BOS / CHOCH, premium-discount legs, liquidity pools    |
-| 5m       | Execution refinement                  | Entry triggers, sweep + reclaim, micro MSS             |
-
-The script subscribes to all four via `request.security` and renders on the
-chart's current TF (recommended 5m or 15m).
+| # | Tool                                  | Role                                                                        |
+|---|----------------------------------------|------------------------------------------------------------------------------|
+| 1 | **Anchored Session VWAP** + ±1σ bands | Fair value anchor; slope = trend pressure                                    |
+| 2 | **Volume Profile** (POC / VAH / VAL)  | Where price *transacted* — auction value area                                |
+| 3 | **Cumulative Volume Delta**            | Orderflow proxy (signed volume); sign = aggressor                            |
+| 4 | **HVN Levels** (BigBeluga z-score)    | High-volume nodes = sticky S/R                                               |
+| 5 | **Supply / Demand zones**              | Last opposing bar before a volume impulse (z-scored body × volume)           |
 
 ---
 
 ## 3. Component Roadmap
 
-### 3.1 Daily Directional Bias (AYA Arrow)
+### 3.1 Anchored Session VWAP
 
-**Inputs**
-- Prior day OHLC.
-- Daily pivot `P = (PH + PL + PC) / 3`.
-- 1H EMA(20) and EMA(50) (bias filter).
-- Reclaim of prior day high / low.
+- Reset on each new session (D / W / M selectable).
+- Online accumulator: `Σ(typ·vol) / Σvol`.
+- Variance band: `σ = √(Σ(typ²·vol)/Σvol − VWAP²)`.
+- ±1σ bands optionally drawn.
 
-**Decision tree**
+### 3.2 Volume Profile
+
+- Rolling lookback (default 288 bars, 50 bins).
+- Each bar's volume distributed evenly across the bins its `[low,high]`
+  range covers.
+- **POC** = bin with greatest accumulated volume.
+- **VAH / VAL** = expanded from POC bin until 70 % of total volume is captured
+  (greedy expansion on the side with more adjacent volume).
+- Recomputed on `barstate.islast` to keep cost bounded.
+
+### 3.3 Cumulative Volume Delta
+
+- Three selectable proxies: body sign × volume, up-tick vs down-tick,
+  above-mid vs below-mid.
+- Resets on session boundary.
+- CVD > 0 = net buying pressure; CVD < 0 = net selling.
+
+### 3.4 HVN Levels (Volumatic z-score)
+
+Direct port of BigBeluga's logic:
 ```
-if   close_1H > P  AND ema20_1H > ema50_1H AND close_1H > prevDayHigh_-1
-        → bias = BULLISH    (confidence: HIGH)
-elif close_1H > P  AND ema20_1H > ema50_1H
-        → bias = BULLISH    (confidence: MEDIUM)
-elif close_1H < P  AND ema20_1H < ema50_1H AND close_1H < prevDayLow_-1
-        → bias = BEARISH    (confidence: HIGH)
-elif close_1H < P  AND ema20_1H < ema50_1H
-        → bias = BEARISH    (confidence: MEDIUM)
-else
-        → bias = NEUTRAL    (do not engage)
+zVol  = z-score(signed-volume,  200)
+zDiff = z-score(close-open,     200)
+HVN_bull ⇔ zVol >  L  AND  zDiff >  L
+HVN_bear ⇔ zVol < -L  AND  zDiff < -L
 ```
-Confidence drives table colour and a numeric score (0–100).
+Each HVN is plotted as a horizontal line at the bar's `(open+close)/2`,
+extended right. Newest *N* (default 8) are kept.
 
-### 3.2 Core AYA Line
+### 3.5 Supply / Demand Zones
 
-The single level the entire session is built around. Selectable input:
+A zone is born when an **impulse** prints (`|zVol| > 1.8` and `|zDiff| > 1.8`).
+- **Demand**: last *down* bar immediately preceding a bullish impulse;
+  zone = `[low, max(open, close)]`.
+- **Supply**: last *up* bar immediately preceding a bearish impulse;
+  zone = `[min(open, close), high]`.
 
-1. **Daily pivot P** (default).
-2. **Anchored VWAP** from session open.
-3. **Prior day midpoint** `(PH + PL) / 2`.
-4. **Manual override** (price input).
+Newest *N* (default 4 each side) drawn as translucent boxes.
 
-Drawn as a thick, persistent horizontal line on all timeframes.
+### 3.6 Volume Bias Engine (the AYA Arrow)
 
-### 3.3 Invalidation Level
+Three orthogonal volume signals; need majority + lead:
 
-- **Bullish bias** → invalidation = lowest 1H low over last `N=12` hours
-  (configurable). Drawn as a dashed line.
-- **Bearish bias** → invalidation = highest 1H high over last `N=12` hours.
-
-**Invalidation rule (the only one that matters):**
-```
-A 1H candle is invalidating ⇔
-    bias == BULL AND  close_1H  <  inv_level  AND  body_size >= 0.6 * range
-                                                  (i.e. full-body, not a wick)
-or
-    bias == BEAR AND  close_1H  >  inv_level  AND  body_size >= 0.6 * range
-```
-Wicks alone never invalidate. The script paints the candle red and prints
-`INVALIDATED` on the dashboard; signals are suppressed until a new bias forms.
-
-### 3.4 Model Targets
-
-Targets are projected from the AYA Line using a hybrid of **ATR(D)** expansion
-and **R-multiples** measured against the invalidation distance `R`:
-
-| Target | Formula (bullish; flip sign for bearish)                |
-|--------|----------------------------------------------------------|
-| TP1    | `AYA + 1.0 × R`           (≈ first liquidity sweep)       |
-| TP2    | `AYA + 2.0 × R`           (session expansion)             |
-| TP3    | `AYA + 4.0 × R`           (minimum asymmetric objective)  |
-| Ext    | `AYA + max(6×R, 1.0×ATRd)` (momentum continuation)        |
-
-`R = |AYA − invalidation|`. If a target lies the wrong side of the prior-day
-range, it is faded but still drawn so traders can see liquidity context.
-
-Targets are **cancelled** the moment the bias is invalidated; they reappear only
-after a confirmed reclaim (see 3.7).
-
-### 3.5 Pullback / Entry Zones
-
-A discount zone (for longs) and premium zone (for shorts) are computed from the
-last completed 15m impulse leg:
-
-- **Leg** = swing low → swing high (or vice versa) over `pivotLen = 5`.
-- **Discount** = 50 %–79 % retrace (Fibonacci): `[leg_high − 0.79·leg, leg_high − 0.5·leg]`.
-- **Premium** = mirror of the above for shorts.
-- **Sweet spot** = 70.5 % (OTE) — drawn as a dotted mid-line.
-
-Boxes are extended right until price either tags them (entry candidate) or the
-leg is invalidated by a structure shift.
-
-### 3.6 Liquidity & Structure Reads
-
-For each chart bar the script tracks:
-
-- **BSL pools** (clusters of equal/buy-side highs).
-- **SSL pools** (equal/sell-side lows).
-- **Sweep events**: wick breaches an SSL/BSL pool but candle closes back inside.
-- **MSS / BOS** on 5m and 15m via swing-pivot break.
-- **Reclaims**: close back through the AYA Line in the bias direction after a
-  prior break.
-
-These feed into the *confirmation triggers* on the dashboard.
-
-### 3.7 Reclaim & Reversal Logic
-
-If invalidation fires the model becomes defensive. A new bias is **only**
-allowed when *all* of the following occur in sequence on ≤ 15m:
-
-1. Liquidity sweep beyond the prior invalidation level.
-2. MSS in the new direction (close beyond opposing swing).
-3. Reclaim of the AYA Line (or new pivot).
-4. Momentum confirmation: 5m close in new direction with body ≥ 0.6 × range.
-
-Until these happen the dashboard shows `DEFENSIVE — STAND DOWN`.
-
-### 3.8 Market State Classification
-
-Computed each bar from ATR ratios + structure:
-
-| State            | Detection                                                                |
-|------------------|---------------------------------------------------------------------------|
-| **Trending**     | `ATR(14) > 1.2 × ATR(50)` AND consecutive HH/HL (or LH/LL) on 15m         |
-| **Rotational**   | Price oscillating inside prior day range, ATR ratio ≈ 1                  |
-| **Weak momentum**| `ATR(14) < 0.8 × ATR(50)` — script suggests reducing or skipping         |
-
-### 3.9 Risk-Reward Visualisation
-
-When price is inside the active pullback zone, the script draws a translucent
-**risk box** (entry → invalidation) and a **reward box** (entry → TP3). The two
-boxes are sized so the reader instantly verifies the ≥ 1:4 RR rule — if the
-geometry can't satisfy it, the box is hatched and a warning printed.
-
-### 3.10 Dashboard / Output Format
-
-A top-right table mirrors the system's required output schema:
+| Signal               | Bullish  | Bearish |
+|----------------------|----------|---------|
+| aVWAP slope (20-bar) | up       | down    |
+| CVD sign             | positive | negative|
+| close vs POC         | above    | below   |
 
 ```
-┌─────────────────────────────────────────────┐
-│ DAILY BIAS    | BULLISH (HIGH 78)           │
-│ AYA LINE      | 23 415.50                   │
-│ INVALIDATION  | 23 312.20                   │
-│ TP1 / TP2     | 23 518 / 23 622             │
-│ TP3 / EXT     | 23 829 / 24 010             │
-│ STATE         | TRENDING                    │
-│ TRIGGER       | sweep + 5m MSS + reclaim    │
-│ DO-NOT-TRADE  | weak momentum / news        │
-└─────────────────────────────────────────────┘
+bullPts = #signals_for_bull
+bearPts = #signals_for_bear
+bias    =  1  if bullPts >= 2 and bullPts > bearPts
+        = -1  if bearPts >= 2 and bearPts > bullPts
+        =  0  otherwise
+confidence = leader * 33  (0..99)
 ```
 
-Each row maps 1:1 to the user-facing system prompt sections
-(`[ DAILY BIAS ]`, `[ CORE AYA LINE ]`, `[ MODEL TARGETS ]`,
-`[ TRADE PLAN ]`, `[ MARKET STATE ]`, `[ RISK NOTES ]`).
+The bias only **flips on a new 1H bar** to avoid intra-hour noise.
+
+### 3.7 AYA Line (anchor)
+
+Selectable source: anchored session VWAP / volume POC / manual override.
+Drawn as a thick gold line across all timeframes.
+
+### 3.8 Invalidation
+
+`invLevel` is volume-derived — picks one of:
+- **VAL / VAH** (default) — auction value-area edge.
+- **Nearest HVN** in the bias direction.
+- **POC** — point of control.
+
+A 1H candle invalidates *only* if:
+```
+|body| / |range|  ≥  bodyPct  (default 0.6)
+AND  bias == BULL  →  close_1H  <  invLevel
+OR   bias == BEAR  →  close_1H  >  invLevel
+```
+Wicks never invalidate.
+
+### 3.9 Targets
+
+`R = |AYA Line − invLevel|`
+
+| Target | Formula                  | Notes                       |
+|--------|--------------------------|-----------------------------|
+| TP1    | `AYA + dir · 1.0 · R`    | first liquidity sweep       |
+| TP2    | `AYA + dir · 2.0 · R`    | session expansion           |
+| TP3    | `AYA + dir · 4.0 · R`    | minimum asymmetric (1:4)    |
+
+Targets are cancelled on invalidation.
+
+### 3.10 Dashboard
+
+Top-right table mirrors the system schema:
+
+```
+┌──────────────────────────────────────────────┐
+│ VOLUME BIAS     | BULLISH ▲  (66)            │
+│ AYA LINE        | 23 415.50  src: aVWAP       │
+│ POC / VAH / VAL | 23 410 / 23 462 / 23 350    │
+│ CVD             | +12 304 504  ▲              │
+│ INVALIDATION    | 23 350.00  ref: VAL/VAH     │
+│ TP1 / TP2 / TP3 | 23 481 / 23 547 / 23 678    │
+│ HVN LEVELS      | 6 active                    │
+│ S/D ZONES       | demand 3   supply 2         │
+│ DO-NOT-TRADE    | —                           │
+│ PHILOSOPHY      | Volume only · ≥1:4 · 1H inv │
+└──────────────────────────────────────────────┘
+```
 
 ---
 
-## 4. Build Order (what the .pine file does, top-to-bottom)
+## 4. Build Order (script top-to-bottom)
 
-1. `//@version=6` + `indicator()` declaration with `overlay=true`,
-   `max_lines_count=500`, `max_boxes_count=500`, `max_labels_count=500`.
-2. Inputs (groups): *Bias*, *AYA Line*, *Invalidation*, *Targets*,
-   *Pullback*, *Liquidity*, *Style*, *Dashboard*.
-3. HTF data fetch via `request.security` (D, 60, 15).
-4. Core calculations: pivot, ATR(D), 1H EMAs, swing pivots, ATR ratios.
-5. Bias engine → `bias`, `confidence`.
-6. AYA Line resolution (per chosen mode).
-7. Invalidation level + full-body 1H close detector.
-8. Target projection.
-9. Pullback / OTE zone box.
-10. Liquidity pools + sweep detector.
-11. MSS + reclaim detector.
-12. Market state classifier.
-13. Drawing layer — lines, boxes, labels (anti-clutter: redraw on update).
-14. Alerts: `bias_flip`, `invalidation`, `tp_hit`, `pullback_tag`,
-    `sweep_reclaim`.
-15. Dashboard table render.
+1. `//@version=6` + `indicator()` declaration.
+2. Inputs (9 groups, all volume).
+3. Anchored Session VWAP + bands.
+4. Volume Profile (rebuild on last bar).
+5. CVD accumulator.
+6. HVN z-score detector + level array.
+7. Supply / Demand zone detector + box arrays.
+8. AYA Line resolution.
+9. Bias engine (consensus of three signals).
+10. Invalidation engine (1H full-body close vs volume reference).
+11. Target projection.
+12. Drawing layer (lines, boxes, labels — rebuilt last bar).
+13. Dashboard table.
+14. Alert conditions.
 
 ---
 
 ## 5. Guardrails Encoded in the Script
 
-| Guardrail                        | How it is enforced                                       |
-|----------------------------------|-----------------------------------------------------------|
-| Wicks never invalidate           | Full-body % filter (`body ≥ 0.6 × range`) on the 1H close |
-| Minimum 1:4 RR                   | RR box hatched + warning when geometry fails              |
-| No trade in weak momentum        | Dashboard shows `STAND DOWN`, signals suppressed          |
-| No reversal without 4-step seq.  | Reclaim engine gates re-entry                             |
-| Targets die with the bias        | Drawing layer clears TP labels on invalidation            |
-| Single in-flight bias            | State machine — only one of {BULL, BEAR, NEUTRAL}         |
+| Guardrail                            | How                                                |
+|--------------------------------------|-----------------------------------------------------|
+| Wicks never invalidate               | Full-body % filter on 1H close                     |
+| Single in-flight bias                | State machine `{BULL, BEAR, NEUTRAL}`              |
+| Bias only flips on new 1H            | Gated by `ta.change(time("60"))`                   |
+| Min 1:4 RR                           | `rrTP3 ≥ 1.0` enforced (default 4.0)               |
+| Targets die on invalidation          | Cleared in drawing layer                           |
+| Compressed / unbuilt = stand down    | "do-not-trade" row keys on aVWAP std-dev / VP NA   |
 
 ---
 
 ## 6. Roadmap Beyond v1
 
-- v1.1 — session presets (London / NY AM / NY PM) auto-anchor.
-- v1.2 — volume-profile POC / VAH / VAL overlay as confluence.
-- v1.3 — alert-bundle JSON payload for webhook → execution bot.
-- v1.4 — back-test harness via `strategy()` clone with the same logic core.
-- v2.0 — adaptive `R`-multiple targets driven by realised volatility regime.
+- v1.1 — multi-session volume profile (RTH vs ETH split).
+- v1.2 — footprint-style delta divergence detector.
+- v1.3 — webhook payload for execution bot.
+- v1.4 — `strategy()` clone for back-testing same logic core.
+- v2.0 — adaptive R-multiples based on realised-volume regime.
 
 ---
 
 > "Capital preservation creates longevity. Longevity creates opportunity."
+

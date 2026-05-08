@@ -1,355 +1,461 @@
 //@version=6
 // =============================================================================
-// AYA LINE — Institutional Intraday Decision-Support Indicator
+// AYA LINE — VOLUME ENGINE
 // -----------------------------------------------------------------------------
 // "Less is better. Precision over frequency. Protect capital first."
 //
-// Implements the full AYA Line framework documented in ROADMAP.md:
-//   1. Daily directional bias (AYA Arrow)        — 1H + Daily pivot + EMAs
-//   2. Core AYA Line                              — pivot / aVWAP / mid / manual
-//   3. Invalidation level                         — 1H FULL-BODY close only
-//   4. Model targets TP1 / TP2 / TP3 / Extended   — R-multiples + ATR(D)
-//   5. Pullback / OTE entry zone                  — 50–79% premium / discount
-//   6. Liquidity pools + sweep detector           — equal H/L + sweep reclaim
-//   7. MSS / BOS + reclaim engine                 — gates reversal trades
-//   8. Market state classifier                    — trending / rotational / weak
-//   9. Risk-reward geometry box (≥1:4 enforced)
-//  10. Dashboard table mirroring the system prompt schema
+// 100% volume-driven decision support. NO price-only filters
+// (no EMA, no ATR, no daily pivot). Every gate uses one of:
+//
+//   1. Anchored Session VWAP (+ standard-deviation bands)
+//   2. Volume Profile  → POC, VAH, VAL  (rolling lookback)
+//   3. Cumulative Volume Delta (CVD) — orderflow proxy
+//   4. High-Volume Nodes — BigBeluga z-score (Volumatic logic)
+//   5. Supply / Demand zones — last opposing bar before a volume impulse
+//
+// Outputs the full AYA framework: bias, AYA Line, invalidation,
+// TP1/TP2/TP3, RR box, dashboard, alerts.
 // =============================================================================
 
-indicator("AYA Line — Institutional Intraday Model", shorttitle="AYA Line",
+indicator("AYA Line — Volume Engine", shorttitle="AYA Line VOL",
      overlay=true,
      max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
 // ─────────────────────────────────────────────────────────────────────────────
-gBias  = "1 ▸ Bias Engine"
-gLine  = "2 ▸ Core AYA Line"
-gInv   = "3 ▸ Invalidation"
-gTgt   = "4 ▸ Model Targets"
-gPb    = "5 ▸ Pullback / OTE"
-gLiq   = "6 ▸ Liquidity & Structure"
-gState = "7 ▸ Market State"
-gStyle = "8 ▸ Style"
-gDash  = "9 ▸ Dashboard"
+gAnchor = "1 ▸ AYA Line Anchor"
+gVP     = "2 ▸ Volume Profile (POC/VAH/VAL)"
+gCVD    = "3 ▸ Cumulative Volume Delta"
+gHVN    = "4 ▸ HVN Levels (Volumatic z-score)"
+gSD     = "5 ▸ Supply / Demand"
+gInv    = "6 ▸ Invalidation"
+gTgt    = "7 ▸ Targets (R-multiples)"
+gStyle  = "8 ▸ Style"
+gDash   = "9 ▸ Dashboard"
 
-// Bias
-emaFastLen = input.int(20, "1H EMA fast", minval=2,                group=gBias)
-emaSlowLen = input.int(50, "1H EMA slow", minval=3,                group=gBias)
+// — Anchor —
+ayaSrc    = input.string("Session aVWAP", "AYA Line source",
+     options=["Session aVWAP","Volume POC","Manual"], group=gAnchor)
+ayaManual = input.price(0.0, "Manual price (used only if source = Manual)",
+     group=gAnchor, confirm=false)
+anchorTF  = input.timeframe("D", "Anchor reset",
+     options=["D","W","M"],                                        group=gAnchor)
+showVwapBands = input.bool(true, "Show ±1σ aVWAP bands",           group=gAnchor)
 
-// AYA Line
-ayaMode    = input.string("Daily Pivot",  "AYA Line source",
-     options=["Daily Pivot","Anchored VWAP (session)","Prior Day Mid","Manual"],
-     group=gLine)
-ayaManual  = input.price(0.0, "Manual AYA Line price",             group=gLine,
-     confirm=false)
+// — Volume Profile —
+vpLookback = input.int(288, "VP lookback (bars)",
+     minval=20, maxval=500,                                        group=gVP)
+vpBins     = input.int(50,  "VP bins",
+     minval=10, maxval=100,                                        group=gVP)
+vaPercent  = input.float(0.70, "Value Area %",
+     minval=0.5, maxval=0.95, step=0.05,                           group=gVP)
+showVP     = input.bool(true, "Draw POC / VAH / VAL",              group=gVP)
 
-// Invalidation
-invLookback = input.int(12, "1H lookback for invalidation swing",
-     minval=3, maxval=72,                                          group=gInv)
-bodyPct     = input.float(0.6, "Full-body min ratio (body/range)",
+// — CVD —
+deltaMode  = input.string("Body sign × volume", "Delta proxy",
+     options=["Body sign × volume",
+              "Up-tick vs down-tick",
+              "Above-mid vs below-mid"],                            group=gCVD)
+cvdResetTF = input.timeframe("D", "CVD reset",
+     options=["D","W"],                                            group=gCVD)
+
+// — HVN (Volumatic z-score) —
+hvnLevel   = input.float(2.4, "HVN strength (|z|)", step=0.1,      group=gHVN)
+hvnAmount  = input.int(8,  "Max HVN levels",        maxval=20,     group=gHVN)
+hvnZLen    = input.int(200, "z-score window",       minval=50,     group=gHVN)
+
+// — Supply / Demand —
+sdImpulseZ = input.float(1.8, "Impulse |z| threshold", step=0.1,   group=gSD)
+sdMaxZones = input.int(4,  "Max S/D zones drawn",      maxval=8,   group=gSD)
+sdExtend   = input.int(50, "Zone extension (bars)",                group=gSD)
+
+// — Invalidation —
+bodyPct    = input.float(0.6, "1H full-body min ratio",
      minval=0.3, maxval=0.95, step=0.05,                           group=gInv)
+invMode    = input.string("VAL/VAH", "Invalidation reference",
+     options=["VAL/VAH","Nearest HVN","POC"],                       group=gInv)
 
-// Targets
-rrTP1   = input.float(1.0, "TP1 (× R)",      minval=0.25, step=0.25, group=gTgt)
-rrTP2   = input.float(2.0, "TP2 (× R)",      minval=0.5,  step=0.25, group=gTgt)
-rrTP3   = input.float(4.0, "TP3 (× R) min1:4",minval=1.0, step=0.25, group=gTgt)
-rrExt   = input.float(6.0, "Extended (× R)", minval=2.0,  step=0.5,  group=gTgt)
-useATRd = input.bool(true, "Cap Extended at max(R×mult, 1×ATR-D)",
-     group=gTgt)
+// — Targets —
+rrTP1   = input.float(1.0, "TP1 (× R)",       minval=0.25, step=0.25, group=gTgt)
+rrTP2   = input.float(2.0, "TP2 (× R)",       minval=0.5,  step=0.25, group=gTgt)
+rrTP3   = input.float(4.0, "TP3 (× R) ≥1:4", minval=1.0, step=0.25,  group=gTgt)
 
-// Pullback
-pivLen     = input.int(5, "Swing pivot length (15m)", minval=2,    group=gPb)
-fibStart   = input.float(0.50, "Discount/Premium start", step=0.01, group=gPb)
-fibEnd     = input.float(0.79, "Discount/Premium end",   step=0.01, group=gPb)
-fibSweet   = input.float(0.705, "OTE sweet-spot",        step=0.005,group=gPb)
+// — Style —
+colBull = input.color(color.new(#22c55e, 0),  "Bull",          group=gStyle)
+colBear = input.color(color.new(#ef4444, 0),  "Bear",          group=gStyle)
+colNeut = input.color(color.new(#9ca3af, 0),  "Neutral",       group=gStyle)
+colAya  = input.color(color.new(#fbbf24, 0),  "AYA Line",      group=gStyle)
+colVwBnd= input.color(color.new(#fbbf24, 70), "aVWAP bands",   group=gStyle)
+colPOC  = input.color(color.new(#fb7185, 0),  "POC",           group=gStyle)
+colVA   = input.color(color.new(#38bdf8, 0),  "VAH/VAL",       group=gStyle)
+colHVNu = input.color(color.new(#00e677, 30), "HVN bull",      group=gStyle)
+colHVNd = input.color(color.new(#f18a45, 30), "HVN bear",      group=gStyle)
+colDem  = input.color(color.new(#22c55e, 80), "Demand zone",   group=gStyle)
+colSup  = input.color(color.new(#ef4444, 80), "Supply zone",   group=gStyle)
+colInv  = input.color(color.new(#f43f5e, 0),  "Invalidation",  group=gStyle)
+colTP   = input.color(color.new(#a78bfa, 0),  "Targets",       group=gStyle)
 
-// Liquidity / structure
-liqLen     = input.int(20, "Pivot length for liquidity pools", minval=3, group=gLiq)
-sweepTolPx = input.float(0.05, "Equal H/L tolerance (% of ATR)",
-     minval=0.0, maxval=1.0, step=0.05,                            group=gLiq)
-mssLen     = input.int(5, "MSS swing length (chart TF)", minval=2, group=gLiq)
-
-// State
-atrFast = input.int(14, "ATR fast",                                group=gState)
-atrSlow = input.int(50, "ATR slow",                                group=gState)
-trendK  = input.float(1.2, "Trend ATR ratio threshold",            group=gState)
-weakK   = input.float(0.8, "Weak ATR ratio threshold",             group=gState)
-
-// Style
-colBull   = input.color(color.new(#22c55e, 0),  "Bull color",      group=gStyle)
-colBear   = input.color(color.new(#ef4444, 0),  "Bear color",      group=gStyle)
-colNeut   = input.color(color.new(#9ca3af, 0),  "Neutral color",   group=gStyle)
-colAya    = input.color(color.new(#fbbf24, 0),  "AYA Line color",  group=gStyle)
-colInv    = input.color(color.new(#f43f5e, 0),  "Invalidation",    group=gStyle)
-colTP     = input.color(color.new(#38bdf8, 0),  "Targets",         group=gStyle)
-colZone   = input.color(color.new(#a78bfa, 80), "Pullback zone",   group=gStyle)
-colRisk   = input.color(color.new(#ef4444, 80), "Risk box",        group=gStyle)
-colReward = input.color(color.new(#22c55e, 80), "Reward box",      group=gStyle)
-
-// Dashboard
-showDash  = input.bool(true,  "Show dashboard",                    group=gDash)
-dashPos   = input.string("top_right", "Dashboard position",
+// — Dashboard —
+showDash = input.bool(true, "Show dashboard",                       group=gDash)
+dashPos  = input.string("top_right", "Position",
      options=["top_right","top_left","bottom_right","bottom_left","middle_right"],
      group=gDash)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTF DATA
+// 1. ANCHORED SESSION VWAP + STD-DEV BANDS
 // ─────────────────────────────────────────────────────────────────────────────
-// Daily — prior day OHLC + ATR
-[pdH, pdL, pdC, pdO, atrD] = request.security(syminfo.tickerid, "D",
-     [high[1], low[1], close[1], open[1], ta.atr(14)],
-     lookahead=barmerge.lookahead_off)
+isNewAnchor = ta.change(time(anchorTF)) != 0
 
-dailyPivot = (pdH + pdL + pdC) / 3.0
-priorMid   = (pdH + pdL) / 2.0
+var float vwapNum = 0.0
+var float vwapDen = 0.0
+var float vwapSqN = 0.0
+if isNewAnchor
+    vwapNum := 0.0
+    vwapDen := 0.0
+    vwapSqN := 0.0
 
-// 1H — close, EMAs, swings, body geometry
-[h1Close, h1Open, h1High, h1Low,
- emaFast1H, emaSlow1H,
- swingHi1H, swingLo1H] = request.security(syminfo.tickerid, "60",
-     [close, open, high, low,
-      ta.ema(close, emaFastLen), ta.ema(close, emaSlowLen),
-      ta.highest(high, invLookback), ta.lowest(low, invLookback)],
-     lookahead=barmerge.lookahead_off)
+typPx = (high + low + close) / 3.0
+volPx = nz(volume, 1.0)
+vwapNum += typPx * volPx
+vwapDen += volPx
+vwapSqN += typPx * typPx * volPx
 
-// 15m — used for impulse leg detection
-[h15Close, h15High, h15Low] = request.security(syminfo.tickerid, "15",
-     [close, high, low], lookahead=barmerge.lookahead_off)
+aVwap = vwapDen > 0 ? vwapNum / vwapDen : close
+aVar  = vwapDen > 0 ? math.max(0.0, vwapSqN / vwapDen - aVwap * aVwap) : 0.0
+aSig  = math.sqrt(aVar)
+vwapUp = aVwap + aSig
+vwapDn = aVwap - aSig
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. BIAS ENGINE  (AYA Arrow)
+// 2. VOLUME PROFILE  (POC / VAH / VAL)
 // ─────────────────────────────────────────────────────────────────────────────
-emaUp   = emaFast1H > emaSlow1H
-emaDn   = emaFast1H < emaSlow1H
-abovePv = h1Close > dailyPivot
-belowPv = h1Close < dailyPivot
-reclaimUp = h1Close > pdH
-reclaimDn = h1Close < pdL
+hh = ta.highest(high, vpLookback)
+ll = ta.lowest (low , vpLookback)
+binSize = (hh - ll) / vpBins
 
-// confidence scoring (0..100)
-confBull = (abovePv ? 35 : 0) + (emaUp ? 30 : 0) + (reclaimUp ? 25 : 0) +
-           (h1Close > h1Open ? 10 : 0)
-confBear = (belowPv ? 35 : 0) + (emaDn ? 30 : 0) + (reclaimDn ? 25 : 0) +
-           (h1Close < h1Open ? 10 : 0)
+var array<float> vpVol = array.new<float>(vpBins, 0.0)
+float poc = na
+float vah = na
+float val = na
 
-var int   biasState = 0       //  1 bull, -1 bear, 0 neutral
-var int   confScore = 0
-var bool  invalidated = false
+if barstate.islast and binSize > 0
+    array.fill(vpVol, 0.0)
+    for i = 0 to vpLookback - 1
+        bH = high[i]
+        bL = low[i]
+        bV = nz(volume[i], 0.0)
+        if bH > bL and bV > 0
+            sB = math.floor((bL - ll) / binSize)
+            eB = math.floor((bH - ll) / binSize)
+            sB := math.max(0, math.min(vpBins - 1, sB))
+            eB := math.max(0, math.min(vpBins - 1, eB))
+            cnt = eB - sB + 1
+            perBin = bV / cnt
+            for b = sB to eB
+                array.set(vpVol, b, array.get(vpVol, b) + perBin)
 
-rawBias = abovePv and emaUp ? 1 : belowPv and emaDn ? -1 : 0
-rawConf = (rawBias ==  1 ? confBull :
-          rawBias == -1 ? confBear : 0)
+    pocBin = 0
+    maxV   = 0.0
+    for b = 0 to vpBins - 1
+        v = array.get(vpVol, b)
+        if v > maxV
+            maxV   := v
+            pocBin := b
+    poc := ll + (pocBin + 0.5) * binSize
 
-// recompute on a new 1H bar
+    totalV  = array.sum(vpVol)
+    targetV = totalV * vaPercent
+    sumV    = array.get(vpVol, pocBin)
+    upBin   = pocBin
+    dnBin   = pocBin
+    for _it = 0 to vpBins
+        if sumV >= targetV
+            break
+        upV = upBin < vpBins - 1 ? array.get(vpVol, upBin + 1) : -1.0
+        dnV = dnBin > 0          ? array.get(vpVol, dnBin - 1) : -1.0
+        if upV < 0 and dnV < 0
+            break
+        if upV >= dnV
+            upBin += 1
+            sumV  += upV
+        else
+            dnBin -= 1
+            sumV  += dnV
+    vah := ll + (upBin + 1) * binSize
+    val := ll +  dnBin      * binSize
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. CUMULATIVE VOLUME DELTA  (orderflow proxy)
+// ─────────────────────────────────────────────────────────────────────────────
+midPx = (high + low) / 2.0
+deltaSign = (deltaMode == "Body sign × volume" ?
+                  (close > open      ?  1 : close < open      ? -1 : 0) :
+             deltaMode == "Up-tick vs down-tick" ?
+                  (close > close[1]  ?  1 : close < close[1]  ? -1 : 0) :
+                  (close > midPx     ?  1 : close < midPx     ? -1 : 0))
+delta  = deltaSign * volPx
+
+cvdReset = ta.change(time(cvdResetTF)) != 0
+var float cvd = 0.0
+if cvdReset
+    cvd := 0.0
+cvd += delta
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. HVN LEVELS  (BigBeluga Volumatic z-score logic)
+// ─────────────────────────────────────────────────────────────────────────────
+volSigned = close > open ? volume : -volume
+diffPx    = close - open
+
+zVol  = (volSigned - ta.sma(volSigned, hvnZLen)) / ta.stdev(volSigned, hvnZLen)
+zDiff = (diffPx    - ta.sma(diffPx,    hvnZLen)) / ta.stdev(diffPx,    hvnZLen)
+
+isHVNbull = zVol >  hvnLevel and zDiff >  hvnLevel
+isHVNbear = zVol < -hvnLevel and zDiff < -hvnLevel
+
+var array<float> hvnPx  = array.new<float>(0)
+var array<int>   hvnDir = array.new<int>(0)
+
+if isHVNbull
+    array.push(hvnPx,  (open + close) / 2.0)
+    array.push(hvnDir,  1)
+if isHVNbear
+    array.push(hvnPx,  (open + close) / 2.0)
+    array.push(hvnDir, -1)
+while array.size(hvnPx) > hvnAmount
+    array.shift(hvnPx)
+    array.shift(hvnDir)
+
+// nearest HVN above / below current price
+float nearHVNUp = na
+float nearHVNDn = na
+if array.size(hvnPx) > 0
+    for i = 0 to array.size(hvnPx) - 1
+        px = array.get(hvnPx, i)
+        if px > close and (na(nearHVNUp) or px < nearHVNUp)
+            nearHVNUp := px
+        if px < close and (na(nearHVNDn) or px > nearHVNDn)
+            nearHVNDn := px
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. SUPPLY / DEMAND ZONES  (last opposing bar before a volume impulse)
+// ─────────────────────────────────────────────────────────────────────────────
+isImpUp = zVol >  sdImpulseZ and zDiff >  sdImpulseZ
+isImpDn = zVol < -sdImpulseZ and zDiff < -sdImpulseZ
+
+var array<float> demTop = array.new<float>(0)
+var array<float> demBot = array.new<float>(0)
+var array<int>   demBar = array.new<int>(0)
+var array<float> supTop = array.new<float>(0)
+var array<float> supBot = array.new<float>(0)
+var array<int>   supBar = array.new<int>(0)
+
+if isImpUp and close[1] < open[1]
+    array.push(demTop, math.max(open[1], close[1]))
+    array.push(demBot, low[1])
+    array.push(demBar, bar_index - 1)
+if isImpDn and close[1] > open[1]
+    array.push(supTop, high[1])
+    array.push(supBot, math.min(open[1], close[1]))
+    array.push(supBar, bar_index - 1)
+
+while array.size(demTop) > sdMaxZones
+    array.shift(demTop)
+    array.shift(demBot)
+    array.shift(demBar)
+while array.size(supTop) > sdMaxZones
+    array.shift(supTop)
+    array.shift(supBot)
+    array.shift(supBar)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. AYA LINE & VOLUME-BIAS ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+ayaLine = (ayaSrc == "Session aVWAP" ? aVwap :
+          ayaSrc == "Volume POC"     ? nz(poc, aVwap) :
+          ayaManual > 0              ? ayaManual : aVwap)
+
+vwapSlope = aVwap - aVwap[20]
+pocRef    = nz(poc, aVwap)
+
+bullPts = (vwapSlope > 0 ? 1 : 0) +
+          (cvd       > 0 ? 1 : 0) +
+          (close > pocRef ? 1 : 0)
+bearPts = (vwapSlope < 0 ? 1 : 0) +
+          (cvd       < 0 ? 1 : 0) +
+          (close < pocRef ? 1 : 0)
+
+newBias = (bullPts >= 2 and bullPts > bearPts ?  1 :
+          bearPts >= 2 and bearPts > bullPts ? -1 : 0)
+
+var int  biasState   = 0
+var int  confScore   = 0
+var bool invalidated = false
+
 new1H = ta.change(time("60")) != 0
 if new1H
-    biasState := rawBias
-    confScore := rawConf
+    biasState   := newBias
+    confScore   := newBias ==  1 ? bullPts * 33 :
+                   newBias == -1 ? bearPts * 33 : 0
     invalidated := false
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. CORE AYA LINE
+// 7. INVALIDATION  (1H full-body close beyond a volume reference)
 // ─────────────────────────────────────────────────────────────────────────────
-// Anchored VWAP from session start
-var float aVwapNum = 0.0
-var float aVwapDen = 0.0
-isNewSession = ta.change(time("D")) != 0
-if isNewSession
-    aVwapNum := 0.0
-    aVwapDen := 0.0
-typPrice = (high + low + close) / 3.0
-volProxy = nz(volume, 1.0)
-aVwapNum += typPrice * volProxy
-aVwapDen += volProxy
-aVwap = aVwapDen > 0 ? aVwapNum / aVwapDen : close
+float invLevel = na
+if biasState == 1
+    invLevel := (invMode == "VAL/VAH"     ? val :
+                invMode == "Nearest HVN" ? nearHVNDn :
+                                            poc)
+if biasState == -1
+    invLevel := (invMode == "VAL/VAH"     ? vah :
+                invMode == "Nearest HVN" ? nearHVNUp :
+                                            poc)
 
-ayaLine = (ayaMode == "Daily Pivot"            ? dailyPivot :
-          ayaMode == "Anchored VWAP (session)" ? aVwap :
-          ayaMode == "Prior Day Mid"           ? priorMid :
-          ayaManual > 0                        ? ayaManual : dailyPivot)
+[h1C, h1O, h1H, h1L] = request.security(syminfo.tickerid, "60",
+     [close, open, high, low], lookahead=barmerge.lookahead_off)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. INVALIDATION  (1H full-body close only)
-// ─────────────────────────────────────────────────────────────────────────────
-invLevel = (biasState ==  1 ? swingLo1H :
-           biasState == -1 ? swingHi1H : na)
-
-h1Range = h1High - h1Low
-h1Body  = math.abs(h1Close - h1Open)
+h1Range  = h1H - h1L
+h1Body   = math.abs(h1C - h1O)
 fullBody = h1Range > 0 and (h1Body / h1Range) >= bodyPct
 
 invFires = false
 if new1H and not na(invLevel) and fullBody
-    if biasState ==  1 and h1Close < invLevel
+    if biasState ==  1 and h1C < invLevel
         invFires := true
-    if biasState == -1 and h1Close > invLevel
+    if biasState == -1 and h1C > invLevel
         invFires := true
-
 if invFires
     invalidated := true
     biasState   := 0
     confScore   := 0
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. MODEL TARGETS
+// 8. TARGETS  (R-multiples vs invalidation)
 // ─────────────────────────────────────────────────────────────────────────────
-R = na(invLevel) ? na : math.abs(ayaLine - invLevel)
-dir = biasState   //  1 / -1 / 0
+R   = na(invLevel) ? na : math.abs(ayaLine - invLevel)
+dir = biasState
 
-tp1 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP1 * R
-tp2 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP2 * R
-tp3 = na(R) or dir == 0 ? na : ayaLine + dir * rrTP3 * R
-extDist = (na(R) ? na :
-     useATRd ? math.max(rrExt * R, atrD) : rrExt * R)
-tpExt = na(extDist) or dir == 0 ? na : ayaLine + dir * extDist
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. PULLBACK / OTE ZONE  (built from last 15m impulse leg)
-// ─────────────────────────────────────────────────────────────────────────────
-ph15 = ta.pivothigh(h15High, pivLen, pivLen)
-pl15 = ta.pivotlow (h15Low , pivLen, pivLen)
-
-var float legHi = na
-var float legLo = na
-var int   legBar = na
-if not na(ph15)
-    legHi := ph15
-    legBar := bar_index
-if not na(pl15)
-    legLo := pl15
-    legBar := bar_index
-
-float zoneTop   = na
-float zoneBot   = na
-float zoneSweet = na
-if not na(legHi) and not na(legLo)
-    leg = legHi - legLo
-    if dir == 1
-        zoneTop   := legHi - fibStart * leg     // 50% retrace
-        zoneBot   := legHi - fibEnd   * leg     // 79% retrace
-        zoneSweet := legHi - fibSweet * leg     // 70.5% OTE
-    if dir == -1
-        zoneBot   := legLo + fibStart * leg
-        zoneTop   := legLo + fibEnd   * leg
-        zoneSweet := legLo + fibSweet * leg
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. LIQUIDITY POOLS + SWEEPS
-// ─────────────────────────────────────────────────────────────────────────────
-phC = ta.pivothigh(high, liqLen, liqLen)
-plC = ta.pivotlow (low , liqLen, liqLen)
-
-atrCur = ta.atr(atrFast)
-tol    = atrCur * sweepTolPx
-
-var float lastBSL = na
-var float lastSSL = na
-if not na(phC)
-    lastBSL := phC
-if not na(plC)
-    lastSSL := plC
-
-sweepBSL = not na(lastBSL) and high > lastBSL + tol and close < lastBSL
-sweepSSL = not na(lastSSL) and low  < lastSSL - tol and close > lastSSL
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. MSS / BOS + RECLAIM
-// ─────────────────────────────────────────────────────────────────────────────
-phMSS = ta.pivothigh(high, mssLen, mssLen)
-plMSS = ta.pivotlow (low , mssLen, mssLen)
-
-var float lastSwingHi = na
-var float lastSwingLo = na
-if not na(phMSS)
-    lastSwingHi := phMSS
-if not na(plMSS)
-    lastSwingLo := plMSS
-
-mssUp = not na(lastSwingHi) and ta.crossover (close, lastSwingHi)
-mssDn = not na(lastSwingLo) and ta.crossunder(close, lastSwingLo)
-
-// reclaim of AYA Line in bias direction
-reclaimAyaUp = ta.crossover (close, ayaLine)
-reclaimAyaDn = ta.crossunder(close, ayaLine)
-
-// 4-step reversal sequencer (sweep → MSS → reclaim → momentum)
-var int  revStep = 0
-var int  revDir  = 0
-momentumOK = math.abs(close - open) >= bodyPct * (high - low)
-
-if invalidated
-    if revStep == 0 and (sweepBSL or sweepSSL)
-        revStep := 1
-        revDir  := sweepSSL ? 1 : -1
-    else if revStep == 1 and ((revDir == 1 and mssUp) or (revDir == -1 and mssDn))
-        revStep := 2
-    else if revStep == 2 and ((revDir == 1 and reclaimAyaUp) or (revDir == -1 and reclaimAyaDn))
-        revStep := 3
-    else if revStep == 3 and momentumOK
-        revStep := 4
-        biasState   := revDir
-        confScore   := 60   // reversal confidence baseline
-        invalidated := false
-        revStep     := 0
-        revDir      := 0
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. MARKET STATE
-// ─────────────────────────────────────────────────────────────────────────────
-atrFastV = ta.atr(atrFast)
-atrSlowV = ta.atr(atrSlow)
-atrRatio = atrSlowV > 0 ? atrFastV / atrSlowV : 1.0
-
-inPriorRange = close <= pdH and close >= pdL
-mState = (atrRatio >= trendK ? "TRENDING" :
-         atrRatio <= weakK  ? "WEAK MOMENTUM" :
-         inPriorRange       ? "ROTATIONAL" : "MIXED")
+tp1 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP1 * R)
+tp2 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP2 * R)
+tp3 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP3 * R)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. DRAWING LAYER
 // ─────────────────────────────────────────────────────────────────────────────
-// Persistent objects — rebuilt each bar (kept light: a handful of lines/boxes)
 var line  lnAya  = na
 var line  lnInv  = na
+var line  lnPOC  = na
+var line  lnVAH  = na
+var line  lnVAL  = na
 var line  lnTP1  = na
 var line  lnTP2  = na
 var line  lnTP3  = na
-var line  lnExt  = na
-var box   bxZone = na
-var line  lnSweet= na
-var box   bxRisk = na
-var box   bxRew  = na
+var line  lnVwUp = na
+var line  lnVwDn = na
 
-f_killLine(l) =>
+// HVN line + zone collections (rebuilt last bar)
+var array<line> hvnLines = array.new<line>(0)
+var array<box>  demBoxes = array.new<box>(0)
+var array<box>  supBoxes = array.new<box>(0)
+
+f_killLine(line l) =>
     if not na(l)
         line.delete(l)
-f_killBox(b) =>
-    if not na(b)
-        box.delete(b)
+
+f_clearLineArr(array<line> a) =>
+    while array.size(a) > 0
+        line.delete(array.shift(a))
+
+f_clearBoxArr(array<box> a) =>
+    while array.size(a) > 0
+        box.delete(array.shift(a))
 
 if barstate.islast
     f_killLine(lnAya)
     f_killLine(lnInv)
+    f_killLine(lnPOC)
+    f_killLine(lnVAH)
+    f_killLine(lnVAL)
     f_killLine(lnTP1)
     f_killLine(lnTP2)
     f_killLine(lnTP3)
-    f_killLine(lnExt)
-    f_killLine(lnSweet)
-    f_killBox(bxZone)
-    f_killBox(bxRisk)
-    f_killBox(bxRew)
+    f_killLine(lnVwUp)
+    f_killLine(lnVwDn)
+    f_clearLineArr(hvnLines)
+    f_clearBoxArr(demBoxes)
+    f_clearBoxArr(supBoxes)
 
     rightX = bar_index + 30
-    leftX  = bar_index - 250
+    leftX  = bar_index - math.min(bar_index, 250)
 
     // AYA Line
-    lnAya := line.new(leftX, ayaLine, rightX, ayaLine, color=colAya, width=3,
-         extend=extend.right)
-    label.new(rightX, ayaLine, "AYA " + str.tostring(ayaLine, format.mintick),
+    lnAya := line.new(leftX, ayaLine, rightX, ayaLine,
+         color=colAya, width=3, extend=extend.right)
+    label.new(rightX, ayaLine,
+         "AYA " + str.tostring(ayaLine, format.mintick),
          style=label.style_label_left, color=color.new(colAya, 70),
          textcolor=color.white, size=size.small)
+
+    // aVWAP bands
+    if showVwapBands
+        lnVwUp := line.new(leftX, vwapUp, rightX, vwapUp,
+             color=colVwBnd, style=line.style_dotted, extend=extend.right)
+        lnVwDn := line.new(leftX, vwapDn, rightX, vwapDn,
+             color=colVwBnd, style=line.style_dotted, extend=extend.right)
+
+    // Volume Profile lines
+    if showVP
+        if not na(poc)
+            lnPOC := line.new(leftX, poc, rightX, poc,
+                 color=colPOC, width=2, extend=extend.right)
+            label.new(rightX, poc, "POC",
+                 style=label.style_label_left, color=color.new(colPOC, 60),
+                 textcolor=color.white, size=size.tiny)
+        if not na(vah)
+            lnVAH := line.new(leftX, vah, rightX, vah,
+                 color=colVA, style=line.style_dashed, extend=extend.right)
+            label.new(rightX, vah, "VAH",
+                 style=label.style_label_left, color=color.new(colVA, 60),
+                 textcolor=color.white, size=size.tiny)
+        if not na(val)
+            lnVAL := line.new(leftX, val, rightX, val,
+                 color=colVA, style=line.style_dashed, extend=extend.right)
+            label.new(rightX, val, "VAL",
+                 style=label.style_label_left, color=color.new(colVA, 60),
+                 textcolor=color.white, size=size.tiny)
+
+    // HVN levels
+    if array.size(hvnPx) > 0
+        for i = 0 to array.size(hvnPx) - 1
+            px  = array.get(hvnPx,  i)
+            dr  = array.get(hvnDir, i)
+            col = dr == 1 ? colHVNu : colHVNd
+            ln  = line.new(rightX - 200, px, rightX, px,
+                 color=col, width=1, style=line.style_solid,
+                 extend=extend.right)
+            array.push(hvnLines, ln)
+
+    // Demand zones
+    if array.size(demTop) > 0
+        for i = 0 to array.size(demTop) - 1
+            t = array.get(demTop, i)
+            b = array.get(demBot, i)
+            x = array.get(demBar, i)
+            bx = box.new(x, t, x + sdExtend, b,
+                 border_color=color.new(colBull, 40), bgcolor=colDem)
+            array.push(demBoxes, bx)
+
+    // Supply zones
+    if array.size(supTop) > 0
+        for i = 0 to array.size(supTop) - 1
+            t = array.get(supTop, i)
+            b = array.get(supBot, i)
+            x = array.get(supBar, i)
+            bx = box.new(x, t, x + sdExtend, b,
+                 border_color=color.new(colBear, 40), bgcolor=colSup)
+            array.push(supBoxes, bx)
 
     // Invalidation
     if not na(invLevel) and dir != 0
@@ -363,72 +469,34 @@ if barstate.islast
 
     // Targets
     if not na(tp1)
-        lnTP1 := line.new(leftX, tp1, rightX, tp1, color=colTP, width=1,
-             extend=extend.right)
-        label.new(rightX, tp1, "TP1", style=label.style_label_left,
-             color=color.new(colTP, 60), textcolor=color.white, size=size.tiny)
+        lnTP1 := line.new(leftX, tp1, rightX, tp1, color=colTP,
+             style=line.style_dotted, extend=extend.right)
+        label.new(rightX, tp1, "TP1",
+             style=label.style_label_left, color=color.new(colTP, 70),
+             textcolor=color.white, size=size.tiny)
     if not na(tp2)
-        lnTP2 := line.new(leftX, tp2, rightX, tp2, color=colTP, width=1,
-             extend=extend.right)
-        label.new(rightX, tp2, "TP2", style=label.style_label_left,
-             color=color.new(colTP, 60), textcolor=color.white, size=size.tiny)
+        lnTP2 := line.new(leftX, tp2, rightX, tp2, color=colTP,
+             style=line.style_dotted, extend=extend.right)
+        label.new(rightX, tp2, "TP2",
+             style=label.style_label_left, color=color.new(colTP, 70),
+             textcolor=color.white, size=size.tiny)
     if not na(tp3)
         lnTP3 := line.new(leftX, tp3, rightX, tp3, color=colTP, width=2,
              extend=extend.right)
         label.new(rightX, tp3, "TP3 (1:4)",
-             style=label.style_label_left, color=color.new(colTP, 40),
-             textcolor=color.white, size=size.small)
-    if not na(tpExt)
-        lnExt := line.new(leftX, tpExt, rightX, tpExt, color=colTP,
-             style=line.style_dotted, width=1, extend=extend.right)
-        label.new(rightX, tpExt, "EXT", style=label.style_label_left,
-             color=color.new(colTP, 60), textcolor=color.white, size=size.tiny)
-
-    // Pullback zone
-    if not na(zoneTop) and not na(zoneBot) and dir != 0
-        bxZone := box.new(bar_index - 30, zoneTop, rightX, zoneBot,
-             border_color=color.new(colZone, 40), bgcolor=colZone)
-        if not na(zoneSweet)
-            lnSweet := line.new(bar_index - 30, zoneSweet, rightX, zoneSweet,
-                 color=color.new(colZone, 0), style=line.style_dotted,
-                 extend=extend.right)
-            label.new(rightX, zoneSweet, "OTE 70.5%",
-                 style=label.style_label_left,
-                 color=color.new(colZone, 30), textcolor=color.white,
-                 size=size.tiny)
-
-    // Risk / Reward boxes (entry assumed = sweet-spot)
-    if not na(zoneSweet) and not na(invLevel) and not na(tp3) and dir != 0
-        rDist = math.abs(zoneSweet - invLevel)
-        wDist = math.abs(tp3 - zoneSweet)
-        rrOK  = wDist >= 4.0 * rDist
-        bxRisk := box.new(bar_index, zoneSweet, rightX, invLevel,
-             border_color=color.new(colInv, 40), bgcolor=colRisk)
-        bxRew  := box.new(bar_index, zoneSweet, rightX, tp3,
-             border_color=color.new(colTP, 40),
-             bgcolor=rrOK ? colReward : color.new(color.orange, 80))
-        label.new(rightX, (zoneSweet + tp3) / 2.0,
-             rrOK ? "RR ≥ 1:4 ✓" : "RR < 1:4 — SKIP",
-             style=label.style_label_left,
-             color=rrOK ? color.new(colBull, 40) : color.new(color.orange, 30),
+             style=label.style_label_left, color=color.new(colTP, 50),
              textcolor=color.white, size=size.small)
 
-// Mark invalidation candle
-bgcolor(invFires ? color.new(colInv, 70) : na, title="Invalidation flash")
-
-// Sweep markers
-plotshape(sweepBSL, title="BSL sweep",  style=shape.triangledown,
-     location=location.abovebar, color=colBear, size=size.tiny)
-plotshape(sweepSSL, title="SSL sweep",  style=shape.triangleup,
-     location=location.belowbar, color=colBull, size=size.tiny)
-
-// MSS markers
-plotshape(mssUp, title="MSS up",   style=shape.labelup,
-     location=location.belowbar, color=color.new(colBull, 60),
-     text="MSS", textcolor=color.white, size=size.tiny)
-plotshape(mssDn, title="MSS down", style=shape.labeldown,
-     location=location.abovebar, color=color.new(colBear, 60),
-     text="MSS", textcolor=color.white, size=size.tiny)
+// Bar markers
+plotshape(invFires,    title="Invalidation",
+     style=shape.xcross, location=location.abovebar,
+     color=colInv, size=size.small)
+plotshape(isHVNbull,   title="HVN bull",
+     style=shape.triangleup, location=location.belowbar,
+     color=colHVNu, size=size.tiny)
+plotshape(isHVNbear,   title="HVN bear",
+     style=shape.triangledown, location=location.abovebar,
+     color=colHVNd, size=size.tiny)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 10. DASHBOARD
@@ -439,96 +507,98 @@ posMap(s) =>
     s == "bottom_left"  ? position.bottom_left :
     s == "middle_right" ? position.middle_right : position.top_right)
 
-var table dash = table.new(posMap(dashPos), 2, 9,
+var table dash = table.new(posMap(dashPos), 2, 10,
      border_width=1, frame_color=color.new(color.gray, 50),
      border_color=color.new(color.gray, 70))
 
-biasTxt = (invalidated ? "DEFENSIVE — STAND DOWN" :
-          biasState ==  1 ? "BULLISH ▲" :
-          biasState == -1 ? "BEARISH ▼" : "NEUTRAL ◇")
-biasBg  = (invalidated ? color.new(color.orange, 50) :
-          biasState ==  1 ? color.new(colBull, 60) :
-          biasState == -1 ? color.new(colBear, 60) :
-                            color.new(colNeut, 60))
+biasTxt = (invalidated         ? "DEFENSIVE — STAND DOWN" :
+          biasState ==  1     ? "BULLISH ▲" :
+          biasState == -1     ? "BEARISH ▼" : "NEUTRAL ◇")
+biasBg  = (invalidated         ? color.new(color.orange, 50) :
+          biasState ==  1     ? color.new(colBull, 60) :
+          biasState == -1     ? color.new(colBear, 60) :
+                                color.new(colNeut, 60))
 
-trigTxt = (revStep == 0 ? "—" :
-          revStep == 1 ? "1/4 sweep ✓" :
-          revStep == 2 ? "2/4 sweep + MSS ✓" :
-          revStep == 3 ? "3/4 sweep + MSS + reclaim ✓" : "ARMED")
+cvdTxt  = str.tostring(cvd, format.volume) +
+          (cvd > 0 ? "  ▲" : cvd < 0 ? "  ▼" : "  ◇")
+cvdBg   = (cvd > 0 ? color.new(colBull, 70) :
+          cvd < 0 ? color.new(colBear, 70) : color.new(colNeut, 70))
 
-dntTxt = (mState == "WEAK MOMENTUM" ? "weak ATR — stand down" :
-         invalidated                ? "wait reclaim sequence" :
-         dir == 0                   ? "no bias — observe" : "—")
+dntTxt = (invalidated                                ? "wait reclaim sequence" :
+         na(poc)                                    ? "VP not built — observe" :
+         math.abs(close - aVwap) < aSig * 0.25      ? "compressed — wait expansion" :
+         dir == 0                                   ? "no consensus — stand down" :
+                                                       "—")
 
 f_cell(int r, int c, string txt, color bg, color tc) =>
     table.cell(dash, c, r, txt, bgcolor=bg, text_color=tc, text_size=size.small)
 
 if showDash and barstate.islast
-    table.clear(dash, 0, 0, 1, 8)
-    f_cell(0, 0, "DAILY BIAS",   color.new(color.black, 30), color.white)
+    table.clear(dash, 0, 0, 1, 9)
+
+    f_cell(0, 0, "VOLUME BIAS",  color.new(color.black, 30), color.white)
     f_cell(0, 1, biasTxt + "  (" + str.tostring(confScore) + ")",
          biasBg, color.white)
 
     f_cell(1, 0, "AYA LINE",     color.new(color.black, 30), color.white)
-    f_cell(1, 1, str.tostring(ayaLine, format.mintick),
+    f_cell(1, 1, str.tostring(ayaLine, format.mintick) + "   src: " + ayaSrc,
          color.new(colAya, 60), color.white)
 
-    f_cell(2, 0, "INVALIDATION", color.new(color.black, 30), color.white)
-    f_cell(2, 1, na(invLevel) ? "—" : str.tostring(invLevel, format.mintick),
+    f_cell(2, 0, "POC / VAH / VAL", color.new(color.black, 30), color.white)
+    f_cell(2, 1,
+         (na(poc)? "—" : str.tostring(poc, format.mintick)) + "  /  " +
+         (na(vah)? "—" : str.tostring(vah, format.mintick)) + "  /  " +
+         (na(val)? "—" : str.tostring(val, format.mintick)),
+         color.new(colPOC, 70), color.white)
+
+    f_cell(3, 0, "CVD",          color.new(color.black, 30), color.white)
+    f_cell(3, 1, cvdTxt, cvdBg, color.white)
+
+    f_cell(4, 0, "INVALIDATION", color.new(color.black, 30), color.white)
+    f_cell(4, 1, na(invLevel) ? "—" :
+         str.tostring(invLevel, format.mintick) + "   ref: " + invMode,
          color.new(colInv, 60), color.white)
 
-    f_cell(3, 0, "TP1 / TP2",    color.new(color.black, 30), color.white)
-    f_cell(3, 1,
-         (na(tp1) ? "—" : str.tostring(tp1, format.mintick)) + "  /  " +
-         (na(tp2) ? "—" : str.tostring(tp2, format.mintick)),
+    f_cell(5, 0, "TP1 / TP2 / TP3", color.new(color.black, 30), color.white)
+    f_cell(5, 1,
+         (na(tp1)? "—" : str.tostring(tp1, format.mintick)) + "  /  " +
+         (na(tp2)? "—" : str.tostring(tp2, format.mintick)) + "  /  " +
+         (na(tp3)? "—" : str.tostring(tp3, format.mintick)),
          color.new(colTP, 70), color.white)
 
-    f_cell(4, 0, "TP3 / EXT",    color.new(color.black, 30), color.white)
-    f_cell(4, 1,
-         (na(tp3)  ? "—" : str.tostring(tp3,  format.mintick)) + "  /  " +
-         (na(tpExt)? "—" : str.tostring(tpExt,format.mintick)),
-         color.new(colTP, 60), color.white)
+    f_cell(6, 0, "HVN LEVELS",   color.new(color.black, 30), color.white)
+    f_cell(6, 1, str.tostring(array.size(hvnPx)) + " active",
+         color.new(colHVNu, 70), color.white)
 
-    f_cell(5, 0, "STATE",        color.new(color.black, 30), color.white)
-    stateBg = (mState == "TRENDING"      ? color.new(colBull,  70) :
-              mState == "WEAK MOMENTUM" ? color.new(color.orange, 60) :
-              mState == "ROTATIONAL"    ? color.new(colNeut,  70) :
-                                          color.new(color.gray, 60))
-    f_cell(5, 1, mState + "  (ATR×" + str.tostring(atrRatio, "#.##") + ")",
-         stateBg, color.white)
+    f_cell(7, 0, "S/D ZONES",    color.new(color.black, 30), color.white)
+    f_cell(7, 1, "demand " + str.tostring(array.size(demTop)) +
+                 "   supply " + str.tostring(array.size(supTop)),
+         color.new(color.purple, 60), color.white)
 
-    f_cell(6, 0, "TRIGGER",      color.new(color.black, 30), color.white)
-    f_cell(6, 1, trigTxt, color.new(color.purple, 60), color.white)
-
-    f_cell(7, 0, "DO-NOT-TRADE", color.new(color.black, 30), color.white)
-    f_cell(7, 1, dntTxt,
+    f_cell(8, 0, "DO-NOT-TRADE", color.new(color.black, 30), color.white)
+    f_cell(8, 1, dntTxt,
          dntTxt == "—" ? color.new(colBull, 70) : color.new(color.orange, 50),
          color.white)
 
-    f_cell(8, 0, "PHILOSOPHY",   color.new(color.black, 30), color.white)
-    f_cell(8, 1, "Capital first · ≥1:4 RR · 1H invalidation",
+    f_cell(9, 0, "PHILOSOPHY",   color.new(color.black, 30), color.white)
+    f_cell(9, 1, "Volume only · ≥1:4 RR · 1H invalidation",
          color.new(color.black, 60), color.silver)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 11. ALERTS
 // ─────────────────────────────────────────────────────────────────────────────
 biasFlipped = ta.change(biasState) != 0
-alertcondition(biasFlipped,        title="AYA: Bias flip",
-     message="AYA Line bias flipped — re-evaluate plan.")
-alertcondition(invFires,           title="AYA: Invalidation",
-     message="AYA Line INVALIDATED on 1H full-body close.")
-alertcondition(sweepBSL or sweepSSL,title="AYA: Liquidity sweep",
-     message="Liquidity sweep detected — watch for reclaim.")
-alertcondition(mssUp or mssDn,     title="AYA: Market structure shift",
-     message="MSS detected on chart timeframe.")
-alertcondition(not na(zoneSweet) and ta.cross(close, zoneSweet),
-     title="AYA: Pullback tag (OTE)",
-     message="Price tagged the AYA OTE sweet-spot.")
+alertcondition(biasFlipped, title="AYA-VOL: Bias flip",
+     message="Volume-bias flipped — re-evaluate plan.")
+alertcondition(invFires,    title="AYA-VOL: Invalidation",
+     message="1H full-body close beyond volume reference — INVALIDATED.")
+alertcondition(isHVNbull or isHVNbear, title="AYA-VOL: HVN printed",
+     message="High-volume node printed — new S/R level active.")
+alertcondition(isImpUp or isImpDn, title="AYA-VOL: Volume impulse",
+     message="Volume impulse detected — fresh S/D zone marked.")
 alertcondition(not na(tp1) and ta.cross(close, tp1),
-     title="AYA: TP1 hit", message="AYA TP1 reached.")
+     title="AYA-VOL: TP1 hit", message="TP1 reached.")
 alertcondition(not na(tp2) and ta.cross(close, tp2),
-     title="AYA: TP2 hit", message="AYA TP2 reached.")
+     title="AYA-VOL: TP2 hit", message="TP2 reached.")
 alertcondition(not na(tp3) and ta.cross(close, tp3),
-     title="AYA: TP3 hit (1:4)", message="AYA TP3 reached — minimum asymmetric objective.")
-alertcondition(not na(tpExt) and ta.cross(close, tpExt),
-     title="AYA: Extended target hit", message="AYA Extended target reached.")
+     title="AYA-VOL: TP3 hit (1:4)", message="TP3 reached — minimum asymmetric objective.")
