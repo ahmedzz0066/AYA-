@@ -250,19 +250,21 @@ if not na(plow)
 float bslLevel = na
 float sslLevel = na
 
-// Scan newest-first for closest equal-high pair
+// Scan newest-first (positive step, reverse index) for closest equal-high pair
 if array.size(swingHs) >= 2
-    for i = array.size(swingHs) - 1 to 1 by -1
-        h1 = array.get(swingHs, i)
-        h2 = array.get(swingHs, i - 1)
+    szH = array.size(swingHs)
+    for i = 0 to szH - 2
+        h1 = array.get(swingHs, szH - 1 - i)
+        h2 = array.get(swingHs, szH - 2 - i)
         if math.abs(h1 - h2) <= eqTolPx
             bslLevel := (h1 + h2) / 2.0
             break
 
 if array.size(swingLs) >= 2
-    for i = array.size(swingLs) - 1 to 1 by -1
-        l1 = array.get(swingLs, i)
-        l2 = array.get(swingLs, i - 1)
+    szL = array.size(swingLs)
+    for i = 0 to szL - 2
+        l1 = array.get(swingLs, szL - 1 - i)
+        l2 = array.get(swingLs, szL - 2 - i)
         if math.abs(l1 - l2) <= eqTolPx
             sslLevel := (l1 + l2) / 2.0
             break
