@@ -1,54 +1,62 @@
-# AYA Line — Volume Engine
+# AYA Line — #MoModel Institutional Engine
 
-Institutional-style intraday decision-support model — **100 % volume-driven**.
+> "Statistical Expansion + Institutional Participation  
+>  + Auction Acceptance + Liquidity Targeting"
 
-> "Less is better. Precision over frequency. Protect capital first."
+## What this is
+
+An institutional-grade intraday decision-support indicator built on a single
+mathematical foundation: **BigBeluga's Volumatic z-score**.
+
+Nothing else is used as an entry filter. No EMAs, no RSI, no ATR-bias,
+no arbitrary fibs. Only statistically abnormal order flow events that pass
+three additional confirmation gates.
 
 ## Files
 
-| File                | Purpose                                                                                |
-|---------------------|----------------------------------------------------------------------------------------|
-| `ROADMAP.md`        | Volume-engine roadmap, logic, build order                                              |
-| `AYA_Line.pine`     | Pine Script **v6** — the volume engine (aVWAP, VP, CVD, HVN, S/D, bias, TPs)           |
-| `Volumatic_SR.pine` | Pine Script **v5** — BigBeluga's *Volumatic S/R Levels* (companion confluence layer)   |
+| File                | Purpose                                                                  |
+|---------------------|--------------------------------------------------------------------------|
+| `AYA_Line.pine`     | Pine Script **v6** — the full #MoModel pipeline                          |
+| `Volumatic_SR.pine` | Pine Script **v5** — BigBeluga's original indicator (MPL-2.0)            |
+| `ROADMAP.md`        | Full mathematical framework, design decisions, and build order           |
 
-## Inputs (volume only)
+## The 6-Step Pipeline
 
-1. **Anchored Session VWAP** + ±1σ bands.
-2. **Volume Profile** — POC, VAH, VAL over a rolling lookback.
-3. **Cumulative Volume Delta** (CVD) — three selectable proxies, session-reset.
-4. **HVN Levels** — BigBeluga z-score detector (signed-volume × body z).
-5. **Supply / Demand Zones** — last opposing bar before a volume impulse.
+```
+Step 1 — Statistical Expansion   z_diff × z_vol (BigBeluga z-score)
+Step 2 — Structure Shift (BOS)   close > prior pivot high / low
+Step 3 — Acceptance Test         price holds above/below origin ≤ N bars
+Step 4 — Momentum Quality Score  0–100 (expansion + volume + range rank)
+Step 5 — Liquidity Targets       BSL/SSL equal H/L · PDH/PDL · FVG voids
+Step 6 — Invalidation            full-body close back through origin
+```
 
-No EMAs, no ATR, no daily pivots. Every gate in the model is built from
-the order book.
+Only origins that pass ALL gates are drawn as **MOLiNE** (Bus Origin) levels.
+
+## What it draws
+
+- **MOLiNE** — active Bus Origin levels, colored by acceptance / invalidation.
+- **Volume box** — BigBeluga-style volume annotation at the origin candle.
+- **Quality badge** — score label (✓ valid / ✗ invalidated) on each MOLiNE.
+- **BOS markers** — triangle on every structural break.
+- **Origin Accepted** — flag when all gates pass.
+- **BSL / SSL** — equal-high / equal-low liquidity pools.
+- **PDH / PDL** — prior day high and low.
+- **FVG boxes** — fair value gaps (unfilled price imbalances).
+- **Dashboard** — 10-row table: state · origin · quality · z-scores · liquidity.
 
 ## Quick start (TradingView)
 
 1. Open TradingView → Pine Editor.
 2. Paste the contents of `AYA_Line.pine`.
 3. Save → "Add to chart".
-4. Recommended chart timeframe: **5m** or **15m**. The script pulls 1H
-   internally via `request.security` for invalidation control.
+4. Recommended timeframe: **5m** or **15m**.
 
-## What it draws
+## Companion: Volumatic S/R Levels
 
-- **AYA Line** — anchored session VWAP / volume POC / manual override.
-- **aVWAP ±1σ bands** — fair-value envelope.
-- **POC / VAH / VAL** — auction value-area edges from the rolling profile.
-- **HVN levels** — bull (green) / bear (orange) horizontal lines.
-- **Supply / demand boxes** — last opposing bar before a volume impulse.
-- **Invalidation** — dashed line at VAL/VAH (or HVN/POC); only a 1H
-  *full-body* close beyond it triggers.
-- **TP1 / TP2 / TP3** — R-multiple targets; TP3 enforces ≥ 1:4 RR.
-- **Dashboard** — bias + score, AYA, POC/VAH/VAL, CVD, invalidation, TPs,
-  HVN count, S/D zone count, do-not-trade reason.
+`Volumatic_SR.pine` is BigBeluga's full standalone indicator. The z-score
+logic inside it is the mathematical foundation of `AYA_Line.pine`. Run it
+alongside to see the full BigBeluga visual (percent labels, volume boxes,
+max/min table) as a cross-reference for the MOLiNE levels.
 
-## Pairing with Volumatic S/R Levels
-
-`Volumatic_SR.pine` is BigBeluga's open-source v5 indicator (MPL-2.0). The
-HVN logic from it is already replicated inside `AYA_Line.pine`; the
-standalone version is kept for users who want the full BigBeluga visual
-(boxes, percent labels, max/min table). Layer either or both.
-
-See `ROADMAP.md` for the full logical specification.
+See `ROADMAP.md` for the complete mathematical specification.

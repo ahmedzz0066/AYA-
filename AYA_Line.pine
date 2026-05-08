@@ -1,604 +1,551 @@
 //@version=6
 // =============================================================================
-// AYA LINE — VOLUME ENGINE
-// -----------------------------------------------------------------------------
-// "Less is better. Precision over frequency. Protect capital first."
+// AYA LINE — #MoModel INSTITUTIONAL ENGINE
+// =============================================================================
+// "Statistical Expansion + Institutional Participation
+//  + Auction Acceptance + Liquidity Targeting"
 //
-// 100% volume-driven decision support. NO price-only filters
-// (no EMA, no ATR, no daily pivot). Every gate uses one of:
+// Foundation: BigBeluga Volumatic z-score (MPL-2.0, © BigBeluga)
+// Architecture: #MoModel (© AYA)
 //
-//   1. Anchored Session VWAP (+ standard-deviation bands)
-//   2. Volume Profile  → POC, VAH, VAL  (rolling lookback)
-//   3. Cumulative Volume Delta (CVD) — orderflow proxy
-//   4. High-Volume Nodes — BigBeluga z-score (Volumatic logic)
-//   5. Supply / Demand zones — last opposing bar before a volume impulse
+// MATHEMATICAL PIPELINE
+//   Step 1 — Statistical Expansion   zDiff × zVol  (BigBeluga z-score only)
+//   Step 2 — Structure Shift (BOS)   close > prior swing H (bull) / L (bear)
+//   Step 3 — Acceptance Test         price holds above/below origin ≤ N bars
+//   Step 4 — Momentum Quality Score  expansion rank + volume rank + range rank
+//   Step 5 — Liquidity Targets       BSL/SSL equal H/L · PDH/PDL · FVG voids
+//   Step 6 — Invalidation            close back through origin (full-body gate)
 //
-// Outputs the full AYA framework: bias, AYA Line, invalidation,
-// TP1/TP2/TP3, RR box, dashboard, alerts.
+// WHAT THIS IS NOT
+//   ✗ EMA crossovers    ✗ RSI   ✗ ATR bands   ✗ Fibonacci
+//   ✗ Random S/R lines  ✗ Lagging oscillators
+//
+// WHAT THE EDGE IS
+//   Where inventory was acquired (Bus Origin)
+//   Whether the auction accepted that price (Acceptance)
+//   Where liquidity likely exists next (BSL/SSL/FVG/PDH/PDL)
 // =============================================================================
 
-indicator("AYA Line — Volume Engine", shorttitle="AYA Line VOL",
-     overlay=true,
-     max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+indicator("AYA Line — #MoModel Engine", shorttitle="AYA #MoModel",
+     overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
 // ─────────────────────────────────────────────────────────────────────────────
-gAnchor = "1 ▸ AYA Line Anchor"
-gVP     = "2 ▸ Volume Profile (POC/VAH/VAL)"
-gCVD    = "3 ▸ Cumulative Volume Delta"
-gHVN    = "4 ▸ HVN Levels (Volumatic z-score)"
-gSD     = "5 ▸ Supply / Demand"
-gInv    = "6 ▸ Invalidation"
-gTgt    = "7 ▸ Targets (R-multiples)"
-gStyle  = "8 ▸ Style"
-gDash   = "9 ▸ Dashboard"
+gZ     = "1 ▸ Statistical Expansion  (BigBeluga z-score)"
+gBOS   = "2 ▸ Structure Shift  — Gate 1"
+gAcc   = "3 ▸ Acceptance       — Gate 2"
+gQ     = "4 ▸ Momentum Quality"
+gTgt   = "5 ▸ Liquidity Targets"
+gInv   = "6 ▸ Invalidation"
+gStyle = "7 ▸ Style"
+gDash  = "8 ▸ Dashboard"
 
-// — Anchor —
-ayaSrc    = input.string("Session aVWAP", "AYA Line source",
-     options=["Session aVWAP","Volume POC","Manual"], group=gAnchor)
-ayaManual = input.price(0.0, "Manual price (used only if source = Manual)",
-     group=gAnchor, confirm=false)
-anchorTF  = input.timeframe("D", "Anchor reset",
-     options=["D","W","M"],                                        group=gAnchor)
-showVwapBands = input.bool(true, "Show ±1σ aVWAP bands",           group=gAnchor)
+// — z-score (BigBeluga parameters) —
+zLen   = input.int  (200,   "Z-score window",              minval=50,          group=gZ)
+zLevel = input.float(2.4,   "Expansion threshold |z|",     step=0.1,           group=gZ)
+zMax   = input.int  (10,    "Max stored Bus Origins",       maxval=20,          group=gZ)
 
-// — Volume Profile —
-vpLookback = input.int(288, "VP lookback (bars)",
-     minval=20, maxval=500,                                        group=gVP)
-vpBins     = input.int(50,  "VP bins",
-     minval=10, maxval=100,                                        group=gVP)
-vaPercent  = input.float(0.70, "Value Area %",
-     minval=0.5, maxval=0.95, step=0.05,                           group=gVP)
-showVP     = input.bool(true, "Draw POC / VAH / VAL",              group=gVP)
+// — Structure —
+pivLen = input.int  (5,     "Swing pivot length",           minval=2,           group=gBOS)
 
-// — CVD —
-deltaMode  = input.string("Body sign × volume", "Delta proxy",
-     options=["Body sign × volume",
-              "Up-tick vs down-tick",
-              "Above-mid vs below-mid"],                            group=gCVD)
-cvdResetTF = input.timeframe("D", "CVD reset",
-     options=["D","W"],                                            group=gCVD)
+// — Acceptance —
+accWin = input.int  (5,     "Acceptance window (bars)",     minval=1,           group=gAcc)
 
-// — HVN (Volumatic z-score) —
-hvnLevel   = input.float(2.4, "HVN strength (|z|)", step=0.1,      group=gHVN)
-hvnAmount  = input.int(8,  "Max HVN levels",        maxval=20,     group=gHVN)
-hvnZLen    = input.int(200, "z-score window",       minval=50,     group=gHVN)
+// — Quality —
+qualMin = input.int (40,    "Min quality to store origin",
+     minval=0, maxval=100,                                                      group=gQ)
 
-// — Supply / Demand —
-sdImpulseZ = input.float(1.8, "Impulse |z| threshold", step=0.1,   group=gSD)
-sdMaxZones = input.int(4,  "Max S/D zones drawn",      maxval=8,   group=gSD)
-sdExtend   = input.int(50, "Zone extension (bars)",                group=gSD)
+// — Liquidity targets —
+eqTolPct = input.float(0.10,"Equal H/L tolerance (%)",     step=0.01,          group=gTgt)
+showEQ   = input.bool (true, "Show BSL / SSL (equal H/L)",                     group=gTgt)
+showFVG  = input.bool (true, "Show Fair Value Gaps",                            group=gTgt)
+showPD   = input.bool (true, "Show Prior Day H/L",                              group=gTgt)
+fvgMax   = input.int  (3,   "Max FVG zones",                maxval=8,           group=gTgt)
 
 // — Invalidation —
-bodyPct    = input.float(0.6, "1H full-body min ratio",
-     minval=0.3, maxval=0.95, step=0.05,                           group=gInv)
-invMode    = input.string("VAL/VAH", "Invalidation reference",
-     options=["VAL/VAH","Nearest HVN","POC"],                       group=gInv)
-
-// — Targets —
-rrTP1   = input.float(1.0, "TP1 (× R)",       minval=0.25, step=0.25, group=gTgt)
-rrTP2   = input.float(2.0, "TP2 (× R)",       minval=0.5,  step=0.25, group=gTgt)
-rrTP3   = input.float(4.0, "TP3 (× R) ≥1:4", minval=1.0, step=0.25,  group=gTgt)
+invBody = input.float(0.5,  "Full-body min ratio",
+     minval=0.3, maxval=0.95, step=0.05,                                        group=gInv)
 
 // — Style —
-colBull = input.color(color.new(#22c55e, 0),  "Bull",          group=gStyle)
-colBear = input.color(color.new(#ef4444, 0),  "Bear",          group=gStyle)
-colNeut = input.color(color.new(#9ca3af, 0),  "Neutral",       group=gStyle)
-colAya  = input.color(color.new(#fbbf24, 0),  "AYA Line",      group=gStyle)
-colVwBnd= input.color(color.new(#fbbf24, 70), "aVWAP bands",   group=gStyle)
-colPOC  = input.color(color.new(#fb7185, 0),  "POC",           group=gStyle)
-colVA   = input.color(color.new(#38bdf8, 0),  "VAH/VAL",       group=gStyle)
-colHVNu = input.color(color.new(#00e677, 30), "HVN bull",      group=gStyle)
-colHVNd = input.color(color.new(#f18a45, 30), "HVN bear",      group=gStyle)
-colDem  = input.color(color.new(#22c55e, 80), "Demand zone",   group=gStyle)
-colSup  = input.color(color.new(#ef4444, 80), "Supply zone",   group=gStyle)
-colInv  = input.color(color.new(#f43f5e, 0),  "Invalidation",  group=gStyle)
-colTP   = input.color(color.new(#a78bfa, 0),  "Targets",       group=gStyle)
+colBull  = input.color(color.new(#00e677, 0),  "Bull expansion",  group=gStyle)
+colBear  = input.color(color.new(#f18a45, 0),  "Bear expansion",  group=gStyle)
+colMOL   = input.color(color.new(#008cff, 0),  "MOLiNE",          group=gStyle)
+colBSL   = input.color(color.new(#38bdf8, 0),  "BSL",             group=gStyle)
+colSSL   = input.color(color.new(#fb7185, 0),  "SSL",             group=gStyle)
+colFVG   = input.color(color.new(#a78bfa, 80), "FVG",             group=gStyle)
+colPDH   = input.color(color.new(#fbbf24, 0),  "PDH",             group=gStyle)
+colPDL   = input.color(color.new(#fbbf24, 0),  "PDL",             group=gStyle)
+colInv   = input.color(color.new(#f43f5e, 0),  "Invalidation",    group=gStyle)
+colNeu   = input.color(color.new(color.gray,0), "Neutral",         group=gStyle)
 
 // — Dashboard —
-showDash = input.bool(true, "Show dashboard",                       group=gDash)
+showDash = input.bool  (true,        "Show dashboard",              group=gDash)
 dashPos  = input.string("top_right", "Position",
-     options=["top_right","top_left","bottom_right","bottom_left","middle_right"],
-     group=gDash)
+     options=["top_right","top_left","bottom_right","bottom_left"],  group=gDash)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. ANCHORED SESSION VWAP + STD-DEV BANDS
+// STEP 1 — STATISTICAL EXPANSION  (BigBeluga Volumatic z-score, ported to v6)
 // ─────────────────────────────────────────────────────────────────────────────
-isNewAnchor = ta.change(time(anchorTF)) != 0
+// Direct port of BigBeluga's norm() method:
+//   z = (src − SMA(src, window)) / STDEV(src, window)
+zNorm(float src) =>
+    m = ta.sma(src, zLen)
+    s = ta.stdev(src, zLen)
+    s > 0 ? (src - m) / s : 0.0
 
-var float vwapNum = 0.0
-var float vwapDen = 0.0
-var float vwapSqN = 0.0
-if isNewAnchor
-    vwapNum := 0.0
-    vwapDen := 0.0
-    vwapSqN := 0.0
-
-typPx = (high + low + close) / 3.0
-volPx = nz(volume, 1.0)
-vwapNum += typPx * volPx
-vwapDen += volPx
-vwapSqN += typPx * typPx * volPx
-
-aVwap = vwapDen > 0 ? vwapNum / vwapDen : close
-aVar  = vwapDen > 0 ? math.max(0.0, vwapSqN / vwapDen - aVwap * aVwap) : 0.0
-aSig  = math.sqrt(aVar)
-vwapUp = aVwap + aSig
-vwapDn = aVwap - aSig
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. VOLUME PROFILE  (POC / VAH / VAL)
-// ─────────────────────────────────────────────────────────────────────────────
-hh = ta.highest(high, vpLookback)
-ll = ta.lowest (low , vpLookback)
-binSize = (hh - ll) / vpBins
-
-var array<float> vpVol = array.new<float>(vpBins, 0.0)
-float poc = na
-float vah = na
-float val = na
-
-if barstate.islast and binSize > 0
-    array.fill(vpVol, 0.0)
-    for i = 0 to vpLookback - 1
-        bH = high[i]
-        bL = low[i]
-        bV = nz(volume[i], 0.0)
-        if bH > bL and bV > 0
-            sB = math.floor((bL - ll) / binSize)
-            eB = math.floor((bH - ll) / binSize)
-            sB := math.max(0, math.min(vpBins - 1, sB))
-            eB := math.max(0, math.min(vpBins - 1, eB))
-            cnt = eB - sB + 1
-            perBin = bV / cnt
-            for b = sB to eB
-                array.set(vpVol, b, array.get(vpVol, b) + perBin)
-
-    pocBin = 0
-    maxV   = 0.0
-    for b = 0 to vpBins - 1
-        v = array.get(vpVol, b)
-        if v > maxV
-            maxV   := v
-            pocBin := b
-    poc := ll + (pocBin + 0.5) * binSize
-
-    totalV  = array.sum(vpVol)
-    targetV = totalV * vaPercent
-    sumV    = array.get(vpVol, pocBin)
-    upBin   = pocBin
-    dnBin   = pocBin
-    for _it = 0 to vpBins
-        if sumV >= targetV
-            break
-        upV = upBin < vpBins - 1 ? array.get(vpVol, upBin + 1) : -1.0
-        dnV = dnBin > 0          ? array.get(vpVol, dnBin - 1) : -1.0
-        if upV < 0 and dnV < 0
-            break
-        if upV >= dnV
-            upBin += 1
-            sumV  += upV
-        else
-            dnBin -= 1
-            sumV  += dnV
-    vah := ll + (upBin + 1) * binSize
-    val := ll +  dnBin      * binSize
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. CUMULATIVE VOLUME DELTA  (orderflow proxy)
-// ─────────────────────────────────────────────────────────────────────────────
-midPx = (high + low) / 2.0
-deltaSign = (deltaMode == "Body sign × volume" ?
-                  (close > open      ?  1 : close < open      ? -1 : 0) :
-             deltaMode == "Up-tick vs down-tick" ?
-                  (close > close[1]  ?  1 : close < close[1]  ? -1 : 0) :
-                  (close > midPx     ?  1 : close < midPx     ? -1 : 0))
-delta  = deltaSign * volPx
-
-cvdReset = ta.change(time(cvdResetTF)) != 0
-var float cvd = 0.0
-if cvdReset
-    cvd := 0.0
-cvd += delta
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. HVN LEVELS  (BigBeluga Volumatic z-score logic)
-// ─────────────────────────────────────────────────────────────────────────────
-volSigned = close > open ? volume : -volume
 diffPx    = close - open
+volSigned = close > open ? volume : -volume
 
-zVol  = (volSigned - ta.sma(volSigned, hvnZLen)) / ta.stdev(volSigned, hvnZLen)
-zDiff = (diffPx    - ta.sma(diffPx,    hvnZLen)) / ta.stdev(diffPx,    hvnZLen)
+zDiff = zNorm(diffPx)
+zVol  = zNorm(volSigned)
 
-isHVNbull = zVol >  hvnLevel and zDiff >  hvnLevel
-isHVNbear = zVol < -hvnLevel and zDiff < -hvnLevel
+// Adaptive line width — BigBeluga's original ATR-scaled visual parameter
+lineW = math.max(1, int(math.round(math.abs(zVol) * (ta.atr(200) * 0.1))))
 
-var array<float> hvnPx  = array.new<float>(0)
-var array<int>   hvnDir = array.new<int>(0)
-
-if isHVNbull
-    array.push(hvnPx,  (open + close) / 2.0)
-    array.push(hvnDir,  1)
-if isHVNbear
-    array.push(hvnPx,  (open + close) / 2.0)
-    array.push(hvnDir, -1)
-while array.size(hvnPx) > hvnAmount
-    array.shift(hvnPx)
-    array.shift(hvnDir)
-
-// nearest HVN above / below current price
-float nearHVNUp = na
-float nearHVNDn = na
-if array.size(hvnPx) > 0
-    for i = 0 to array.size(hvnPx) - 1
-        px = array.get(hvnPx, i)
-        if px > close and (na(nearHVNUp) or px < nearHVNUp)
-            nearHVNUp := px
-        if px < close and (na(nearHVNDn) or px > nearHVNDn)
-            nearHVNDn := px
+bullExpand = zDiff >  zLevel and zVol >  zLevel
+bearExpand = zDiff < -zLevel and zVol < -zLevel
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. SUPPLY / DEMAND ZONES  (last opposing bar before a volume impulse)
+// STEP 2 — STRUCTURE SHIFT  (BOS)
+// Bullish BOS: close crosses above most recent pivot high
+// Bearish BOS: close crosses below most recent pivot low
 // ─────────────────────────────────────────────────────────────────────────────
-isImpUp = zVol >  sdImpulseZ and zDiff >  sdImpulseZ
-isImpDn = zVol < -sdImpulseZ and zDiff < -sdImpulseZ
+phigh = ta.pivothigh(high, pivLen, pivLen)
+plow  = ta.pivotlow (low,  pivLen, pivLen)
 
-var array<float> demTop = array.new<float>(0)
-var array<float> demBot = array.new<float>(0)
-var array<int>   demBar = array.new<int>(0)
-var array<float> supTop = array.new<float>(0)
-var array<float> supBot = array.new<float>(0)
-var array<int>   supBar = array.new<int>(0)
+var float lastPH = na
+var float lastPL = na
+if not na(phigh)
+    lastPH := phigh
+if not na(plow)
+    lastPL := plow
 
-if isImpUp and close[1] < open[1]
-    array.push(demTop, math.max(open[1], close[1]))
-    array.push(demBot, low[1])
-    array.push(demBar, bar_index - 1)
-if isImpDn and close[1] > open[1]
-    array.push(supTop, high[1])
-    array.push(supBot, math.min(open[1], close[1]))
-    array.push(supBar, bar_index - 1)
-
-while array.size(demTop) > sdMaxZones
-    array.shift(demTop)
-    array.shift(demBot)
-    array.shift(demBar)
-while array.size(supTop) > sdMaxZones
-    array.shift(supTop)
-    array.shift(supBot)
-    array.shift(supBar)
+bosUp = not na(lastPH) and ta.crossover (close, lastPH)
+bosDn = not na(lastPL) and ta.crossunder(close, lastPL)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. AYA LINE & VOLUME-BIAS ENGINE
+// STEP 3 + 4 — ORIGIN STATE MACHINE  +  QUALITY SCORE
 // ─────────────────────────────────────────────────────────────────────────────
-ayaLine = (ayaSrc == "Session aVWAP" ? aVwap :
-          ayaSrc == "Volume POC"     ? nz(poc, aVwap) :
-          ayaManual > 0              ? ayaManual : aVwap)
+// States
+//   0  = IDLE          (no active candidate)
+//   1  = EXPANSION     (waiting for BOS)
+//   2  = BOS CONFIRMED (waiting for acceptance)
+//   3  = VALID         (all gates passed, MOLiNE active)
+//  -1  = INVALIDATED   (close back through origin on full body)
+// ─────────────────────────────────────────────────────────────────────────────
+var int   originState = 0
+var float originPx    = na      // Bus Origin level (midpoint of expansion bar)
+var int   originDir   = 0       //  1 = bull, -1 = bear
+var int   originBarN  = 0       // bar_index when expansion fired
+var float originHi    = na
+var float originLo    = na
+var float originVol   = 0.0     // volume of the expansion bar
+var float originQual  = 0.0     // quality score (computed at expansion)
 
-vwapSlope = aVwap - aVwap[20]
-pocRef    = nz(poc, aVwap)
+// Quality score — rank the expansion bar (0–100)
+f_quality() =>
+    vr = ta.sma(volume, 200) > 0 ? volume / ta.sma(volume, 200) : 1.0
+    rr = ta.atr(200) > 0 ? (high - low) / ta.atr(200) : 1.0
+    q1 = math.abs(zDiff) >= zLevel * 1.5 ? 25 : 15
+    q2 = math.abs(zVol)  >= zLevel * 1.5 ? 25 : 15
+    q3 = (vr >= 3.0 ? 25 : vr >= 2.0 ? 15 : vr >= 1.5 ? 10 : 5)
+    q4 = (rr >= 2.5 ? 25 : rr >= 1.5 ? 15 : rr >= 1.2 ? 10 : 5)
+    float(math.min(100, q1 + q2 + q3 + q4))
 
-bullPts = (vwapSlope > 0 ? 1 : 0) +
-          (cvd       > 0 ? 1 : 0) +
-          (close > pocRef ? 1 : 0)
-bearPts = (vwapSlope < 0 ? 1 : 0) +
-          (cvd       < 0 ? 1 : 0) +
-          (close < pocRef ? 1 : 0)
+// Validated origin storage (permanent — drawn until shifted off by zMax)
+var array<float> molPx    = array.new<float>(0)
+var array<int>   molDir   = array.new<int>(0)
+var array<float> molQual  = array.new<float>(0)
+var array<bool>  molInv   = array.new<bool>(0)
+var array<int>   molBarN  = array.new<int>(0)
+var array<float> molVol   = array.new<float>(0)
 
-newBias = (bullPts >= 2 and bullPts > bearPts ?  1 :
-          bearPts >= 2 and bearPts > bullPts ? -1 : 0)
+f_pushOrigin() =>
+    array.push(molPx,   originPx)
+    array.push(molDir,  originDir)
+    array.push(molQual, originQual)
+    array.push(molInv,  false)
+    array.push(molBarN, originBarN)
+    array.push(molVol,  originVol)
+    if array.size(molPx) > zMax
+        array.shift(molPx)
+        array.shift(molDir)
+        array.shift(molQual)
+        array.shift(molInv)
+        array.shift(molBarN)
+        array.shift(molVol)
 
-var int  biasState   = 0
-var int  confScore   = 0
-var bool invalidated = false
+// ── State transitions ──────────────────────────────────────────────────────
+// New expansion always resets the active candidate (keeps stored origins)
+if bullExpand or bearExpand
+    originState := 1
+    originPx    := (open + close) / 2.0
+    originDir   := bullExpand ? 1 : -1
+    originBarN  := bar_index
+    originHi    := high
+    originLo    := low
+    originVol   := volume
+    originQual  := f_quality()
 
-new1H = ta.change(time("60")) != 0
-if new1H
-    biasState   := newBias
-    confScore   := newBias ==  1 ? bullPts * 33 :
-                   newBias == -1 ? bearPts * 33 : 0
-    invalidated := false
+// Gate 1: Structure Shift
+if originState == 1
+    if (originDir == 1 and bosUp) or (originDir == -1 and bosDn)
+        originState := 2
+
+// Gate 2: Acceptance
+if originState == 2
+    elapsed = bar_index - originBarN
+    if elapsed <= accWin
+        accepted = (originDir == 1 and close > originPx) or
+                   (originDir == -1 and close < originPx)
+        if accepted
+            originState := 3
+            if originQual >= qualMin
+                f_pushOrigin()
+    else if elapsed > accWin
+        originState := 0   // window expired without acceptance
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. INVALIDATION  (1H full-body close beyond a volume reference)
+// STEP 6 — INVALIDATION  (close back through origin on a full-body bar)
 // ─────────────────────────────────────────────────────────────────────────────
-float invLevel = na
-if biasState == 1
-    invLevel := (invMode == "VAL/VAH"     ? val :
-                invMode == "Nearest HVN" ? nearHVNDn :
-                                            poc)
-if biasState == -1
-    invLevel := (invMode == "VAL/VAH"     ? vah :
-                invMode == "Nearest HVN" ? nearHVNUp :
-                                            poc)
+hBody    = math.abs(close - open)
+hRange   = high - low
+fullBody = hRange > 0 and (hBody / hRange) >= invBody
 
-[h1C, h1O, h1H, h1L] = request.security(syminfo.tickerid, "60",
-     [close, open, high, low], lookahead=barmerge.lookahead_off)
+// Invalidate active origin
+if originState == 3 and fullBody
+    if (originDir == 1 and close < originPx) or
+       (originDir == -1 and close > originPx)
+        originState := -1
 
-h1Range  = h1H - h1L
-h1Body   = math.abs(h1C - h1O)
-fullBody = h1Range > 0 and (h1Body / h1Range) >= bodyPct
-
-invFires = false
-if new1H and not na(invLevel) and fullBody
-    if biasState ==  1 and h1C < invLevel
-        invFires := true
-    if biasState == -1 and h1C > invLevel
-        invFires := true
-if invFires
-    invalidated := true
-    biasState   := 0
-    confScore   := 0
+// Invalidate stored origins
+if fullBody and array.size(molPx) > 0
+    for i = 0 to array.size(molPx) - 1
+        if not array.get(molInv, i)
+            px = array.get(molPx,  i)
+            dr = array.get(molDir, i)
+            if (dr == 1 and close < px) or (dr == -1 and close > px)
+                array.set(molInv, i, true)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. TARGETS  (R-multiples vs invalidation)
+// STEP 5 — LIQUIDITY TARGETS
 // ─────────────────────────────────────────────────────────────────────────────
-R   = na(invLevel) ? na : math.abs(ayaLine - invLevel)
-dir = biasState
 
-tp1 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP1 * R)
-tp2 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP2 * R)
-tp3 = (na(R) or dir == 0 ? na : ayaLine + dir * rrTP3 * R)
+// ── BSL / SSL (Equal Highs / Equal Lows) ──────────────────────────────────
+eqTolPx = close * eqTolPct / 100.0
+
+var array<float> swingHs = array.new<float>(0)
+var array<float> swingLs = array.new<float>(0)
+
+if not na(phigh)
+    array.push(swingHs, phigh)
+    if array.size(swingHs) > 30
+        array.shift(swingHs)
+if not na(plow)
+    array.push(swingLs, plow)
+    if array.size(swingLs) > 30
+        array.shift(swingLs)
+
+float bslLevel = na
+float sslLevel = na
+
+// Scan newest-first for closest equal-high pair
+if array.size(swingHs) >= 2
+    for i = array.size(swingHs) - 1 to 1 by -1
+        h1 = array.get(swingHs, i)
+        h2 = array.get(swingHs, i - 1)
+        if math.abs(h1 - h2) <= eqTolPx
+            bslLevel := (h1 + h2) / 2.0
+            break
+
+if array.size(swingLs) >= 2
+    for i = array.size(swingLs) - 1 to 1 by -1
+        l1 = array.get(swingLs, i)
+        l2 = array.get(swingLs, i - 1)
+        if math.abs(l1 - l2) <= eqTolPx
+            sslLevel := (l1 + l2) / 2.0
+            break
+
+// ── Prior Day H/L ──────────────────────────────────────────────────────────
+[pdH, pdL] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1]], lookahead=barmerge.lookahead_off)
+
+// ── Fair Value Gaps ─────────────────────────────────────────────────────────
+// Bull FVG: high[2] < low  → gap between high[2] and current low
+// Bear FVG: low[2]  > high → gap between current high and low[2]
+bullFVG = high[2] < low
+bearFVG = low[2]  > high
+
+var array<float> fvgTop = array.new<float>(0)
+var array<float> fvgBot = array.new<float>(0)
+var array<int>   fvgDir = array.new<int>(0)
+
+if bullFVG
+    array.push(fvgTop, low)
+    array.push(fvgBot, high[2])
+    array.push(fvgDir, 1)
+    if array.size(fvgTop) > fvgMax
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+if bearFVG
+    array.push(fvgTop, low[2])
+    array.push(fvgBot, high)
+    array.push(fvgDir, -1)
+    if array.size(fvgTop) > fvgMax
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. DRAWING LAYER
+// DRAWING LAYER
+// Rebuild all objects on barstate.islast to reflect current state.
 // ─────────────────────────────────────────────────────────────────────────────
-var line  lnAya  = na
-var line  lnInv  = na
-var line  lnPOC  = na
-var line  lnVAH  = na
-var line  lnVAL  = na
-var line  lnTP1  = na
-var line  lnTP2  = na
-var line  lnTP3  = na
-var line  lnVwUp = na
-var line  lnVwDn = na
+var array<line>  molLines  = array.new<line>(0)
+var array<box>   molBoxes  = array.new<box>(0)
+var array<label> allLabels = array.new<label>(0)
+var array<box>   fvgBoxes  = array.new<box>(0)
+var line lnPDH  = na
+var line lnPDL  = na
+var line lnBSL  = na
+var line lnSSL  = na
 
-// HVN line + zone collections (rebuilt last bar)
-var array<line> hvnLines = array.new<line>(0)
-var array<box>  demBoxes = array.new<box>(0)
-var array<box>  supBoxes = array.new<box>(0)
-
-f_killLine(line l) =>
+f_delLine(line l) =>
     if not na(l)
         line.delete(l)
-
-f_clearLineArr(array<line> a) =>
+f_clearLA(array<line> a) =>
     while array.size(a) > 0
         line.delete(array.shift(a))
-
-f_clearBoxArr(array<box> a) =>
+f_clearBA(array<box> a) =>
     while array.size(a) > 0
         box.delete(array.shift(a))
+f_clearLbA(array<label> a) =>
+    while array.size(a) > 0
+        label.delete(array.shift(a))
 
 if barstate.islast
-    f_killLine(lnAya)
-    f_killLine(lnInv)
-    f_killLine(lnPOC)
-    f_killLine(lnVAH)
-    f_killLine(lnVAL)
-    f_killLine(lnTP1)
-    f_killLine(lnTP2)
-    f_killLine(lnTP3)
-    f_killLine(lnVwUp)
-    f_killLine(lnVwDn)
-    f_clearLineArr(hvnLines)
-    f_clearBoxArr(demBoxes)
-    f_clearBoxArr(supBoxes)
+    // ── clear previous pass ────────────────────────────────────────────────
+    f_clearLA(molLines)
+    f_clearBA(molBoxes)
+    f_clearLbA(allLabels)
+    f_clearBA(fvgBoxes)
+    f_delLine(lnPDH)
+    f_delLine(lnPDL)
+    f_delLine(lnBSL)
+    f_delLine(lnSSL)
 
-    rightX = bar_index + 30
-    leftX  = bar_index - math.min(bar_index, 250)
+    n     = bar_index + 30
+    lftX  = bar_index - math.min(bar_index, 300)
 
-    // AYA Line
-    lnAya := line.new(leftX, ayaLine, rightX, ayaLine,
-         color=colAya, width=3, extend=extend.right)
-    label.new(rightX, ayaLine,
-         "AYA " + str.tostring(ayaLine, format.mintick),
-         style=label.style_label_left, color=color.new(colAya, 70),
-         textcolor=color.white, size=size.small)
+    // ── MOLiNE levels ───────────────────────────────────────────────────────
+    if array.size(molPx) > 0
+        for i = 0 to array.size(molPx) - 1
+            px    = array.get(molPx,   i)
+            dr    = array.get(molDir,  i)
+            ql    = array.get(molQual, i)
+            inv   = array.get(molInv,  i)
+            bN    = array.get(molBarN, i)
+            vol_  = array.get(molVol,  i)
 
-    // aVWAP bands
-    if showVwapBands
-        lnVwUp := line.new(leftX, vwapUp, rightX, vwapUp,
-             color=colVwBnd, style=line.style_dotted, extend=extend.right)
-        lnVwDn := line.new(leftX, vwapDn, rightX, vwapDn,
-             color=colVwBnd, style=line.style_dotted, extend=extend.right)
+            lineCol = (inv        ? color.new(colInv, 60) :
+                      dr == 1    ? (close >= px ? colBull : color.new(colBull, 60)) :
+                      (close <= px ? colBear : color.new(colBear, 60)))
+            lStyle  = inv ? line.style_dotted : line.style_solid
 
-    // Volume Profile lines
-    if showVP
-        if not na(poc)
-            lnPOC := line.new(leftX, poc, rightX, poc,
-                 color=colPOC, width=2, extend=extend.right)
-            label.new(rightX, poc, "POC",
-                 style=label.style_label_left, color=color.new(colPOC, 60),
-                 textcolor=color.white, size=size.tiny)
-        if not na(vah)
-            lnVAH := line.new(leftX, vah, rightX, vah,
-                 color=colVA, style=line.style_dashed, extend=extend.right)
-            label.new(rightX, vah, "VAH",
-                 style=label.style_label_left, color=color.new(colVA, 60),
-                 textcolor=color.white, size=size.tiny)
-        if not na(val)
-            lnVAL := line.new(leftX, val, rightX, val,
-                 color=colVA, style=line.style_dashed, extend=extend.right)
-            label.new(rightX, val, "VAL",
-                 style=label.style_label_left, color=color.new(colVA, 60),
-                 textcolor=color.white, size=size.tiny)
+            molLines.push(line.new(bN, px, n, px,
+                 color=lineCol, width=inv ? 1 : 2,
+                 style=lStyle, extend=extend.right))
 
-    // HVN levels
-    if array.size(hvnPx) > 0
-        for i = 0 to array.size(hvnPx) - 1
-            px  = array.get(hvnPx,  i)
-            dr  = array.get(hvnDir, i)
-            col = dr == 1 ? colHVNu : colHVNd
-            ln  = line.new(rightX - 200, px, rightX, px,
-                 color=col, width=1, style=line.style_solid,
+            // Volume box at origin candle (BigBeluga visual)
+            molBoxes.push(box.new(bN, px + lineW, bN + 8, px - lineW,
+                 border_color=color.new(colNeu, 80), border_width=1,
+                 bgcolor=color.new(colNeu, 90),
+                 text=str.tostring(vol_, format.volume),
+                 text_size=size.small, text_color=lineCol,
+                 text_halign=text.align_right, text_valign=text.align_center))
+
+            // Quality badge
+            allLabels.push(label.new(n, px,
+                 (inv ? "✗ " : "✓ ") + str.tostring(int(ql)) + "  MOL",
+                 style=label.style_label_left,
+                 color=color.new(lineCol, 45),
+                 textcolor=color.white, size=size.small))
+
+    // ── BSL / SSL ───────────────────────────────────────────────────────────
+    if showEQ
+        if not na(bslLevel)
+            lnBSL := line.new(lftX, bslLevel, n, bslLevel,
+                 color=colBSL, style=line.style_dotted, width=2,
                  extend=extend.right)
-            array.push(hvnLines, ln)
+            allLabels.push(label.new(n, bslLevel, "BSL",
+                 style=label.style_label_left,
+                 color=color.new(colBSL, 65), textcolor=color.white,
+                 size=size.tiny))
+        if not na(sslLevel)
+            lnSSL := line.new(lftX, sslLevel, n, sslLevel,
+                 color=colSSL, style=line.style_dotted, width=2,
+                 extend=extend.right)
+            allLabels.push(label.new(n, sslLevel, "SSL",
+                 style=label.style_label_left,
+                 color=color.new(colSSL, 65), textcolor=color.white,
+                 size=size.tiny))
 
-    // Demand zones
-    if array.size(demTop) > 0
-        for i = 0 to array.size(demTop) - 1
-            t = array.get(demTop, i)
-            b = array.get(demBot, i)
-            x = array.get(demBar, i)
-            bx = box.new(x, t, x + sdExtend, b,
-                 border_color=color.new(colBull, 40), bgcolor=colDem)
-            array.push(demBoxes, bx)
+    // ── Prior Day H/L ───────────────────────────────────────────────────────
+    if showPD
+        if not na(pdH)
+            lnPDH := line.new(lftX, pdH, n, pdH,
+                 color=colPDH, style=line.style_dashed, extend=extend.right)
+            allLabels.push(label.new(n, pdH, "PDH",
+                 style=label.style_label_left,
+                 color=color.new(colPDH, 65), textcolor=color.white,
+                 size=size.tiny))
+        if not na(pdL)
+            lnPDL := line.new(lftX, pdL, n, pdL,
+                 color=colPDL, style=line.style_dashed, extend=extend.right)
+            allLabels.push(label.new(n, pdL, "PDL",
+                 style=label.style_label_left,
+                 color=color.new(colPDL, 65), textcolor=color.white,
+                 size=size.tiny))
 
-    // Supply zones
-    if array.size(supTop) > 0
-        for i = 0 to array.size(supTop) - 1
-            t = array.get(supTop, i)
-            b = array.get(supBot, i)
-            x = array.get(supBar, i)
-            bx = box.new(x, t, x + sdExtend, b,
-                 border_color=color.new(colBear, 40), bgcolor=colSup)
-            array.push(supBoxes, bx)
+    // ── FVG boxes ───────────────────────────────────────────────────────────
+    if showFVG and array.size(fvgTop) > 0
+        for i = 0 to array.size(fvgTop) - 1
+            t   = array.get(fvgTop, i)
+            b   = array.get(fvgBot, i)
+            fvgBoxes.push(box.new(lftX, t, n, b,
+                 border_color=color.new(colFVG, 40), bgcolor=colFVG))
 
-    // Invalidation
-    if not na(invLevel) and dir != 0
-        lnInv := line.new(leftX, invLevel, rightX, invLevel,
-             color=colInv, width=2, style=line.style_dashed,
-             extend=extend.right)
-        label.new(rightX, invLevel,
-             "INV " + str.tostring(invLevel, format.mintick),
-             style=label.style_label_left, color=color.new(colInv, 70),
-             textcolor=color.white, size=size.small)
+// ─────────────────────────────────────────────────────────────────────────────
+// BAR MARKERS
+// ─────────────────────────────────────────────────────────────────────────────
+// BigBeluga: color expansion bars
+barcolor((bullExpand ? colBull : bearExpand ? colBear : na), title="Expansion bar")
 
-    // Targets
-    if not na(tp1)
-        lnTP1 := line.new(leftX, tp1, rightX, tp1, color=colTP,
-             style=line.style_dotted, extend=extend.right)
-        label.new(rightX, tp1, "TP1",
-             style=label.style_label_left, color=color.new(colTP, 70),
-             textcolor=color.white, size=size.tiny)
-    if not na(tp2)
-        lnTP2 := line.new(leftX, tp2, rightX, tp2, color=colTP,
-             style=line.style_dotted, extend=extend.right)
-        label.new(rightX, tp2, "TP2",
-             style=label.style_label_left, color=color.new(colTP, 70),
-             textcolor=color.white, size=size.tiny)
-    if not na(tp3)
-        lnTP3 := line.new(leftX, tp3, rightX, tp3, color=colTP, width=2,
-             extend=extend.right)
-        label.new(rightX, tp3, "TP3 (1:4)",
-             style=label.style_label_left, color=color.new(colTP, 50),
-             textcolor=color.white, size=size.small)
-
-// Bar markers
-plotshape(invFires,    title="Invalidation",
-     style=shape.xcross, location=location.abovebar,
-     color=colInv, size=size.small)
-plotshape(isHVNbull,   title="HVN bull",
+// BOS markers (every structural break)
+plotshape(bosUp, title="BOS Up",
      style=shape.triangleup, location=location.belowbar,
-     color=colHVNu, size=size.tiny)
-plotshape(isHVNbear,   title="HVN bear",
+     color=colBull, size=size.small)
+plotshape(bosDn, title="BOS Down",
      style=shape.triangledown, location=location.abovebar,
-     color=colHVNd, size=size.tiny)
+     color=colBear, size=size.small)
+
+// Origin validated
+originJustValid = originState == 3 and originState[1] != 3
+plotshape(originJustValid, title="Origin Accepted",
+     style=shape.flag,
+     location=(originDir == 1 ? location.belowbar : location.abovebar),
+     color=(originDir == 1 ? colBull : colBear), size=size.small)
+
+// Invalidation flash
+originJustInv = originState == -1 and originState[1] != -1
+bgcolor(originJustInv ? color.new(colInv, 75) : na, title="Invalidation flash")
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. DASHBOARD
+// DASHBOARD
 // ─────────────────────────────────────────────────────────────────────────────
-posMap(s) =>
+posMap_(s) =>
     (s == "top_left"     ? position.top_left :
     s == "bottom_right" ? position.bottom_right :
-    s == "bottom_left"  ? position.bottom_left :
-    s == "middle_right" ? position.middle_right : position.top_right)
+    s == "bottom_left"  ? position.bottom_left : position.top_right)
 
-var table dash = table.new(posMap(dashPos), 2, 10,
+var table dash = table.new(posMap_(dashPos), 2, 10,
      border_width=1, frame_color=color.new(color.gray, 50),
      border_color=color.new(color.gray, 70))
 
-biasTxt = (invalidated         ? "DEFENSIVE — STAND DOWN" :
-          biasState ==  1     ? "BULLISH ▲" :
-          biasState == -1     ? "BEARISH ▼" : "NEUTRAL ◇")
-biasBg  = (invalidated         ? color.new(color.orange, 50) :
-          biasState ==  1     ? color.new(colBull, 60) :
-          biasState == -1     ? color.new(colBear, 60) :
-                                color.new(colNeut, 60))
+stateTxt = (originState ==  3 ? "VALID — " + (originDir == 1 ? "BULL ▲" : "BEAR ▼") :
+           originState ==  2 ? "AWAITING ACCEPTANCE" :
+           originState ==  1 ? "AWAITING BOS" :
+           originState == -1 ? "INVALIDATED" : "IDLE — NO ORIGIN")
+stateBg  = (originState ==  3 ? color.new(originDir == 1 ? colBull : colBear, 55) :
+           originState ==  2 ? color.new(color.orange, 50) :
+           originState ==  1 ? color.new(color.yellow, 65) :
+           originState == -1 ? color.new(colInv, 55) :
+                                color.new(color.gray, 65))
 
-cvdTxt  = str.tostring(cvd, format.volume) +
-          (cvd > 0 ? "  ▲" : cvd < 0 ? "  ▼" : "  ◇")
-cvdBg   = (cvd > 0 ? color.new(colBull, 70) :
-          cvd < 0 ? color.new(colBear, 70) : color.new(colNeut, 70))
+qualTxt = (originQual >= 75 ? "HIGH  " :
+          originQual >= 50  ? "MED   " :
+          originQual >= qualMin ? "LOW   " : "SKIP  ") +
+          "(" + str.tostring(int(originQual)) + " / 100)"
+qualBg  = (originQual >= 75 ? color.new(colBull, 60) :
+          originQual >= 50  ? color.new(color.orange, 55) :
+                               color.new(colBear, 65))
 
-dntTxt = (invalidated                                ? "wait reclaim sequence" :
-         na(poc)                                    ? "VP not built — observe" :
-         math.abs(close - aVwap) < aSig * 0.25      ? "compressed — wait expansion" :
-         dir == 0                                   ? "no consensus — stand down" :
-                                                       "—")
+dntTxt = (originState == -1 ? "origin invalidated — stand down" :
+         originState ==  0  ? "no expansion fired — idle" :
+         originState ==  1  ? "waiting structure shift — no trade" :
+         originState ==  2  ? "waiting acceptance confirmation" :
+         originQual < qualMin ? "quality below threshold — skip" : "—")
 
-f_cell(int r, int c, string txt, color bg, color tc) =>
+f_cell_(int r, int c, string txt, color bg, color tc) =>
     table.cell(dash, c, r, txt, bgcolor=bg, text_color=tc, text_size=size.small)
 
 if showDash and barstate.islast
     table.clear(dash, 0, 0, 1, 9)
 
-    f_cell(0, 0, "VOLUME BIAS",  color.new(color.black, 30), color.white)
-    f_cell(0, 1, biasTxt + "  (" + str.tostring(confScore) + ")",
-         biasBg, color.white)
+    f_cell_(0, 0, "ORIGIN STATE",   color.new(color.black, 30), color.white)
+    f_cell_(0, 1, stateTxt,         stateBg,                    color.white)
 
-    f_cell(1, 0, "AYA LINE",     color.new(color.black, 30), color.white)
-    f_cell(1, 1, str.tostring(ayaLine, format.mintick) + "   src: " + ayaSrc,
-         color.new(colAya, 60), color.white)
+    f_cell_(1, 0, "BUS ORIGIN",     color.new(color.black, 30), color.white)
+    f_cell_(1, 1, (na(originPx) ? "—" : str.tostring(originPx, format.mintick)),
+         color.new(colMOL, 55), color.white)
 
-    f_cell(2, 0, "POC / VAH / VAL", color.new(color.black, 30), color.white)
-    f_cell(2, 1,
-         (na(poc)? "—" : str.tostring(poc, format.mintick)) + "  /  " +
-         (na(vah)? "—" : str.tostring(vah, format.mintick)) + "  /  " +
-         (na(val)? "—" : str.tostring(val, format.mintick)),
-         color.new(colPOC, 70), color.white)
+    f_cell_(2, 0, "QUALITY SCORE",  color.new(color.black, 30), color.white)
+    f_cell_(2, 1, qualTxt, qualBg,  color.white)
 
-    f_cell(3, 0, "CVD",          color.new(color.black, 30), color.white)
-    f_cell(3, 1, cvdTxt, cvdBg, color.white)
+    f_cell_(3, 0, "zDiff / zVol",   color.new(color.black, 30), color.white)
+    f_cell_(3, 1, str.tostring(zDiff, "#.##") + "  /  " + str.tostring(zVol, "#.##"),
+         color.new(color.gray, 55), color.white)
 
-    f_cell(4, 0, "INVALIDATION", color.new(color.black, 30), color.white)
-    f_cell(4, 1, na(invLevel) ? "—" :
-         str.tostring(invLevel, format.mintick) + "   ref: " + invMode,
-         color.new(colInv, 60), color.white)
+    f_cell_(4, 0, "BSL / SSL",      color.new(color.black, 30), color.white)
+    f_cell_(4, 1, (na(bslLevel) ? "—" : str.tostring(bslLevel, format.mintick)) +
+                  "  /  " + (na(sslLevel) ? "—" : str.tostring(sslLevel, format.mintick)),
+         color.new(color.gray, 55), color.white)
 
-    f_cell(5, 0, "TP1 / TP2 / TP3", color.new(color.black, 30), color.white)
-    f_cell(5, 1,
-         (na(tp1)? "—" : str.tostring(tp1, format.mintick)) + "  /  " +
-         (na(tp2)? "—" : str.tostring(tp2, format.mintick)) + "  /  " +
-         (na(tp3)? "—" : str.tostring(tp3, format.mintick)),
-         color.new(colTP, 70), color.white)
+    f_cell_(5, 0, "PRIOR DAY H/L",  color.new(color.black, 30), color.white)
+    f_cell_(5, 1, (na(pdH) ? "—" : str.tostring(pdH, format.mintick)) +
+                  "  /  " + (na(pdL) ? "—" : str.tostring(pdL, format.mintick)),
+         color.new(color.gray, 55), color.white)
 
-    f_cell(6, 0, "HVN LEVELS",   color.new(color.black, 30), color.white)
-    f_cell(6, 1, str.tostring(array.size(hvnPx)) + " active",
-         color.new(colHVNu, 70), color.white)
+    f_cell_(6, 0, "FVG ZONES",      color.new(color.black, 30), color.white)
+    f_cell_(6, 1, str.tostring(array.size(fvgTop)) + " active",
+         color.new(colFVG, 55), color.white)
 
-    f_cell(7, 0, "S/D ZONES",    color.new(color.black, 30), color.white)
-    f_cell(7, 1, "demand " + str.tostring(array.size(demTop)) +
-                 "   supply " + str.tostring(array.size(supTop)),
-         color.new(color.purple, 60), color.white)
+    f_cell_(7, 0, "ORIGINS STORED", color.new(color.black, 30), color.white)
+    f_cell_(7, 1, str.tostring(array.size(molPx)) + " / " + str.tostring(zMax),
+         color.new(colMOL, 55), color.white)
 
-    f_cell(8, 0, "DO-NOT-TRADE", color.new(color.black, 30), color.white)
-    f_cell(8, 1, dntTxt,
-         dntTxt == "—" ? color.new(colBull, 70) : color.new(color.orange, 50),
+    f_cell_(8, 0, "DO-NOT-TRADE",   color.new(color.black, 30), color.white)
+    f_cell_(8, 1, dntTxt,
+         dntTxt == "—" ? color.new(colBull, 65) : color.new(color.orange, 50),
          color.white)
 
-    f_cell(9, 0, "PHILOSOPHY",   color.new(color.black, 30), color.white)
-    f_cell(9, 1, "Volume only · ≥1:4 RR · 1H invalidation",
-         color.new(color.black, 60), color.silver)
+    f_cell_(9, 0, "FRAMEWORK",      color.new(color.black, 30), color.white)
+    f_cell_(9, 1, "z-score + BOS + Acceptance + Liquidity",
+         color.new(color.black, 55), color.silver)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 11. ALERTS
+// ALERTS
 // ─────────────────────────────────────────────────────────────────────────────
-biasFlipped = ta.change(biasState) != 0
-alertcondition(biasFlipped, title="AYA-VOL: Bias flip",
-     message="Volume-bias flipped — re-evaluate plan.")
-alertcondition(invFires,    title="AYA-VOL: Invalidation",
-     message="1H full-body close beyond volume reference — INVALIDATED.")
-alertcondition(isHVNbull or isHVNbear, title="AYA-VOL: HVN printed",
-     message="High-volume node printed — new S/R level active.")
-alertcondition(isImpUp or isImpDn, title="AYA-VOL: Volume impulse",
-     message="Volume impulse detected — fresh S/D zone marked.")
-alertcondition(not na(tp1) and ta.cross(close, tp1),
-     title="AYA-VOL: TP1 hit", message="TP1 reached.")
-alertcondition(not na(tp2) and ta.cross(close, tp2),
-     title="AYA-VOL: TP2 hit", message="TP2 reached.")
-alertcondition(not na(tp3) and ta.cross(close, tp3),
-     title="AYA-VOL: TP3 hit (1:4)", message="TP3 reached — minimum asymmetric objective.")
+alertcondition(bullExpand or bearExpand,
+     title="MoModel: Statistical Expansion",
+     message="Abnormal z-score event — potential Bus Origin forming.")
+alertcondition(bosUp, title="MoModel: BOS Up",
+     message="Bullish break of structure confirmed.")
+alertcondition(bosDn, title="MoModel: BOS Down",
+     message="Bearish break of structure confirmed.")
+alertcondition(originJustValid,
+     title="MoModel: Origin VALID ✓",
+     message="Bus Origin accepted. MOLiNE active. Evaluate trade quality.")
+alertcondition(originJustInv,
+     title="MoModel: Origin INVALIDATED ✗",
+     message="Close back through origin on full body. Thesis dead. Stand down.")
+alertcondition(bullFVG or bearFVG,
+     title="MoModel: FVG Created",
+     message="Fair Value Gap detected — liquidity void mapped.")
+alertcondition(not na(bslLevel) and ta.crossover(close, bslLevel),
+     title="MoModel: BSL Swept",
+     message="Price has swept buy-side liquidity (equal highs). Watch for reaction.")
+alertcondition(not na(sslLevel) and ta.crossunder(close, sslLevel),
+     title="MoModel: SSL Swept",
+     message="Price has swept sell-side liquidity (equal lows). Watch for reaction.")

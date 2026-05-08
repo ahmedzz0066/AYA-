@@ -1,207 +1,180 @@
-# AYA Line — Volume-Engine Roadmap & Logical Approach
+# AYA Line — #MoModel Institutional Engine  
+## Roadmap & Mathematical Framework
 
-> "Less is better. Precision over frequency. Protect capital first."
->
-> — AYA Line core philosophy
-
-This document is the engineering blueprint behind the **AYA Line — Volume Engine**
-Pine Script v6 indicator (`AYA_Line.pine`). The model is **100 % volume-driven**:
-no EMAs, no ATR, no daily pivots. Every gate uses one of five volume tools.
+> "Capital preservation creates longevity. Longevity creates opportunity."
 
 ---
 
-## 1. Mission Statement
+## 0. Governing Principle
 
-AYA Line is a *decision-support* indicator that mechanizes an institutional
-intraday operator's read of the order book through volume:
+Before a single line is drawn, three questions are separated:
 
-1. Establish a **volume bias** (the *AYA Arrow*) from the consensus of three
-   orderflow signals.
-2. Anchor the bias to a **single core level** (the *AYA Line*) sourced from
-   volume — anchored session VWAP, volume POC, or manual.
-3. Define an **invalidation** rule that only the 1H full-body close past a
-   volume reference (VAL/VAH, nearest HVN, or POC) can break.
-4. Project **R-multiple targets** (TP1 → TP2 → TP3, ≥ 1:4).
-5. Highlight **supply / demand zones** + **HVN levels** as confluence pickups.
-6. Print **risk notes**: what invalidates, what confirms, when *not* to trade.
+| Question                          | Answer in the model                         |
+|-----------------------------------|---------------------------------------------|
+| What is mathematically valid?     | Z-score of signed volume × price expansion  |
+| What is statistically repeatable? | Acceptance of inventory by the auction      |
+| What is only visual/chart noise?  | Everything else — dropped                   |
 
----
+A market maker or liquidity engineer cares only about:
 
-## 2. Volume Inputs (the only inputs)
-
-| # | Tool                                  | Role                                                                        |
-|---|----------------------------------------|------------------------------------------------------------------------------|
-| 1 | **Anchored Session VWAP** + ±1σ bands | Fair value anchor; slope = trend pressure                                    |
-| 2 | **Volume Profile** (POC / VAH / VAL)  | Where price *transacted* — auction value area                                |
-| 3 | **Cumulative Volume Delta**            | Orderflow proxy (signed volume); sign = aggressor                            |
-| 4 | **HVN Levels** (BigBeluga z-score)    | High-volume nodes = sticky S/R                                               |
-| 5 | **Supply / Demand zones**              | Last opposing bar before a volume impulse (z-scored body × volume)           |
+1. **Inventory** — where was it acquired?
+2. **Liquidity** — where is the next pool?
+3. **Imbalance** — did the auction accept the new price?
+4. **Volatility expansion** — was the move statistically abnormal?
+5. **Mean reversion probability** — has the origin been violated?
 
 ---
 
-## 3. Component Roadmap
+## 1. The Only Valid Input: BigBeluga Z-score
 
-### 3.1 Anchored Session VWAP
+The BigBeluga Volumatic indicator provides the model's sole entry filter.
 
-- Reset on each new session (D / W / M selectable).
-- Online accumulator: `Σ(typ·vol) / Σvol`.
-- Variance band: `σ = √(Σ(typ²·vol)/Σvol − VWAP²)`.
-- ±1σ bands optionally drawn.
-
-### 3.2 Volume Profile
-
-- Rolling lookback (default 288 bars, 50 bins).
-- Each bar's volume distributed evenly across the bins its `[low,high]`
-  range covers.
-- **POC** = bin with greatest accumulated volume.
-- **VAH / VAL** = expanded from POC bin until 70 % of total volume is captured
-  (greedy expansion on the side with more adjacent volume).
-- Recomputed on `barstate.islast` to keep cost bounded.
-
-### 3.3 Cumulative Volume Delta
-
-- Three selectable proxies: body sign × volume, up-tick vs down-tick,
-  above-mid vs below-mid.
-- Resets on session boundary.
-- CVD > 0 = net buying pressure; CVD < 0 = net selling.
-
-### 3.4 HVN Levels (Volumatic z-score)
-
-Direct port of BigBeluga's logic:
-```
-zVol  = z-score(signed-volume,  200)
-zDiff = z-score(close-open,     200)
-HVN_bull ⇔ zVol >  L  AND  zDiff >  L
-HVN_bear ⇔ zVol < -L  AND  zDiff < -L
-```
-Each HVN is plotted as a horizontal line at the bar's `(open+close)/2`,
-extended right. Newest *N* (default 8) are kept.
-
-### 3.5 Supply / Demand Zones
-
-A zone is born when an **impulse** prints (`|zVol| > 1.8` and `|zDiff| > 1.8`).
-- **Demand**: last *down* bar immediately preceding a bullish impulse;
-  zone = `[low, max(open, close)]`.
-- **Supply**: last *up* bar immediately preceding a bearish impulse;
-  zone = `[min(open, close), high]`.
-
-Newest *N* (default 4 each side) drawn as translucent boxes.
-
-### 3.6 Volume Bias Engine (the AYA Arrow)
-
-Three orthogonal volume signals; need majority + lead:
-
-| Signal               | Bullish  | Bearish |
-|----------------------|----------|---------|
-| aVWAP slope (20-bar) | up       | down    |
-| CVD sign             | positive | negative|
-| close vs POC         | above    | below   |
+### Mathematical definition
 
 ```
-bullPts = #signals_for_bull
-bearPts = #signals_for_bear
-bias    =  1  if bullPts >= 2 and bullPts > bearPts
-        = -1  if bearPts >= 2 and bearPts > bullPts
-        =  0  otherwise
-confidence = leader * 33  (0..99)
+diffPx    = close − open                         // price displacement
+volSigned = close > open ? +volume : −volume     // signed volume
+
+z_diff = (diffPx    − SMA(diffPx,    200)) / STDEV(diffPx,    200)
+z_vol  = (volSigned − SMA(volSigned, 200)) / STDEV(volSigned, 200)
+
+bullExpand ⇔  z_diff >  threshold  AND  z_vol >  threshold
+bearExpand ⇔  z_diff < −threshold  AND  z_vol < −threshold
 ```
 
-The bias only **flips on a new 1H bar** to avoid intra-hour noise.
+### Why this is valid
 
-### 3.7 AYA Line (anchor)
+- Values |z| > 2.0 are statistically unusual (≈ 2.5 % of observations).
+- True directional expansion requires **both** volatility expansion AND
+  participation expansion simultaneously.
+- This filter removes most random bars; only genuinely anomalous events pass.
 
-Selectable source: anchored session VWAP / volume POC / manual override.
-Drawn as a thick gold line across all timeframes.
+### What z-score alone does NOT prove
 
-### 3.8 Invalidation
+High volume alone can be absorption, distribution, liquidation, hedging, or
+continuation. **A line at a high-volume bar is not edge.** What matters is
+how price behaves *after* the event. This is why three additional gates exist.
 
-`invLevel` is volume-derived — picks one of:
-- **VAL / VAH** (default) — auction value-area edge.
-- **Nearest HVN** in the bias direction.
-- **POC** — point of control.
+---
 
-A 1H candle invalidates *only* if:
-```
-|body| / |range|  ≥  bodyPct  (default 0.6)
-AND  bias == BULL  →  close_1H  <  invLevel
-OR   bias == BEAR  →  close_1H  >  invLevel
-```
-Wicks never invalidate.
+## 2. #MoModel Pipeline (6 Steps)
 
-### 3.9 Targets
+### Step 1 — Statistical Expansion (BigBeluga z-score)
 
-`R = |AYA Line − invLevel|`
+Fires when `z_diff` and `z_vol` simultaneously exceed `threshold` in the same
+direction. This marks a **Bus Origin Candidate**. No trade, no line yet.
 
-| Target | Formula                  | Notes                       |
-|--------|--------------------------|-----------------------------|
-| TP1    | `AYA + dir · 1.0 · R`    | first liquidity sweep       |
-| TP2    | `AYA + dir · 2.0 · R`    | session expansion           |
-| TP3    | `AYA + dir · 4.0 · R`    | minimum asymmetric (1:4)    |
-
-Targets are cancelled on invalidation.
-
-### 3.10 Dashboard
-
-Top-right table mirrors the system schema:
+### Step 2 — Structure Shift (Gate 1 — Break of Structure)
 
 ```
-┌──────────────────────────────────────────────┐
-│ VOLUME BIAS     | BULLISH ▲  (66)            │
-│ AYA LINE        | 23 415.50  src: aVWAP       │
-│ POC / VAH / VAL | 23 410 / 23 462 / 23 350    │
-│ CVD             | +12 304 504  ▲              │
-│ INVALIDATION    | 23 350.00  ref: VAL/VAH     │
-│ TP1 / TP2 / TP3 | 23 481 / 23 547 / 23 678    │
-│ HVN LEVELS      | 6 active                    │
-│ S/D ZONES       | demand 3   supply 2         │
-│ DO-NOT-TRADE    | —                           │
-│ PHILOSOPHY      | Volume only · ≥1:4 · 1H inv │
-└──────────────────────────────────────────────┘
+Bullish BOS ⇔  close  crosses above  last pivot high
+Bearish BOS ⇔  close  crosses below  last pivot low
+```
+
+- Pivot = `ta.pivothigh / ta.pivotlow` with configurable lookback.
+- Without this step there is **no proof of directional control**.
+- The origin candidate is IDLE until BOS fires.
+
+### Step 3 — Acceptance Test (Gate 2)
+
+Within a configurable window (default 5 bars) after BOS:
+
+```
+Bull accepted ⇔  close  >  originPx  (price holds above origin midpoint)
+Bear accepted ⇔  close  <  originPx  (price holds below origin midpoint)
+```
+
+If the window expires without acceptance: origin is reset (auction failed).
+
+**This is the institutional secret.** Did the market *accept* higher/lower
+prices? If yes, inventory was acquired and held. If no, the move was a
+sweep or a false auction.
+
+### Step 4 — Momentum Quality Score (0 – 100)
+
+Computed at the moment of expansion (not at validation). Ranks the move:
+
+| Component            | Max pts | Condition                                  |
+|----------------------|---------|--------------------------------------------|
+| Price z-score rank   | 25      | `|z_diff| ≥ threshold × 1.5`              |
+| Volume z-score rank  | 25      | `|z_vol|  ≥ threshold × 1.5`              |
+| Volume ratio (×SMA)  | 25      | `volume / SMA(volume,200) ≥ 3.0`          |
+| Range ratio (×ATR)   | 25      | `(high−low) / ATR(200) ≥ 2.5`             |
+
+Origins below `qualMin` (default 40) are detected but not stored.
+
+### Step 5 — Liquidity Targets
+
+Targets are **NOT** arbitrary RR multiples. They are liquidity pools:
+
+| Level              | Definition                                              |
+|--------------------|---------------------------------------------------------|
+| **BSL**            | Cluster of equal swing highs (buy-side liquidity)       |
+| **SSL**            | Cluster of equal swing lows (sell-side liquidity)       |
+| **PDH / PDL**      | Prior day high / low (most watched session extremes)    |
+| **Bull FVG**       | `high[2] < low` — unfilled upward imbalance             |
+| **Bear FVG**       | `low[2]  > high` — unfilled downward imbalance          |
+
+### Step 6 — Invalidation
+
+```
+Full-body bar ⇔  |close − open| / (high − low)  ≥  bodyRatio  (default 0.5)
+
+Bull invalidated ⇔  close  <  originPx  on a full-body bar
+Bear invalidated ⇔  close  >  originPx  on a full-body bar
+```
+
+Close back through the origin = inventory was distributed. Thesis dead.
+Exit. Reassess from scratch.
+
+---
+
+## 3. What Is Removed (and Why)
+
+| Removed                    | Reason                                              |
+|----------------------------|-----------------------------------------------------|
+| EMA crossovers             | Lagging; explain nothing about inventory            |
+| RSI / MACD                 | Momentum oscillators measure effect, not cause      |
+| ATR-based bias             | Volatility alone has no directional meaning         |
+| Daily pivots / fibs        | Arbitrary; not derived from order flow              |
+| Random S/R line extension  | High volume alone ≠ edge (absorption vs. expansion) |
+| RR multiples as targets    | Institutions target liquidity, not geometry         |
+
+---
+
+## 4. Dashboard Schema
+
+```
+┌──────────────────────────────────────────────────────┐
+│ ORIGIN STATE   │ VALID — BULL ▲                       │
+│ BUS ORIGIN     │ 23 415.50                            │
+│ QUALITY SCORE  │ HIGH  (78 / 100)                     │
+│ zDiff / zVol   │ 2.91  /  3.12                        │
+│ BSL / SSL      │ 23 498.00  /  23 312.00              │
+│ PRIOR DAY H/L  │ 23 510.00  /  23 280.00              │
+│ FVG ZONES      │ 2 active                             │
+│ ORIGINS STORED │ 3 / 10                               │
+│ DO-NOT-TRADE   │ —                                    │
+│ FRAMEWORK      │ z-score + BOS + Acceptance + Liquidity│
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. Build Order (script top-to-bottom)
+## 5. Files
 
-1. `//@version=6` + `indicator()` declaration.
-2. Inputs (9 groups, all volume).
-3. Anchored Session VWAP + bands.
-4. Volume Profile (rebuild on last bar).
-5. CVD accumulator.
-6. HVN z-score detector + level array.
-7. Supply / Demand zone detector + box arrays.
-8. AYA Line resolution.
-9. Bias engine (consensus of three signals).
-10. Invalidation engine (1H full-body close vs volume reference).
-11. Target projection.
-12. Drawing layer (lines, boxes, labels — rebuilt last bar).
-13. Dashboard table.
-14. Alert conditions.
-
----
-
-## 5. Guardrails Encoded in the Script
-
-| Guardrail                            | How                                                |
-|--------------------------------------|-----------------------------------------------------|
-| Wicks never invalidate               | Full-body % filter on 1H close                     |
-| Single in-flight bias                | State machine `{BULL, BEAR, NEUTRAL}`              |
-| Bias only flips on new 1H            | Gated by `ta.change(time("60"))`                   |
-| Min 1:4 RR                           | `rrTP3 ≥ 1.0` enforced (default 4.0)               |
-| Targets die on invalidation          | Cleared in drawing layer                           |
-| Compressed / unbuilt = stand down    | "do-not-trade" row keys on aVWAP std-dev / VP NA   |
+| File                | Purpose                                               |
+|---------------------|-------------------------------------------------------|
+| `AYA_Line.pine`     | Pine Script v6 — full #MoModel engine                 |
+| `Volumatic_SR.pine` | Pine Script v5 — BigBeluga original (companion)       |
+| `ROADMAP.md`        | This document                                         |
 
 ---
 
 ## 6. Roadmap Beyond v1
 
-- v1.1 — multi-session volume profile (RTH vs ETH split).
-- v1.2 — footprint-style delta divergence detector.
-- v1.3 — webhook payload for execution bot.
-- v1.4 — `strategy()` clone for back-testing same logic core.
-- v2.0 — adaptive R-multiples based on realised-volume regime.
-
----
-
-> "Capital preservation creates longevity. Longevity creates opportunity."
-
+- v1.1 — multi-origin tracking (queue, not just latest candidate).
+- v1.2 — footprint delta proxy using tick-rule CVD for finer acceptance.
+- v1.3 — webhook payload for execution bot integration.
+- v1.4 — `strategy()` clone to back-test pipeline over historical data.
+- v2.0 — dynamic quality threshold adapting to volatility regime.
