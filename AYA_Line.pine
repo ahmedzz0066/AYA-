@@ -1,0 +1,746 @@
+//@version=6
+// =============================================================================
+// AYA LINE — #MoModel v4   (FIRST-PRINCIPLES PROBABILITY ENGINE)
+// =============================================================================
+// "Statistical Expansion + Institutional Participation
+//  + Auction Acceptance + Liquidity Targeting"
+//
+// Reduced to first principles. Every line answers ONE market-maker question:
+//
+//   Q1  Where was inventory acquired?      → ORIGIN ZONE  (a range, not a line)
+//   Q2  Was control transferred?           → STRUCTURE SHIFT (pivot OR fast)
+//   Q3  Did the auction accept the price?  → 3 SIMULTANEOUS TESTS
+//   Q4  Is participation continuing?       → PERSISTENCE  (vol-conf / vol-total)
+//   Q5  Is the trend efficient?            → EFFICIENCY  (net / total path)
+//   Q6  Is mean reversion likely?          → MR FACTOR  (distance in R units)
+//   Q7  What's the next liquidity pool?    → TARGET STACK (BSL/SSL/PDH/PDL/FVG)
+//
+// The headline output is ONE number — CONTINUATION PROBABILITY (0–100):
+//
+//      ContProb  =  quality × efficiency × persistence × (1 − MR_factor) × 100
+//
+// Quality is itself a GEOMETRIC mean of four normalised components, so any
+// single weak component drags the whole score down (multiplicative penalty).
+//
+// Foundation:  BigBeluga Volumatic z-score  (MPL-2.0 © BigBeluga)
+// Architecture: AYA #MoModel v4 — first-principles reduction
+// =============================================================================
+
+indicator("AYA Line — #MoModel v4", shorttitle="AYA #MoModel v4",
+     overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+gZ      = "1 ▸ Z-score Engine  (BigBeluga foundation)"
+gZone   = "2 ▸ Origin Zone  (Demand / Supply range)"
+gBOS    = "3 ▸ Structure Shift  — Gate 1"
+gAcc    = "4 ▸ Acceptance  — Gates 2 / 3 / 4"
+gQual   = "5 ▸ Quality  (multiplicative)"
+gMR     = "6 ▸ Mean Reversion"
+gTgt    = "7 ▸ Liquidity Targets"
+gInv    = "8 ▸ Invalidation"
+gStyle  = "9 ▸ Style"
+gDash   = "10 ▸ Dashboard & Probability"
+
+// — z-score —
+zLen      = input.int  (200,  "Z-score window",                minval=50,        group=gZ)
+zLevel    = input.float(2.4,  "Expansion threshold |z|",       step=0.1,         group=gZ)
+zMax      = input.int  (8,    "Max stored origins",            maxval=20,        group=gZ)
+
+// — origin zone —
+zoneMode  = input.string("Half-candle", "Zone definition",
+     options=["Half-candle", "Full-candle", "Anchored consolidation"],            group=gZone)
+consoLen  = input.int  (5,    "Consolidation lookback (anchored)", minval=2,     group=gZone)
+showZones = input.bool (true, "Draw origin zone boxes",                           group=gZone)
+
+// — structure shift —
+pivLen    = input.int  (5,    "Swing pivot length",            minval=2,          group=gBOS)
+useFastBOS= input.bool (true, "Allow fast BOS (impulse breaks recent extreme)",   group=gBOS)
+fastLen   = input.int  (5,    "Fast BOS lookback",             minval=2,          group=gBOS)
+
+// — acceptance (multi-test) —
+accWin    = input.int  (5,    "Acceptance window (bars)",      minval=1,          group=gAcc)
+accMinEff = input.float(0.40, "Min directional efficiency",    step=0.05,
+     minval=0.0, maxval=1.0,                                                       group=gAcc)
+accMinPer = input.float(0.55, "Min persistent volume ratio",   step=0.05,
+     minval=0.50, maxval=0.95,                                                     group=gAcc)
+
+// — quality —
+qualMin   = input.int  (30,   "Min quality to store (0-100)",  minval=0,
+     maxval=100,                                                                   group=gQual)
+
+// — mean reversion —
+mrMaxR    = input.float(3.0,  "Max distance in origin R",      step=0.5,
+     minval=1.5,                                                                   group=gMR)
+
+// — targets —
+eqTolPct  = input.float(0.10, "Equal H/L tolerance (%)",       step=0.01,         group=gTgt)
+fvgMax    = input.int  (3,    "Max FVG zones",                 maxval=8,          group=gTgt)
+showBSL   = input.bool (true, "Show BSL / SSL",                                   group=gTgt)
+showFVG   = input.bool (true, "Show FVG",                                          group=gTgt)
+showPD    = input.bool (true, "Show PDH / PDL",                                    group=gTgt)
+
+// — invalidation —
+invBody   = input.float(0.5,  "Full-body min ratio",           step=0.05,
+     minval=0.3, maxval=0.95,                                                      group=gInv)
+invMode   = input.string("Outer edge", "Invalidation reference",
+     options=["Outer edge", "Inner edge", "Origin midpoint"],                      group=gInv)
+
+// — style —
+colBull   = input.color(color.new(#00e677, 0),  "Bull",           group=gStyle)
+colBear   = input.color(color.new(#f18a45, 0),  "Bear",           group=gStyle)
+colDemand = input.color(color.new(#22c55e, 80), "Demand zone",    group=gStyle)
+colSupply = input.color(color.new(#ef4444, 80), "Supply zone",    group=gStyle)
+colMOL    = input.color(color.new(#008cff, 0),  "MOLiNE",         group=gStyle)
+colBSL    = input.color(color.new(#38bdf8, 0),  "BSL",            group=gStyle)
+colSSL    = input.color(color.new(#fb7185, 0),  "SSL",            group=gStyle)
+colFVG    = input.color(color.new(#a78bfa, 80), "FVG",            group=gStyle)
+colPDH    = input.color(color.new(#fbbf24, 0),  "PDH",            group=gStyle)
+colPDL    = input.color(color.new(#fbbf24, 0),  "PDL",            group=gStyle)
+colInv    = input.color(color.new(#f43f5e, 0),  "Invalidation",   group=gStyle)
+colMR     = input.color(color.new(#fb923c, 60), "Mean reversion", group=gStyle)
+colNeu    = input.color(color.new(color.gray, 0),"Neutral",       group=gStyle)
+
+// — dashboard —
+showDash    = input.bool  (true,        "Show dashboard",           group=gDash)
+dashPos     = input.string("top_right", "Position",
+     options=["top_right","top_left","bottom_right","bottom_left","middle_right"], group=gDash)
+contMinShow = input.int   (60,          "Highlight ContProb above (%)", minval=0,
+     maxval=100,                                                                   group=gDash)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 1 — Z-SCORE ENGINE  (BigBeluga foundation, only valid input)
+// ═════════════════════════════════════════════════════════════════════════════
+zNorm(float src) =>
+    m = ta.sma(src, zLen)
+    s = ta.stdev(src, zLen)
+    s > 0 ? (src - m) / s : 0.0
+
+diffPx    = close - open
+volSigned = close > open ? volume : -volume
+zDiff = zNorm(diffPx)
+zVol  = zNorm(volSigned)
+
+bullExpand = zDiff >  zLevel and zVol >  zLevel
+bearExpand = zDiff < -zLevel and zVol < -zLevel
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 2 — STRUCTURE SHIFT (multi-method BOS)
+//   Method A — classical pivot break  (slower, reliable)
+//   Method B — impulse bar itself breaks N-bar extreme  (fast, aggressive)
+// ═════════════════════════════════════════════════════════════════════════════
+phigh = ta.pivothigh(high, pivLen, pivLen)
+plow  = ta.pivotlow (low,  pivLen, pivLen)
+
+var float lastPH = na
+var float lastPL = na
+if not na(phigh)
+    lastPH := phigh
+if not na(plow)
+    lastPL := plow
+
+bosA_up = not na(lastPH) and ta.crossover (close, lastPH)
+bosA_dn = not na(lastPL) and ta.crossunder(close, lastPL)
+
+recentH = ta.highest(high[1], fastLen)
+recentL = ta.lowest (low[1],  fastLen)
+bosB_up = useFastBOS and bullExpand and close > recentH
+bosB_dn = useFastBOS and bearExpand and close < recentL
+
+bosUp = bosA_up or bosB_up
+bosDn = bosA_dn or bosB_dn
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 3 — ORIGIN ZONE & STATE MACHINE
+//   States: 0=idle 1=expansion 2=BOS-confirmed 3=valid -1=invalidated
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Active origin (current candidate / accepted)
+var int   originState = 0
+var int   originDir   = 0
+var int   originBarN  = 0
+var float originVol_  = 0.0
+var float originTop   = na
+var float originBot   = na
+var float originMid_  = na
+var float originR     = na
+var float originQual  = 0.0
+
+// Path tracking from BOS bar
+var int   bosBarN      = 0
+var float pathExtreme  = na
+var float pathOpposite = na
+var float volConf      = 0.0
+var float volAgainst   = 0.0
+
+// Live test outputs (kept persistent so probability engine can read them)
+var float currEff      = 0.0
+var float currPersist  = 0.0
+var float mrFactor     = 0.0
+
+// Validated origin storage
+var array<float> molTop   = array.new<float>(0)
+var array<float> molBot   = array.new<float>(0)
+var array<int>   molDir   = array.new<int>(0)
+var array<float> molQual  = array.new<float>(0)
+var array<bool>  molInv   = array.new<bool>(0)
+var array<int>   molBarN  = array.new<int>(0)
+var array<float> molVol   = array.new<float>(0)
+
+// — Build the origin zone for the just-fired expansion —
+f_makeZone() =>
+    float t = na
+    float b = na
+    if zoneMode == "Half-candle"
+        if bullExpand
+            t := (open + close) / 2.0
+            b := low
+        else
+            t := high
+            b := (open + close) / 2.0
+    else if zoneMode == "Full-candle"
+        t := high
+        b := low
+    else
+        t := ta.highest(high[1], consoLen)
+        b := ta.lowest (low[1],  consoLen)
+    [t, b]
+
+// — Quality score (multiplicative / geometric mean) —
+f_quality() =>
+    vr = ta.sma(volume, 200) > 0 ? volume / ta.sma(volume, 200) : 1.0
+    rr = ta.atr(200) > 0 ? (high - low) / ta.atr(200) : 1.0
+    q1 = math.min(1.0, math.abs(zDiff) / (zLevel * 1.5))
+    q2 = math.min(1.0, math.abs(zVol)  / (zLevel * 1.5))
+    q3 = math.min(1.0, vr / 3.0)
+    q4 = math.min(1.0, rr / 2.5)
+    base = math.max(0.0001, q1 * q2 * q3 * q4)
+    math.pow(base, 0.25) * 100.0
+
+// ── State transitions ────────────────────────────────────────────────────
+// Trigger: new expansion always replaces active candidate
+if bullExpand or bearExpand
+    [t_, b_] = f_makeZone()
+    originTop  := t_
+    originBot  := b_
+    originMid_ := (t_ + b_) / 2.0
+    originR    := math.max(syminfo.mintick, t_ - b_)
+    originDir  := bullExpand ? 1 : -1
+    originBarN := bar_index
+    originVol_ := volume
+    originQual := f_quality()
+    originState := 1
+
+    // Fast BOS — same-bar evaluation
+    if useFastBOS
+        if (originDir == 1 and close > recentH) or (originDir == -1 and close < recentL)
+            originState  := 2
+            bosBarN      := bar_index
+            pathExtreme  := close
+            pathOpposite := close
+            volConf      := 0.0
+            volAgainst   := 0.0
+
+// Slow BOS — pivot crossover after expansion
+if originState == 1
+    if (originDir == 1 and bosUp) or (originDir == -1 and bosDn)
+        originState  := 2
+        bosBarN      := bar_index
+        pathExtreme  := close
+        pathOpposite := close
+        volConf      := 0.0
+        volAgainst   := 0.0
+
+// Path tracking after BOS
+if originState == 2 or originState == 3
+    if originDir == 1
+        pathExtreme  := math.max(nz(pathExtreme,  close), high)
+        pathOpposite := math.min(nz(pathOpposite, close), low)
+    else
+        pathExtreme  := math.min(nz(pathExtreme,  close), low)
+        pathOpposite := math.max(nz(pathOpposite, close), high)
+
+    barConfirms = (originDir == 1 and close > open) or (originDir == -1 and close < open)
+    if barConfirms
+        volConf := volConf + volume
+    else
+        volAgainst := volAgainst + volume
+
+    // Live persistence + efficiency
+    netMove   = math.abs(close - originMid_)
+    totalMove = math.abs(pathExtreme - pathOpposite)
+    currEff      := totalMove > 0 ? netMove / totalMove : 0.0
+    totalVol     = volConf + volAgainst
+    currPersist  := totalVol > 0 ? volConf / totalVol : 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 4 — ACCEPTANCE  (3 simultaneous tests)
+//   Test A — close beyond origin zone  (price escaped inventory range)
+//   Test B — persistent volume         (>= accMinPer in confirming direction)
+//   Test C — directional efficiency    (>= accMinEff net/total path)
+// ═════════════════════════════════════════════════════════════════════════════
+testA = false
+testB = false
+testC = false
+
+if originState == 2
+    elapsed = bar_index - bosBarN
+    testA := (originDir == 1 and close > originTop) or
+             (originDir == -1 and close < originBot)
+    testB := currPersist >= accMinPer
+    testC := currEff     >= accMinEff
+
+    if elapsed <= accWin and testA and testB and testC
+        originState := 3
+        if originQual >= qualMin
+            array.push(molTop,  originTop)
+            array.push(molBot,  originBot)
+            array.push(molDir,  originDir)
+            array.push(molQual, originQual)
+            array.push(molInv,  false)
+            array.push(molBarN, originBarN)
+            array.push(molVol,  originVol_)
+            if array.size(molTop) > zMax
+                array.shift(molTop)
+                array.shift(molBot)
+                array.shift(molDir)
+                array.shift(molQual)
+                array.shift(molInv)
+                array.shift(molBarN)
+                array.shift(molVol)
+    else if elapsed > accWin
+        originState := 0  // window expired without acceptance
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 6 — MEAN REVERSION FACTOR
+//   Distance from origin midpoint, normalised in R units (zone-range units).
+//   1.0 R = at zone midpoint travel distance · mrMaxR R = full mean-reversion.
+// ═════════════════════════════════════════════════════════════════════════════
+if not na(originMid_) and not na(originR) and originR > 0
+    distR = math.abs(close - originMid_) / originR
+    mrFactor := math.max(0.0, math.min(1.0, (distR - 1.0) / math.max(0.5, mrMaxR - 1.0)))
+else
+    mrFactor := 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 7 — INVALIDATION  (full-body close back through reference)
+// ═════════════════════════════════════════════════════════════════════════════
+float invLevel = na
+if originState == 3
+    if invMode == "Outer edge"
+        invLevel := originDir == 1 ? originBot : originTop
+    else if invMode == "Inner edge"
+        invLevel := originDir == 1 ? originTop : originBot
+    else
+        invLevel := originMid_
+
+hBody    = math.abs(close - open)
+hRange   = high - low
+fullBody = hRange > 0 and (hBody / hRange) >= invBody
+
+if originState == 3 and fullBody and not na(invLevel)
+    if (originDir == 1 and close < invLevel) or
+       (originDir == -1 and close > invLevel)
+        originState := -1
+
+// Stored-origin invalidation (use outer edge always)
+if fullBody and array.size(molTop) > 0
+    for i = 0 to array.size(molTop) - 1
+        if not array.get(molInv, i)
+            t = array.get(molTop, i)
+            b = array.get(molBot, i)
+            d = array.get(molDir, i)
+            ref = d == 1 ? b : t
+            if (d == 1 and close < ref) or (d == -1 and close > ref)
+                array.set(molInv, i, true)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 8 — CONTINUATION PROBABILITY  (the headline output)
+//   ContProb = quality × efficiency × persistence × (1 − MR_factor) × 100
+// ═════════════════════════════════════════════════════════════════════════════
+contProb = 0.0
+if originState == 3
+    qF = originQual / 100.0
+    eF = math.min(1.0, currEff     / 0.7)   // saturate at 70% efficiency
+    pF = math.min(1.0, currPersist / 0.8)   // saturate at 80% persistence
+    contProb := qF * eF * pF * (1.0 - mrFactor) * 100.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP 5 — LIQUIDITY TARGETS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// — Equal H/L (BSL / SSL) —
+eqTolPx = close * eqTolPct / 100.0
+
+var array<float> swingHs = array.new<float>(0)
+var array<float> swingLs = array.new<float>(0)
+if not na(phigh)
+    array.push(swingHs, phigh)
+    if array.size(swingHs) > 30
+        array.shift(swingHs)
+if not na(plow)
+    array.push(swingLs, plow)
+    if array.size(swingLs) > 30
+        array.shift(swingLs)
+
+float bslLevel = na
+float sslLevel = na
+
+if array.size(swingHs) >= 2
+    szH = array.size(swingHs)
+    for i = 0 to szH - 2
+        h1 = array.get(swingHs, szH - 1 - i)
+        h2 = array.get(swingHs, szH - 2 - i)
+        if math.abs(h1 - h2) <= eqTolPx
+            bslLevel := (h1 + h2) / 2.0
+            break
+
+if array.size(swingLs) >= 2
+    szL = array.size(swingLs)
+    for i = 0 to szL - 2
+        l1 = array.get(swingLs, szL - 1 - i)
+        l2 = array.get(swingLs, szL - 2 - i)
+        if math.abs(l1 - l2) <= eqTolPx
+            sslLevel := (l1 + l2) / 2.0
+            break
+
+// — Prior Day H/L —
+[pdH, pdL] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1]], lookahead=barmerge.lookahead_off)
+
+// — Fair Value Gaps —
+bullFVG = high[2] < low
+bearFVG = low[2]  > high
+
+var array<float> fvgTop = array.new<float>(0)
+var array<float> fvgBot = array.new<float>(0)
+var array<int>   fvgDir = array.new<int>(0)
+
+if bullFVG
+    array.push(fvgTop, low)
+    array.push(fvgBot, high[2])
+    array.push(fvgDir, 1)
+    if array.size(fvgTop) > fvgMax
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+if bearFVG
+    array.push(fvgTop, low[2])
+    array.push(fvgBot, high)
+    array.push(fvgDir, -1)
+    if array.size(fvgTop) > fvgMax
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgDir)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DRAWING LAYER  (rebuilt on barstate.islast)
+// ═════════════════════════════════════════════════════════════════════════════
+var array<line>  molLines  = array.new<line>(0)
+var array<box>   molBoxes  = array.new<box>(0)
+var array<label> allLabels = array.new<label>(0)
+var array<box>   fvgBoxes  = array.new<box>(0)
+var line lnPDH = na
+var line lnPDL = na
+var line lnBSL = na
+var line lnSSL = na
+var line lnAct = na    // active origin midline
+var box  bxAct = na    // active origin zone
+
+f_killLn(line l) =>
+    if not na(l)
+        line.delete(l)
+f_killBx(box b) =>
+    if not na(b)
+        box.delete(b)
+f_clearLA(array<line> a) =>
+    while array.size(a) > 0
+        line.delete(array.shift(a))
+f_clearBA(array<box> a) =>
+    while array.size(a) > 0
+        box.delete(array.shift(a))
+f_clearLbA(array<label> a) =>
+    while array.size(a) > 0
+        label.delete(array.shift(a))
+
+if barstate.islast
+    f_clearLA(molLines)
+    f_clearBA(molBoxes)
+    f_clearLbA(allLabels)
+    f_clearBA(fvgBoxes)
+    f_killLn(lnPDH)
+    f_killLn(lnPDL)
+    f_killLn(lnBSL)
+    f_killLn(lnSSL)
+    f_killLn(lnAct)
+    f_killBx(bxAct)
+
+    n     = bar_index + 30
+    lftX  = bar_index - math.min(bar_index, 300)
+
+    // ── ACTIVE ORIGIN ZONE (current candidate / accepted) ──────────────────
+    if showZones and originState != 0 and not na(originTop) and not na(originBot)
+        bgZone   = originDir == 1 ? colDemand : colSupply
+        bordCol  = originState ==  3 ? (originDir == 1 ? colBull : colBear) :
+                  originState == -1 ? colInv :
+                                       color.new(colNeu, 50)
+        bxAct := box.new(originBarN, originTop, n, originBot,
+             border_color=bordCol, border_width=2,
+             bgcolor=originState == -1 ? color.new(colInv, 90) : bgZone)
+        lnAct := line.new(originBarN, originMid_, n, originMid_,
+             color=color.new(bordCol, 30), style=line.style_dashed,
+             extend=extend.right)
+
+        // Continuation probability badge on active origin
+        if originState == 3
+            contCol = (contProb >= contMinShow ?
+                      color.new(originDir == 1 ? colBull : colBear, 30) :
+                      color.new(color.gray, 50))
+            allLabels.push(label.new(n, originMid_,
+                 "ContProb " + str.tostring(int(contProb)) + "%   Q" +
+                 str.tostring(int(originQual)) + "  Eff " +
+                 str.tostring(int(currEff * 100)) + "%  Pers " +
+                 str.tostring(int(currPersist * 100)) + "%",
+                 style=label.style_label_left, color=contCol,
+                 textcolor=color.white, size=size.small))
+
+    // ── STORED VALIDATED ORIGINS ───────────────────────────────────────────
+    if showZones and array.size(molTop) > 0
+        for i = 0 to array.size(molTop) - 1
+            t   = array.get(molTop,  i)
+            b   = array.get(molBot,  i)
+            d   = array.get(molDir,  i)
+            ql  = array.get(molQual, i)
+            inv = array.get(molInv,  i)
+            bN  = array.get(molBarN, i)
+            vol_= array.get(molVol,  i)
+
+            zoneCol = inv ? color.new(colInv, 92) :
+                      d == 1 ? colDemand : colSupply
+            bordCol = inv ? color.new(colInv, 60) :
+                      d == 1 ? color.new(colBull, 30) :
+                               color.new(colBear, 30)
+            bxStored = box.new(bN, t, n, b,
+                 border_color=bordCol, border_width=1, bgcolor=zoneCol)
+            molBoxes.push(bxStored)
+
+            mid_ = (t + b) / 2.0
+            molLines.push(line.new(bN, mid_, n, mid_,
+                 color=inv ? color.new(colInv, 60) : color.new(colMOL, 40),
+                 style=line.style_dotted, extend=extend.right))
+
+            // Volume + quality badge
+            allLabels.push(label.new(n, mid_,
+                 (inv ? "✗ " : "✓ ") + "Q" + str.tostring(int(ql)) + " · " +
+                 str.tostring(vol_, format.volume),
+                 style=label.style_label_left,
+                 color=color.new(bordCol, 50),
+                 textcolor=color.white, size=size.small))
+
+    // ── BSL / SSL ───────────────────────────────────────────────────────────
+    if showBSL
+        if not na(bslLevel)
+            lnBSL := line.new(lftX, bslLevel, n, bslLevel,
+                 color=colBSL, style=line.style_dotted, width=2,
+                 extend=extend.right)
+            allLabels.push(label.new(n, bslLevel, "BSL",
+                 style=label.style_label_left,
+                 color=color.new(colBSL, 65), textcolor=color.white, size=size.tiny))
+        if not na(sslLevel)
+            lnSSL := line.new(lftX, sslLevel, n, sslLevel,
+                 color=colSSL, style=line.style_dotted, width=2,
+                 extend=extend.right)
+            allLabels.push(label.new(n, sslLevel, "SSL",
+                 style=label.style_label_left,
+                 color=color.new(colSSL, 65), textcolor=color.white, size=size.tiny))
+
+    // ── PDH / PDL ───────────────────────────────────────────────────────────
+    if showPD
+        if not na(pdH)
+            lnPDH := line.new(lftX, pdH, n, pdH,
+                 color=colPDH, style=line.style_dashed, extend=extend.right)
+            allLabels.push(label.new(n, pdH, "PDH",
+                 style=label.style_label_left,
+                 color=color.new(colPDH, 65), textcolor=color.white, size=size.tiny))
+        if not na(pdL)
+            lnPDL := line.new(lftX, pdL, n, pdL,
+                 color=colPDL, style=line.style_dashed, extend=extend.right)
+            allLabels.push(label.new(n, pdL, "PDL",
+                 style=label.style_label_left,
+                 color=color.new(colPDL, 65), textcolor=color.white, size=size.tiny))
+
+    // ── FVG boxes ───────────────────────────────────────────────────────────
+    if showFVG and array.size(fvgTop) > 0
+        for i = 0 to array.size(fvgTop) - 1
+            t = array.get(fvgTop, i)
+            b = array.get(fvgBot, i)
+            fvgBoxes.push(box.new(lftX, t, n, b,
+                 border_color=color.new(colFVG, 40), bgcolor=colFVG))
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BAR-LEVEL VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+barcolor((bullExpand ? colBull : bearExpand ? colBear : na), title="Expansion bar")
+
+plotshape(bosUp, "BOS Up",
+     style=shape.triangleup,   location=location.belowbar,
+     color=colBull, size=size.tiny)
+plotshape(bosDn, "BOS Down",
+     style=shape.triangledown, location=location.abovebar,
+     color=colBear, size=size.tiny)
+
+originJustValid = originState == 3 and originState[1] != 3
+plotshape(originJustValid and originDir ==  1, "Origin Accepted Bull",
+     style=shape.flag, location=location.belowbar,
+     color=colBull, size=size.small)
+plotshape(originJustValid and originDir == -1, "Origin Accepted Bear",
+     style=shape.flag, location=location.abovebar,
+     color=colBear, size=size.small)
+
+originJustInv = originState == -1 and originState[1] != -1
+bgcolor(originJustInv ? color.new(colInv, 75) : na, title="Invalidation flash")
+
+mrAlertActive = originState == 3 and mrFactor >= 0.85
+bgcolor(mrAlertActive ? color.new(colMR, 88) : na, title="Mean reversion warning")
+
+// Hidden plots so values are available in Data Window & alerts
+plot(zDiff,        "z Diff",        display=display.data_window)
+plot(zVol,         "z Vol",         display=display.data_window)
+plot(originQual,   "Quality",       display=display.data_window)
+plot(currEff*100,  "Efficiency %",  display=display.data_window)
+plot(currPersist*100,"Persistence %", display=display.data_window)
+plot(mrFactor*100, "MR Factor %",   display=display.data_window)
+plot(contProb,     "ContProb %",    display=display.data_window)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═════════════════════════════════════════════════════════════════════════════
+posMap_(s) =>
+    (s == "top_left"      ? position.top_left      :
+    s == "bottom_right"  ? position.bottom_right  :
+    s == "bottom_left"   ? position.bottom_left   :
+    s == "middle_right"  ? position.middle_right  : position.top_right)
+
+var table dash = table.new(posMap_(dashPos), 2, 12,
+     border_width=1, frame_color=color.new(color.gray, 50),
+     border_color=color.new(color.gray, 70))
+
+stateTxt = (originState ==  3 ? "VALID — " + (originDir == 1 ? "BULL ▲" : "BEAR ▼") :
+           originState ==  2 ? "BOS — AWAITING ACCEPTANCE" :
+           originState ==  1 ? "EXPANSION — AWAITING BOS" :
+           originState == -1 ? "INVALIDATED" : "IDLE")
+
+stateBg = (originState ==  3 ? color.new(originDir == 1 ? colBull : colBear, 50) :
+          originState ==  2 ? color.new(color.orange, 50) :
+          originState ==  1 ? color.new(color.yellow, 65) :
+          originState == -1 ? color.new(colInv, 55) :
+                               color.new(color.gray, 65))
+
+contBg = (contProb >= 70 ? color.new(colBull, 40) :
+         contProb >= contMinShow ? color.new(color.orange, 40) :
+         contProb >  0 ? color.new(colBear, 60) :
+                         color.new(color.gray, 70))
+
+zoneTxt = (na(originTop) or na(originBot) ? "—" :
+          str.tostring(originBot, format.mintick) + "  →  " +
+          str.tostring(originTop, format.mintick))
+
+dntTxt = (originState == -1 ? "origin invalidated — stand down" :
+         originState ==  0  ? "no expansion — idle" :
+         originState ==  1  ? "awaiting BOS confirmation" :
+         originState ==  2  ? "awaiting acceptance (testA/B/C)" :
+         mrFactor >= 0.85   ? "extended — mean-reversion risk" :
+         contProb < contMinShow ? "low continuation probability" : "—")
+
+f_cell_(int r, int c, string txt, color bg, color tc) =>
+    table.cell(dash, c, r, txt, bgcolor=bg, text_color=tc, text_size=size.small)
+
+if showDash and barstate.islast
+    table.clear(dash, 0, 0, 1, 11)
+
+    f_cell_(0, 0, "ORIGIN STATE",     color.new(color.black, 30), color.white)
+    f_cell_(0, 1, stateTxt,           stateBg,                    color.white)
+
+    f_cell_(1, 0, "CONTINUATION %",   color.new(color.black, 25), color.yellow)
+    f_cell_(1, 1, str.tostring(int(contProb)) + "%",
+         contBg, color.white)
+
+    f_cell_(2, 0, "QUALITY (geomean)",color.new(color.black, 30), color.white)
+    f_cell_(2, 1, str.tostring(int(originQual)) + " / 100",
+         color.new(color.purple, 50), color.white)
+
+    f_cell_(3, 0, "ZONE  bot → top",  color.new(color.black, 30), color.white)
+    f_cell_(3, 1, zoneTxt,            color.new(colMOL, 55), color.white)
+
+    f_cell_(4, 0, "ACCEPT  A / B / C",color.new(color.black, 30), color.white)
+    f_cell_(4, 1, (testA ? "✓" : "✗") + "   " +
+                  (testB ? "✓" : "✗") + "   " +
+                  (testC ? "✓" : "✗"),
+         color.new(color.gray, 55), color.white)
+
+    f_cell_(5, 0, "EFF / PERS / MR",  color.new(color.black, 30), color.white)
+    f_cell_(5, 1, str.tostring(int(currEff*100))     + "%  /  " +
+                  str.tostring(int(currPersist*100)) + "%  /  " +
+                  str.tostring(int(mrFactor*100))    + "%",
+         color.new(color.gray, 55), color.white)
+
+    f_cell_(6, 0, "zDiff / zVol",     color.new(color.black, 30), color.white)
+    f_cell_(6, 1, str.tostring(zDiff, "#.##") + "  /  " + str.tostring(zVol, "#.##"),
+         color.new(color.gray, 55), color.white)
+
+    f_cell_(7, 0, "BSL / SSL",        color.new(color.black, 30), color.white)
+    f_cell_(7, 1, (na(bslLevel) ? "—" : str.tostring(bslLevel, format.mintick)) +
+                  "  /  " + (na(sslLevel) ? "—" : str.tostring(sslLevel, format.mintick)),
+         color.new(color.gray, 55), color.white)
+
+    f_cell_(8, 0, "PDH / PDL",        color.new(color.black, 30), color.white)
+    f_cell_(8, 1, (na(pdH) ? "—" : str.tostring(pdH, format.mintick)) +
+                  "  /  " + (na(pdL) ? "—" : str.tostring(pdL, format.mintick)),
+         color.new(color.gray, 55), color.white)
+
+    f_cell_(9, 0, "FVG / ORIGINS",    color.new(color.black, 30), color.white)
+    f_cell_(9, 1, str.tostring(array.size(fvgTop)) + " fvg  /  " +
+                  str.tostring(array.size(molTop)) + " stored",
+         color.new(colFVG, 55), color.white)
+
+    f_cell_(10, 0, "DO-NOT-TRADE",    color.new(color.black, 30), color.white)
+    f_cell_(10, 1, dntTxt,
+         dntTxt == "—" ? color.new(colBull, 65) : color.new(color.orange, 50),
+         color.white)
+
+    f_cell_(11, 0, "FRAMEWORK",       color.new(color.black, 30), color.white)
+    f_cell_(11, 1, "z + BOS + Accept(A/B/C) + Liquidity → P",
+         color.new(color.black, 55), color.silver)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(bullExpand or bearExpand,
+     title="MoModel v4: Statistical Expansion",
+     message="z-score event — Bus Origin candidate forming.")
+alertcondition(bosUp, title="MoModel v4: BOS Up",
+     message="Bullish structure shift confirmed.")
+alertcondition(bosDn, title="MoModel v4: BOS Down",
+     message="Bearish structure shift confirmed.")
+alertcondition(originJustValid,
+     title="MoModel v4: Origin VALID ✓",
+     message="3-test acceptance passed. Continuation probability live.")
+alertcondition(originJustInv,
+     title="MoModel v4: Origin INVALIDATED ✗",
+     message="Full-body close back through reference. Stand down.")
+alertcondition(originState == 3 and contProb >= 70 and contProb[1] < 70,
+     title="MoModel v4: HIGH-CONVICTION (ContProb ≥ 70%)",
+     message="Continuation probability crossed 70%. Conditions aligned.")
+alertcondition(mrAlertActive and not mrAlertActive[1],
+     title="MoModel v4: Mean Reversion Warning",
+     message="Distance from origin exceeds threshold — reduce / exit.")
+alertcondition(bullFVG or bearFVG,
+     title="MoModel v4: FVG Created",
+     message="Liquidity void detected — magnet for price.")
+alertcondition(not na(bslLevel) and ta.crossover(close, bslLevel),
+     title="MoModel v4: BSL Swept",
+     message="Buy-side liquidity swept — watch for reaction.")
+alertcondition(not na(sslLevel) and ta.crossunder(close, sslLevel),
+     title="MoModel v4: SSL Swept",
+     message="Sell-side liquidity swept — watch for reaction.")
