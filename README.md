@@ -1,62 +1,66 @@
-# AYA Line — #MoModel Institutional Engine
+# AYA Line — #MoModel v4
 
-> "Statistical Expansion + Institutional Participation  
->  + Auction Acceptance + Liquidity Targeting"
+> **First-principles institutional probability engine.**
+> Built on BigBeluga's Volumatic z-score, layered with multi-test acceptance,
+> persistence tracking, efficiency measurement, and mean-reversion gating.
+> Outputs one number you can act on: **Continuation Probability**.
 
-## What this is
+## The headline
 
-An institutional-grade intraday decision-support indicator built on a single
-mathematical foundation: **BigBeluga's Volumatic z-score**.
+```
+ContProb  =  quality × efficiency × persistence × (1 − MR_factor)  × 100
+```
 
-Nothing else is used as an entry filter. No EMAs, no RSI, no ATR-bias,
-no arbitrary fibs. Only statistically abnormal order flow events that pass
-three additional confirmation gates.
+Quality is itself a *geometric mean* of four normalised components — any
+weak link drags the whole probability down. No additive scoring tricks.
+
+## What this is NOT
+
+✗ EMA crossovers · ✗ RSI · ✗ MACD · ✗ ATR-bias  
+✗ Random S/R lines · ✗ Arbitrary RR multiples · ✗ Lagging oscillators
+
+## What this IS
+
+The seven market-maker questions, mapped to deterministic math:
+
+| Q | Question                                  | Answered by                            |
+|---|-------------------------------------------|----------------------------------------|
+| 1 | Where was inventory acquired?             | Origin Zone (range, not a line)        |
+| 2 | Was control transferred?                  | Pivot BOS **or** fast-impulse BOS      |
+| 3 | Did the auction accept the price?         | 3 simultaneous tests (A · B · C)       |
+| 4 | Is participation continuing?              | Persistence ratio                      |
+| 5 | Is the trend efficient?                   | Net-move / total-path                  |
+| 6 | Is mean reversion likely?                 | Distance in R units                    |
+| 7 | Where is the next liquidity pool?         | BSL · SSL · PDH · PDL · FVG            |
 
 ## Files
 
-| File                | Purpose                                                                  |
-|---------------------|--------------------------------------------------------------------------|
-| `AYA_Line.pine`     | Pine Script **v6** — the full #MoModel pipeline                          |
-| `Volumatic_SR.pine` | Pine Script **v5** — BigBeluga's original indicator (MPL-2.0)            |
-| `ROADMAP.md`        | Full mathematical framework, design decisions, and build order           |
-
-## The 6-Step Pipeline
-
-```
-Step 1 — Statistical Expansion   z_diff × z_vol (BigBeluga z-score)
-Step 2 — Structure Shift (BOS)   close > prior pivot high / low
-Step 3 — Acceptance Test         price holds above/below origin ≤ N bars
-Step 4 — Momentum Quality Score  0–100 (expansion + volume + range rank)
-Step 5 — Liquidity Targets       BSL/SSL equal H/L · PDH/PDL · FVG voids
-Step 6 — Invalidation            full-body close back through origin
-```
-
-Only origins that pass ALL gates are drawn as **MOLiNE** (Bus Origin) levels.
-
-## What it draws
-
-- **MOLiNE** — active Bus Origin levels, colored by acceptance / invalidation.
-- **Volume box** — BigBeluga-style volume annotation at the origin candle.
-- **Quality badge** — score label (✓ valid / ✗ invalidated) on each MOLiNE.
-- **BOS markers** — triangle on every structural break.
-- **Origin Accepted** — flag when all gates pass.
-- **BSL / SSL** — equal-high / equal-low liquidity pools.
-- **PDH / PDL** — prior day high and low.
-- **FVG boxes** — fair value gaps (unfilled price imbalances).
-- **Dashboard** — 10-row table: state · origin · quality · z-scores · liquidity.
+| File                | Purpose                                                  |
+|---------------------|----------------------------------------------------------|
+| `AYA_Line.pine`     | Pine Script **v6** — the full v4 engine                  |
+| `Volumatic_SR.pine` | Pine Script **v5** — BigBeluga's original (MPL-2.0)      |
+| `ROADMAP.md`        | Full mathematical framework + v3 → v4 migration notes    |
 
 ## Quick start (TradingView)
 
-1. Open TradingView → Pine Editor.
-2. Paste the contents of `AYA_Line.pine`.
-3. Save → "Add to chart".
-4. Recommended timeframe: **5m** or **15m**.
+1. Pine Editor → paste `AYA_Line.pine` → Save → "Add to chart".
+2. Recommended timeframe: **5m** or **15m**.
+3. Watch the dashboard's **CONTINUATION %** row — that's your decision number.
+4. Optional: also load `Volumatic_SR.pine` on the same chart to cross-reference
+   the BigBeluga visual against the AYA origin zones.
 
-## Companion: Volumatic S/R Levels
+## What you see on the chart
 
-`Volumatic_SR.pine` is BigBeluga's full standalone indicator. The z-score
-logic inside it is the mathematical foundation of `AYA_Line.pine`. Run it
-alongside to see the full BigBeluga visual (percent labels, volume boxes,
-max/min table) as a cross-reference for the MOLiNE levels.
+- **Origin zones** — green for demand, red for supply; rebuilt for each accepted origin.
+- **Active zone** — bordered in bias colour with a dashed midline.
+- **MOLiNE midlines** — dotted blue across each stored origin.
+- **Continuation badge** — "ContProb 67% · Q78 · Eff 71% · Pers 68%" on the active zone.
+- **BSL / SSL** — dotted lines at equal-high / equal-low clusters.
+- **PDH / PDL** — dashed lines.
+- **FVG boxes** — translucent purple over fair-value-gap zones.
+- **BOS triangles** at every structural break.
+- **Origin Accepted flag** when all three tests pass.
+- **Bar-coloured expansion candles** (bull green / bear orange).
+- **Mean-reversion warning flash** when `MR_factor ≥ 0.85`.
 
-See `ROADMAP.md` for the complete mathematical specification.
+See `ROADMAP.md` for the complete first-principles derivation.
