@@ -1,0 +1,397 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © BigBeluga (Pine Script v6 recreation — educational purposes only)
+//@version=6
+indicator("Market Core [BigBeluga]", shorttitle="MC [BB]", overlay=true,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_bars_back    = 500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+var string G_OB = "⬤ Order Blocks"
+ob_show      = input.bool(true,  "Show Order Blocks",        group = G_OB)
+ob_len       = input.int(10,     "Pivot Length",              group = G_OB, minval = 3, maxval = 50)
+ob_max       = input.int(5,      "Max Blocks",                group = G_OB, minval = 1, maxval = 20)
+ob_bull_col  = input.color(color.new(#2196F3, 80), "Bullish OB", group = G_OB)
+ob_bear_col  = input.color(color.new(#FF5252, 80), "Bearish OB", group = G_OB)
+
+var string G_SMC = "⬤ Smart Money Concepts"
+smc_show     = input.bool(true,  "Show SMC",                  group = G_SMC)
+bos_show     = input.bool(true,  "Show BOS / CHOCH",          group = G_SMC)
+fvg_show     = input.bool(true,  "Show Fair Value Gaps",      group = G_SMC)
+fvg_ext      = input.bool(true,  "Extend FVG Until Filled",   group = G_SMC)
+fvg_max      = input.int(10,     "Max FVGs",                  group = G_SMC, minval = 1, maxval = 50)
+dt_show      = input.bool(true,  "Show Double Top / Bottom",  group = G_SMC)
+dt_thresh    = input.float(0.5,  "Double Top/Bot Tolerance %",group = G_SMC, minval = 0.05, maxval = 3.0, step = 0.05)
+smc_len      = input.int(10,     "Structure Pivot Length",    group = G_SMC, minval = 3, maxval = 50)
+
+var string G_SR = "⬤ Support & Resistance"
+sr_show      = input.bool(true,  "Show S/R Levels",           group = G_SR)
+sr_len       = input.int(20,     "Pivot Length",              group = G_SR, minval = 5, maxval = 100)
+sr_max       = input.int(6,      "Max Levels",                group = G_SR, minval = 1, maxval = 15)
+sr_prox      = input.float(0.5,  "Merge Proximity %",         group = G_SR, minval = 0.05, maxval = 3.0, step = 0.05)
+
+var string G_CLR = "⬤ Colors"
+bull_col     = input.color(#2196F3, "Bullish",                group = G_CLR)
+bear_col     = input.color(#FF5252, "Bearish",                group = G_CLR)
+neut_col     = input.color(#FFD700, "Neutral",                group = G_CLR)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Approximate buyer / seller volume split from candle anatomy
+buyVol()  => volume * (close - low)  / math.max(high - low, syminfo.mintick)
+sellVol() => volume * (high - close) / math.max(high - low, syminfo.mintick)
+
+deltaVol = buyVol() - sellVol()
+
+// Volume percentile rank: what % of the past `n` bars had volume ≤ current
+volPctRank(offset, n) =>
+    v   = volume[offset]
+    cnt = 0
+    for i = 0 to n - 1
+        if volume[offset + i] <= v
+            cnt += 1
+    math.round(cnt / n * 100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ORDER BLOCKS
+// ══════════════════════════════════════════════════════════════════════════════
+
+swingH = ta.pivothigh(high, ob_len, ob_len)   // confirmed ob_len bars late
+swingL = ta.pivotlow (low,  ob_len, ob_len)
+
+var array<box>   ob_boxes  = array.new<box>()
+var array<bool>  ob_isBull = array.new<bool>()
+var array<label> ob_lbls   = array.new<label>()
+
+// Trim array to `cap` elements by removing the oldest (front)
+trimOB(cap) =>
+    while array.size(ob_boxes) >= cap
+        box.delete  (array.shift(ob_boxes))
+        label.delete(array.shift(ob_lbls))
+        array.shift (ob_isBull)
+
+if ob_show
+    // ── Remove mitigated OBs; extend surviving ones ──
+    i = 0
+    while i < array.size(ob_boxes)
+        b     = array.get(ob_boxes,  i)
+        is_b  = array.get(ob_isBull, i)
+        top_v = box.get_top(b)
+        bot_v = box.get_bottom(b)
+        // OB is mitigated when price closes through the zone
+        if (is_b and close < bot_v) or (not is_b and close > top_v)
+            box.delete  (b)
+            label.delete(array.get(ob_lbls, i))
+            array.remove(ob_boxes,  i)
+            array.remove(ob_isBull, i)
+            array.remove(ob_lbls,   i)
+        else
+            box.set_right(b, bar_index)
+            i += 1
+
+    // ── New Bearish OB at swing high ──
+    if not na(swingH)
+        trimOB(ob_max)
+        // OB candle = the last bullish body just before the pivot
+        ob_idx = ob_len + 1                    // 1 bar before the pivot bar
+        ob_top = high[ob_idx]
+        ob_bot = math.min(open[ob_idx], close[ob_idx])
+        vr     = volPctRank(ob_idx, 50)
+        rank_s = vr >= 70 ? "Strong" : vr >= 40 ? "High" : "Balanced"
+        bdr    = color.new(bear_col, 0)
+
+        b = box.new(bar_index[ob_idx], ob_bot, bar_index, ob_top,
+             border_color = bdr,
+             bgcolor      = ob_bear_col,
+             border_width = 1)
+        lbl = label.new(bar_index[ob_idx], ob_top,
+             "🔴 " + rank_s + "  " + str.tostring(vr) + "%",
+             style     = label.style_label_right,
+             color     = color.new(bdr, 85),
+             textcolor = bdr,
+             size      = size.small)
+        array.push(ob_boxes,  b)
+        array.push(ob_isBull, false)
+        array.push(ob_lbls,   lbl)
+
+    // ── New Bullish OB at swing low ──
+    if not na(swingL)
+        trimOB(ob_max)
+        ob_idx = ob_len + 1
+        ob_top = math.max(open[ob_idx], close[ob_idx])
+        ob_bot = low[ob_idx]
+        vr     = volPctRank(ob_idx, 50)
+        rank_s = vr >= 70 ? "Strong" : vr >= 40 ? "High" : "Balanced"
+        bdr    = color.new(bull_col, 0)
+
+        b = box.new(bar_index[ob_idx], ob_bot, bar_index, ob_top,
+             border_color = bdr,
+             bgcolor      = ob_bull_col,
+             border_width = 1)
+        lbl = label.new(bar_index[ob_idx], ob_bot,
+             "🔵 " + rank_s + "  " + str.tostring(vr) + "%",
+             style     = label.style_label_right,
+             color     = color.new(bdr, 85),
+             textcolor = bdr,
+             size      = size.small)
+        array.push(ob_boxes,  b)
+        array.push(ob_isBull, true)
+        array.push(ob_lbls,   lbl)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SMART MONEY CONCEPTS — BOS / CHOCH
+// ══════════════════════════════════════════════════════════════════════════════
+
+smc_ph = ta.pivothigh(high, smc_len, smc_len)
+smc_pl = ta.pivotlow (low,  smc_len, smc_len)
+
+var float lastPH     = na
+var int   lastPH_idx = na
+var float lastPL     = na
+var int   lastPL_idx = na
+var bool  trend_up   = true
+var bool  bosB_done  = false   // prevents repeated triggers on same level
+var bool  bosR_done  = false
+
+if not na(smc_ph)
+    lastPH     := smc_ph
+    lastPH_idx := bar_index[smc_len]
+    bosB_done  := false
+
+if not na(smc_pl)
+    lastPL     := smc_pl
+    lastPL_idx := bar_index[smc_len]
+    bosR_done  := false
+
+if smc_show and bos_show
+    // ── Bullish BOS / CHOCH: close breaks above last swing high ──
+    if not na(lastPH) and close > lastPH and not bosB_done
+        bosB_done := true
+        is_choch   = not trend_up          // CHOCH when previously in downtrend
+        lbl_txt    = is_choch ? "CHOCH" : "BOS"
+        clr        = is_choch ? color.new(bull_col, 0) : color.new(bull_col, 40)
+
+        line.new(lastPH_idx, lastPH, bar_index, lastPH,
+             color = clr, width = 1, style = line.style_dashed)
+        label.new(bar_index, lastPH, lbl_txt,
+             style = label.style_label_down,
+             color = color.new(clr, 80), textcolor = clr, size = size.small)
+
+        // Delta volume diamond at the structural pivot
+        dv = 0.0
+        lookback = math.min(bar_index - lastPH_idx, 100)
+        for k = 0 to lookback - 1
+            dv += deltaVol[k]
+        d_clr = dv > 0 ? bull_col : dv < 0 ? bear_col : neut_col
+        label.new(lastPH_idx, lastPH, "◆",
+             style = label.style_none, textcolor = d_clr, size = size.large)
+
+        trend_up := true
+
+    // ── Bearish BOS / CHOCH: close breaks below last swing low ──
+    if not na(lastPL) and close < lastPL and not bosR_done
+        bosR_done := true
+        is_choch   = trend_up             // CHOCH when previously in uptrend
+        lbl_txt    = is_choch ? "CHOCH" : "BOS"
+        clr        = is_choch ? color.new(bear_col, 0) : color.new(bear_col, 40)
+
+        line.new(lastPL_idx, lastPL, bar_index, lastPL,
+             color = clr, width = 1, style = line.style_dashed)
+        label.new(bar_index, lastPL, lbl_txt,
+             style = label.style_label_up,
+             color = color.new(clr, 80), textcolor = clr, size = size.small)
+
+        dv = 0.0
+        lookback = math.min(bar_index - lastPL_idx, 100)
+        for k = 0 to lookback - 1
+            dv += deltaVol[k]
+        d_clr = dv > 0 ? bull_col : dv < 0 ? bear_col : neut_col
+        label.new(lastPL_idx, lastPL, "◆",
+             style = label.style_none, textcolor = d_clr, size = size.large)
+
+        trend_up := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  FAIR VALUE GAPS  (3-candle imbalance)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<box>  fvg_boxes = array.new<box>()
+var array<bool> fvg_bull  = array.new<bool>()
+
+if smc_show and fvg_show
+    // Bullish FVG: gap between high[2] and low[0]
+    if low > high[2]
+        b = box.new(bar_index - 2, high[2], bar_index, low,
+             border_color = color.new(bull_col, 60),
+             bgcolor      = color.new(bull_col, 88),
+             border_width = 1)
+        array.push(fvg_boxes, b)
+        array.push(fvg_bull,  true)
+
+    // Bearish FVG: gap between low[2] and high[0]
+    if high < low[2]
+        b = box.new(bar_index - 2, high, bar_index, low[2],
+             border_color = color.new(bear_col, 60),
+             bgcolor      = color.new(bear_col, 88),
+             border_width = 1)
+        array.push(fvg_boxes, b)
+        array.push(fvg_bull,  false)
+
+    // Process: extend active FVGs or remove when filled
+    i = 0
+    while i < array.size(fvg_boxes)
+        b     = array.get(fvg_boxes, i)
+        is_b  = array.get(fvg_bull,  i)
+        top_v = box.get_top(b)
+        bot_v = box.get_bottom(b)
+        filled = is_b ? low <= top_v : high >= bot_v
+        if filled
+            box.delete  (b)
+            array.remove(fvg_boxes, i)
+            array.remove(fvg_bull,  i)
+        else
+            if fvg_ext
+                box.set_right(b, bar_index)
+            i += 1
+
+    // Cap FVG count
+    while array.size(fvg_boxes) > fvg_max
+        box.delete  (array.shift(fvg_boxes))
+        array.shift (fvg_bull)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  DOUBLE TOP / DOUBLE BOTTOM
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float prev_ph     = na
+var int   prev_ph_idx = na
+var float prev_pl     = na
+var int   prev_pl_idx = na
+
+if smc_show and dt_show
+    if not na(smc_ph)
+        if not na(prev_ph)
+            pct_diff = math.abs(smc_ph - prev_ph) / prev_ph * 100
+            if pct_diff < dt_thresh
+                lvl = math.max(smc_ph, prev_ph)
+                line.new(prev_ph_idx, lvl, bar_index[smc_len], lvl,
+                     color = color.new(bear_col, 0), width = 2)
+                label.new(bar_index[smc_len], lvl, "Double Top ▼",
+                     style     = label.style_label_down,
+                     color     = color.new(bear_col, 80),
+                     textcolor = bear_col,
+                     size      = size.small)
+        prev_ph     := smc_ph
+        prev_ph_idx := bar_index[smc_len]
+
+    if not na(smc_pl)
+        if not na(prev_pl)
+            pct_diff = math.abs(smc_pl - prev_pl) / prev_pl * 100
+            if pct_diff < dt_thresh
+                lvl = math.min(smc_pl, prev_pl)
+                line.new(prev_pl_idx, lvl, bar_index[smc_len], lvl,
+                     color = color.new(bull_col, 0), width = 2)
+                label.new(bar_index[smc_len], lvl, "Double Bottom ▲",
+                     style     = label.style_label_up,
+                     color     = color.new(bull_col, 80),
+                     textcolor = bull_col,
+                     size      = size.small)
+        prev_pl     := smc_pl
+        prev_pl_idx := bar_index[smc_len]
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SUPPORT & RESISTANCE  (pivot-based, touch-ranked)
+// ══════════════════════════════════════════════════════════════════════════════
+
+sr_ph = ta.pivothigh(high, sr_len, sr_len)
+sr_pl = ta.pivotlow (low,  sr_len, sr_len)
+
+var array<float> sr_lvls  = array.new<float>()
+var array<int>   sr_cnts  = array.new<int>()
+var array<line>  sr_lines = array.new<line>()
+var array<label> sr_lbls  = array.new<label>()
+var array<bool>  sr_sup   = array.new<bool>()
+
+// Find the index of an existing nearby level; -1 if none
+findNear(lvl) =>
+    result = -1
+    thresh = lvl * sr_prox / 100
+    for i = 0 to array.size(sr_lvls) - 1
+        if math.abs(array.get(sr_lvls, i) - lvl) <= thresh
+            result := i
+            break
+    result
+
+// Register a pivot as a support/resistance level
+addSR(lvl, is_sup) =>
+    clr = is_sup ? color.new(bull_col, 0) : color.new(bear_col, 0)
+    idx = findNear(lvl)
+    if idx >= 0
+        // Level already exists — increment touch count and refresh label
+        new_cnt = array.get(sr_cnts, idx) + 1
+        array.set(sr_cnts, idx, new_cnt)
+        // Stronger levels get a more opaque line
+        alpha   = math.max(0, 70 - new_cnt * 12)
+        line.set_color(array.get(sr_lines, idx), color.new(clr, alpha))
+        label.delete(array.get(sr_lbls, idx))
+        lbl = label.new(bar_index, lvl, str.tostring(new_cnt) + "✕",
+             style     = label.style_none,
+             textcolor = clr,
+             size      = size.small)
+        array.set(sr_lbls, idx, lbl)
+    else
+        // New level — trim if at capacity
+        if array.size(sr_lvls) >= sr_max
+            line.delete (array.shift(sr_lines))
+            label.delete(array.shift(sr_lbls))
+            array.shift (sr_lvls)
+            array.shift (sr_cnts)
+            array.shift (sr_sup)
+        ln = line.new(bar_index[sr_len], lvl, bar_index, lvl,
+             color = color.new(clr, 60), width = 1, style = line.style_dotted)
+        lbl = label.new(bar_index, lvl, "1✕",
+             style     = label.style_none,
+             textcolor = clr,
+             size      = size.small)
+        array.push(sr_lines, ln)
+        array.push(sr_lbls,  lbl)
+        array.push(sr_lvls,  lvl)
+        array.push(sr_cnts,  1)
+        array.push(sr_sup,   is_sup)
+
+if sr_show
+    if not na(sr_ph)
+        addSR(sr_ph, false)
+    if not na(sr_pl)
+        addSR(sr_pl, true)
+
+    // Extend all active lines to the current bar
+    if array.size(sr_lines) > 0
+        for i = 0 to array.size(sr_lines) - 1
+            line.set_x2(array.get(sr_lines, i), bar_index)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TREND BIAS BACKGROUND  (subtle shading from BOS / CHOCH state)
+// ══════════════════════════════════════════════════════════════════════════════
+
+bgcolor(trend_up ? color.new(bull_col, 97) : color.new(bear_col, 97), title = "Trend Bias BG")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CURRENT TREND LABEL  (top-right corner)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    trend_txt = trend_up ? "▲ Bullish" : "▼ Bearish"
+    trend_clr = trend_up ? bull_col     : bear_col
+    label.new(bar_index, high,
+         "Market Core\n" + trend_txt,
+         style     = label.style_label_left,
+         color     = color.new(trend_clr, 80),
+         textcolor = trend_clr,
+         size      = size.normal)
