@@ -186,8 +186,9 @@ if smc_show and bos_show
         // Delta volume diamond at the structural pivot
         dv = 0.0
         lookback = math.min(bar_index - lastPH_idx, 100)
-        for k = 0 to lookback - 1
-            dv += deltaVol[k]
+        if lookback > 0
+            for k = 0 to lookback - 1
+                dv += deltaVol[k]
         d_clr = dv > 0 ? bull_col : dv < 0 ? bear_col : neut_col
         label.new(lastPH_idx, lastPH, "◆",
              style = label.style_none, textcolor = d_clr, size = size.large)
@@ -209,8 +210,9 @@ if smc_show and bos_show
 
         dv = 0.0
         lookback = math.min(bar_index - lastPL_idx, 100)
-        for k = 0 to lookback - 1
-            dv += deltaVol[k]
+        if lookback > 0
+            for k = 0 to lookback - 1
+                dv += deltaVol[k]
         d_clr = dv > 0 ? bull_col : dv < 0 ? bear_col : neut_col
         label.new(lastPL_idx, lastPL, "◆",
              style = label.style_none, textcolor = d_clr, size = size.large)
@@ -322,10 +324,11 @@ var array<bool>  sr_sup   = array.new<bool>()
 findNear(lvl) =>
     result = -1
     thresh = lvl * sr_prox / 100
-    for i = 0 to array.size(sr_lvls) - 1
-        if math.abs(array.get(sr_lvls, i) - lvl) <= thresh
-            result := i
-            break
+    if array.size(sr_lvls) > 0
+        for i = 0 to array.size(sr_lvls) - 1
+            if math.abs(array.get(sr_lvls, i) - lvl) <= thresh
+                result := i
+                break
     result
 
 // Register a pivot as a support/resistance level
