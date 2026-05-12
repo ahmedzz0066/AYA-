@@ -405,35 +405,36 @@ if i_show_tbl
                text_color=i_col_val, text_size=size.tiny)
 
     // POC distance in ticks (direction-colored: above = green, below = red)
-    float poc_dist  = not na(poc_price) and syminfo.mintick > 0 ?
-                      math.abs(close - poc_price) / syminfo.mintick : na
-    color dist_col  = not na(poc_dist) ?
-                      (close >= poc_price ? i_col_vah : i_col_val) : #9E9E9E
+    float poc_dist = na
+    if not na(poc_price) and syminfo.mintick > 0
+        poc_dist := math.abs(close - poc_price) / syminfo.mintick
+    color dist_col = #9E9E9E
+    if not na(poc_dist)
+        dist_col := close >= poc_price ? i_col_vah : i_col_val
+    string poc_dist_str = not na(poc_dist) ? str.tostring(int(poc_dist)) + " t" : "-"
     table.cell(_tbl, 0, 4, "POC dist", text_color=#9E9E9E, text_size=size.tiny)
-    table.cell(_tbl, 1, 4, not na(poc_dist) ? str.tostring(int(poc_dist)) + " t" : "-",
-               text_color=dist_col, text_size=size.tiny)
+    table.cell(_tbl, 1, 4, poc_dist_str, text_color=dist_col, text_size=size.tiny)
 
     // Cumulative Volume Delta — live, resets on session start
-    color cvd_col = session_cvd > 0 ? #00E676 : session_cvd < 0 ? #FF1744 : #9E9E9E
+    color cvd_col = session_cvd > 0 ? color.new(#00E676, 0) : session_cvd < 0 ? color.new(#FF1744, 0) : color.new(#9E9E9E, 0)
     table.cell(_tbl, 0, 5, "CVD", text_color=#9E9E9E, text_size=size.tiny)
-    table.cell(_tbl, 1, 5, str.tostring(int(session_cvd), "#,###"),
-               text_color=cvd_col, text_size=size.tiny)
+    table.cell(_tbl, 1, 5, str.tostring(int(session_cvd), "#,###"), text_color=cvd_col, text_size=size.tiny)
 
-    // Profile balance: bull% of session volume (>55% bull=buyers in control)
-    color bal_col = not na(prof_bull_pct) ?
-                    (prof_bull_pct > 55 ? #00E676 : prof_bull_pct < 45 ? #FF1744 : #FFD700) :
-                    #9E9E9E
+    // Profile balance: bull% of session volume (>55% = buyers in control)
+    color bal_col = color.new(#9E9E9E, 0)
+    if not na(prof_bull_pct)
+        bal_col := prof_bull_pct > 55 ? color.new(#00E676, 0) : prof_bull_pct < 45 ? color.new(#FF1744, 0) : color.new(#FFD700, 0)
+    string bal_str = not na(prof_bull_pct) ? str.tostring(prof_bull_pct, "#.0") + "%" : "-"
     table.cell(_tbl, 0, 6, "Bull vol%", text_color=#9E9E9E, text_size=size.tiny)
-    table.cell(_tbl, 1, 6, not na(prof_bull_pct) ?
-               str.tostring(prof_bull_pct, "#.0") + "%" : "-",
-               text_color=bal_col, text_size=size.tiny)
+    table.cell(_tbl, 1, 6, bal_str, text_color=bal_col, text_size=size.tiny)
 
     // VA position: where is price relative to Value Area (0% = at VAL, 100% = at VAH)
     float va_range = not na(vah_price) and not na(val_price) ? vah_price - val_price : na
     float va_pos   = va_range > 0 ? (close - val_price) / va_range * 100.0 : na
     bool  in_va    = not na(va_pos) and va_pos >= 0 and va_pos <= 100
-    color vap_col  = not na(va_pos) ?
-                     (va_pos > 75 ? #00E676 : va_pos < 25 ? #FF1744 : #FFD700) : #9E9E9E
+    color vap_col  = color.new(#9E9E9E, 0)
+    if not na(va_pos)
+        vap_col := va_pos > 75 ? color.new(#00E676, 0) : va_pos < 25 ? color.new(#FF1744, 0) : color.new(#FFD700, 0)
     string vap_str = not na(va_pos) ? str.tostring(math.round(va_pos)) + "% " + (in_va ? "IN" : "OUT") : "-"
     table.cell(_tbl, 0, 7, "VA pos", text_color=#9E9E9E, text_size=size.tiny)
     table.cell(_tbl, 1, 7, vap_str, text_color=vap_col, text_size=size.tiny)
