@@ -86,9 +86,9 @@ bool in_session = not i_use_sess or not na(time(timeframe.period, i_session))
 
 // Session-start: new RTH/ETH open, or new calendar day when unfiltered.
 // Friday→Saturday weekend gap is explicitly excluded.
-bool is_sess_start = i_use_sess
-     ? (in_session and not in_session[1])
-     : ta.change(dayofweek) != 0
+bool is_sess_start = i_use_sess ?
+     (in_session and not in_session[1]) :
+     ta.change(dayofweek) != 0
        and not (dayofweek[1] == dayofweek.friday and dayofweek == dayofweek.saturday)
 
 // CVD: directional proxy.  close>open = aggressive buy; else = aggressive sell.
@@ -405,10 +405,10 @@ if i_show_tbl
                text_color=i_col_val, text_size=size.tiny)
 
     // POC distance in ticks (direction-colored: above = green, below = red)
-    float poc_dist  = not na(poc_price) and syminfo.mintick > 0
-                      ? math.abs(close - poc_price) / syminfo.mintick : na
-    color dist_col  = not na(poc_dist)
-                      ? (close >= poc_price ? i_col_vah : i_col_val) : #9E9E9E
+    float poc_dist  = not na(poc_price) and syminfo.mintick > 0 ?
+                      math.abs(close - poc_price) / syminfo.mintick : na
+    color dist_col  = not na(poc_dist) ?
+                      (close >= poc_price ? i_col_vah : i_col_val) : #9E9E9E
     table.cell(_tbl, 0, 4, "POC dist", text_color=#9E9E9E, text_size=size.tiny)
     table.cell(_tbl, 1, 4, not na(poc_dist) ? str.tostring(int(poc_dist)) + " t" : "-",
                text_color=dist_col, text_size=size.tiny)
@@ -420,20 +420,20 @@ if i_show_tbl
                text_color=cvd_col, text_size=size.tiny)
 
     // Profile balance: bull% of session volume (>55% bull=buyers in control)
-    color bal_col = not na(prof_bull_pct)
-                    ? (prof_bull_pct > 55 ? #00E676 : prof_bull_pct < 45 ? #FF1744 : #FFD700)
-                    : #9E9E9E
+    color bal_col = not na(prof_bull_pct) ?
+                    (prof_bull_pct > 55 ? #00E676 : prof_bull_pct < 45 ? #FF1744 : #FFD700) :
+                    #9E9E9E
     table.cell(_tbl, 0, 6, "Bull vol%", text_color=#9E9E9E, text_size=size.tiny)
-    table.cell(_tbl, 1, 6, not na(prof_bull_pct)
-               ? str.tostring(prof_bull_pct, "#.0") + "%" : "-",
+    table.cell(_tbl, 1, 6, not na(prof_bull_pct) ?
+               str.tostring(prof_bull_pct, "#.0") + "%" : "-",
                text_color=bal_col, text_size=size.tiny)
 
     // VA position: where is price relative to Value Area (0% = at VAL, 100% = at VAH)
     float va_range = not na(vah_price) and not na(val_price) ? vah_price - val_price : na
     float va_pos   = va_range > 0 ? (close - val_price) / va_range * 100.0 : na
     bool  in_va    = not na(va_pos) and va_pos >= 0 and va_pos <= 100
-    color vap_col  = not na(va_pos)
-                     ? (va_pos > 75 ? #00E676 : va_pos < 25 ? #FF1744 : #FFD700) : #9E9E9E
+    color vap_col  = not na(va_pos) ?
+                     (va_pos > 75 ? #00E676 : va_pos < 25 ? #FF1744 : #FFD700) : #9E9E9E
     string vap_str = not na(va_pos) ? str.tostring(math.round(va_pos)) + "% " + (in_va ? "IN" : "OUT") : "-"
     table.cell(_tbl, 0, 7, "VA pos", text_color=#9E9E9E, text_size=size.tiny)
     table.cell(_tbl, 1, 7, vap_str, text_color=vap_col, text_size=size.tiny)
