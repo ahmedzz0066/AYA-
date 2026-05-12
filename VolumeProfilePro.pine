@@ -312,16 +312,20 @@ if barstate.islast
                     border_color=color.new(chart.fg_color, 96), bgcolor=sc)
 
     // Stacked imbalance overlays
+    // Guard: Pine Script `for z = 0 to -1` does NOT skip — it iterates
+    // downward with step -1 when from > to. We must explicitly skip when
+    // the imb array is empty, otherwise array.get(imb, 0) fires on size=0.
     int zone_count = array.size(imb) / 3
-    for z = 0 to zone_count - 1
-        int   z0  = int(array.get(imb, z * 3))
-        int   z1  = int(array.get(imb, z * 3 + 1))
-        float dir = array.get(imb, z * 3 + 2)
-        float z_lo = array.get(_lvls, z0)
-        float z_hi = array.get(_lvls, z1 + 1)
-        color zc  = dir > 0 ? i_col_imb_b : i_col_imb_s
-        box.new(b - lookback, z_hi, b, z_lo,
-                border_color=color.new(zc, 15), border_width=1, bgcolor=zc)
+    if zone_count > 0
+        for z = 0 to zone_count - 1
+            int   z0  = int(array.get(imb, z * 3))
+            int   z1  = int(array.get(imb, z * 3 + 1))
+            float dir = array.get(imb, z * 3 + 2)
+            float z_lo = array.get(_lvls, z0)
+            float z_hi = array.get(_lvls, z1 + 1)
+            color zc  = dir > 0 ? i_col_imb_b : i_col_imb_s
+            box.new(b - lookback, z_hi, b, z_lo,
+                    border_color=color.new(zc, 15), border_width=1, bgcolor=zc)
 
     // POC line + label
     line.new(b - lookback, poc_price, b + i_width, poc_price,
