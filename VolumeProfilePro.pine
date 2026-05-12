@@ -118,32 +118,33 @@ if barstate.islast
         label.delete(lbl)
 
     // ── 4b. Price range for the lookback window ───────────────────────────────
-    int   lookback = math.min(i_lookback, bar_index)
+    // lookback must be >= 1; ta.highest/lowest are undefined with length 0
+    int   lookback = math.max(1, math.min(i_lookback, bar_index))
     float hi       = ta.highest(high, lookback)
     float lo       = ta.lowest(low,   lookback)
 
     // Degenerate-range guard (illiquid symbols, pre-market flats, holidays)
-    if hi - lo < syminfo.mintick * 4
-        hi += syminfo.mintick * 20
-        lo -= syminfo.mintick * 20
+    if na(hi) or na(lo) or hi - lo < syminfo.mintick * 4
+        hi := nz(hi, close) + syminfo.mintick * 20
+        lo := nz(lo, close) - syminfo.mintick * 20
 
     float step = (hi - lo) / i_rows
 
-    // ── 4c. Rebuild level boundaries and volume arrays ────────────────────────
-    array.clear(_lvls)
-    array.clear(_bvols)
-    array.clear(_svols)
+    // ── 4c. Rebuild arrays — assign new arrays of exact size so they are
+    //        never empty; array.set() is used instead of push() to avoid
+    //        any transient empty-array state during the fill loop.
+    _lvls  := array.new_float(i_rows + 1, 0.0)
+    _bvols := array.new_float(i_rows, 0.0)
+    _svols := array.new_float(i_rows, 0.0)
 
-    for i = 0 to i_rows          // i_rows + 1 boundary prices
-        array.push(_lvls, lo + i * step)
-
-    for i = 0 to i_rows - 1
-        array.push(_bvols, 0.0)
-        array.push(_svols, 0.0)
+    for i = 0 to i_rows
+        array.set(_lvls, i, lo + i * step)
 
     // ── 4d. Volume assignment — O(lookback), O(1) per bar via direct indexing ─
     // Direct bin formula eliminates the O(rows) inner-loop from the original.
     for offset = 0 to lookback - 1
+        if na(step) or step <= 0
+            break
         // Session filter: time(tf, session) is a series; [offset] reads history.
         if i_use_sess and na(time(timeframe.period, i_session)[offset])
             continue
