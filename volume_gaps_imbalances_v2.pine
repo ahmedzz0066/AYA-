@@ -129,12 +129,21 @@ if barstate.islast
     //~~}
 
     // ~~ Volume assignment {
+    // Helper: safely turn a price into a row index, NaN-proof and bounds-proof.
+    // (Implemented inline because Pine v6 forbids function defs in local scope.)
     for i = lkb to 0
-        float v  = nz(volume[i])
-        float hb = high[i]
-        float lb = low[i]
-        float cb = close[i]
-        float ob = open[i]
+        float v_raw = volume[i]
+        float hb_raw = high[i]
+        float lb_raw = low[i]
+        float cb_raw = close[i]
+        // Skip bars with missing data — common on instruments without volume
+        // or before the symbol's listing history.
+        if na(v_raw) or na(hb_raw) or na(lb_raw) or na(cb_raw)
+            continue
+        float v   = v_raw
+        float hb  = hb_raw
+        float lb  = lb_raw
+        float cb  = cb_raw
         float rng = hb - lb
 
         // Range-weighted buy/sell shares (replaces close>open candle-color delta)
@@ -144,28 +153,46 @@ if barstate.islast
         float v_sell = v * sell_share
 
         if spread_vol and step > 0 and rng > 0
-            // Distribute across every row [low, high] traverses
-            int j_lo = math.max(0,        int(math.floor((lb - lo) / step)))
-            int j_hi = math.min(rows - 1, int(math.floor((hb - lo) / step)))
+            // Distribute across every row [low, high] traverses.
+            // Double-clamp: math.min/max may not bound an Infinity from a degenerate
+            // step, so we also reject indices outside [0, rows-1] inside the loop.
+            int j_lo_raw = int(math.floor((lb - lo) / step))
+            int j_hi_raw = int(math.floor((hb - lo) / step))
+            int j_lo = math.max(0,        math.min(rows - 1, j_lo_raw))
+            int j_hi = math.max(0,        math.min(rows - 1, j_hi_raw))
+            if j_lo > j_hi
+                int tmp = j_lo
+                j_lo := j_hi
+                j_hi := tmp
             int span = math.max(1, j_hi - j_lo + 1)
             float share_buy  = v_buy  / span
             float share_sell = v_sell / span
             for j = j_lo to j_hi
-                bull_vols.set(j, bull_vols.get(j) + share_buy)
-                bear_vols.set(j, bear_vols.get(j) + share_sell)
-                traversed.set(j, traversed.get(j) + 1.0)
+                if j >= 0 and j < rows
+                    bull_vols.set(j, bull_vols.get(j) + share_buy)
+                    bear_vols.set(j, bear_vols.get(j) + share_sell)
+                    traversed.set(j, traversed.get(j) + 1.0)
         else
-            // Legacy single-row dump for users who want it
-            float p = src[i]
-            int j = step > 0 ? math.max(0, math.min(rows - 1, int(math.floor((p - lo) / step)))) : 0
-            bull_vols.set(j, bull_vols.get(j) + v_buy)
-            bear_vols.set(j, bear_vols.get(j) + v_sell)
-            // Mark all traversed rows for gap detection regardless of spread setting
+            // Legacy single-row dump
+            float p_raw = src[i]
+            if not na(p_raw) and step > 0
+                int j_raw = int(math.floor((p_raw - lo) / step))
+                int j = math.max(0, math.min(rows - 1, j_raw))
+                bull_vols.set(j, bull_vols.get(j) + v_buy)
+                bear_vols.set(j, bear_vols.get(j) + v_sell)
+            // Mark traversed rows for gap detection regardless of spread setting
             if rng > 0 and step > 0
-                int t_lo = math.max(0,        int(math.floor((lb - lo) / step)))
-                int t_hi = math.min(rows - 1, int(math.floor((hb - lo) / step)))
+                int t_lo_raw = int(math.floor((lb - lo) / step))
+                int t_hi_raw = int(math.floor((hb - lo) / step))
+                int t_lo = math.max(0, math.min(rows - 1, t_lo_raw))
+                int t_hi = math.max(0, math.min(rows - 1, t_hi_raw))
+                if t_lo > t_hi
+                    int tmp = t_lo
+                    t_lo := t_hi
+                    t_hi := tmp
                 for tj = t_lo to t_hi
-                    traversed.set(tj, traversed.get(tj) + 1.0)
+                    if tj >= 0 and tj < rows
+                        traversed.set(tj, traversed.get(tj) + 1.0)
     //~~}
 
     // ~~ Compute max + median row volume {
