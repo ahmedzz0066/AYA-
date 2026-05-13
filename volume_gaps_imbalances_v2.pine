@@ -1,0 +1,316 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// Rewrite of "Volume Gaps & Imbalances (Zeiierman)" applying a first-principles audit.
+// Key changes vs. the original:
+//   1. Tracks only this script's own boxes/labels (never deletes foreign drawings).
+//   2. Range-weighted Δ proxy ((close-low)/(high-low)) instead of candle-color delta.
+//   3. Each bar's volume is spread across every row its [low, high] traversed.
+//   4. A "gap" row requires bar-range traversal AND volume < k × median(row_vol),
+//      not literal zero. Zone merge is optional, not forced.
+//   5. Zone left edge anchors at the earliest crossing bar (creation), not first revisit.
+//   6. Δ bar uses a sqrt scale; no minimum-size visual lie.
+//   7. Lookback can be a bar count, a session, or N sessions.
+//   8. Row boundaries built as rows+1 integer-indexed levels (no float off-by-one).
+//   9. Bar-range overlap test fixed (was three near-duplicate clauses).
+
+//@version=6
+indicator("Volume Gaps & Imbalances v2", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// ~~ Tooltips {
+var string t_lkb_mode = "How the lookback window is defined.\n• Bars: fixed number of historical bars.\n• Session: the current trading session only.\n• N Sessions: the last N completed sessions plus the current one."
+var string t_prd      = "Number of historical bars (used when Lookback Mode = Bars)."
+var string t_nsess    = "Number of sessions (used when Lookback Mode = N Sessions)."
+var string t_rows     = "Number of price rows between the highest and lowest price in the lookback range."
+var string t_spread   = "If on, each bar's volume is spread evenly across every row its [low, high] traversed.\nIf off, all of the bar's volume is dumped into the row containing the chosen source price (legacy behaviour)."
+var string t_src      = "Price source used when Spread Across Range is off."
+var string t_width    = "Horizontal width in bars for the main volume profile drawn to the right of price."
+var string t_bull     = "Fill color for the buy share of each price row (range-weighted)."
+var string t_bear     = "Fill color for the sell share of each price row (range-weighted)."
+var string t_zone     = "Background color used to highlight low-volume price gaps."
+var string t_gap_k    = "A row is flagged as a gap when its volume is below k × median(row_volume).\nSet to 0 to require strictly zero volume."
+var string t_merge    = "Merge vertically adjacent gap rows into a single zone."
+var string t_sumN     = "Number of stacked sections in the Δ panel."
+var string t_sumW     = "Horizontal width in bars of the Δ panel."
+var string t_sumGap   = "Horizontal gap, in bars, between the main profile and the Δ panel."
+var string t_sumLbl   = "Show or hide the Δ percentage text inside each Δ bar."
+var string t_sqrt     = "Use sqrt(|Δ|) scaling for Δ bar length. Off = linear scaling."
+//~~}
+
+// ~~ Settings {
+lkb_mode = input.string("Bars", "Lookback Mode", options = ["Bars", "Session", "N Sessions"], tooltip = t_lkb_mode, group = "Lookback")
+prd      = input.int(200, "Bars",        minval = 50, maxval = 5000, tooltip = t_prd,   group = "Lookback")
+nsess    = input.int(1,   "Sessions",    minval = 1,  maxval = 50,   tooltip = t_nsess, group = "Lookback")
+
+rows       = input.int(50, "Rows", minval = 10, maxval = 200, tooltip = t_rows, group = "Profile Settings")
+spread_vol = input.bool(true, "Spread Across Bar Range", tooltip = t_spread, group = "Profile Settings")
+src        = input.source(hlc3, "Fallback Source", tooltip = t_src, group = "Profile Settings")
+
+width       = input.int(100, "Profile Width (bars)", minval = 1, maxval = 500, group = "Profile Styling")
+bull_color  = input.color(color.new(color.blue,   30), "Buy Share Color",  tooltip = t_bull, group = "Profile Styling")
+bear_color  = input.color(color.new(color.orange, 30), "Sell Share Color", tooltip = t_bear, group = "Profile Styling")
+zone_color  = input.color(color.new(color.navy,   50), "Gap Zone Color",   tooltip = t_zone, group = "Profile Styling")
+
+gap_k       = input.float(0.05, "Gap Threshold k", minval = 0.0, maxval = 1.0, step = 0.01, tooltip = t_gap_k, group = "Gap Detection")
+merge_zones = input.bool(false, "Merge Adjacent Gaps", tooltip = t_merge, group = "Gap Detection")
+
+sum_sections = input.int(20, "Summary Sections", minval = 1, maxval = 100, tooltip = t_sumN,   group = "Delta Summary")
+sum_panel_w  = input.int(40, "Summary Width",    minval = 10, maxval = 200, tooltip = t_sumW,  group = "Delta Summary")
+sum_gap_x    = input.int(4,  "Gap From Profile", minval = 1,  maxval = 50,  tooltip = t_sumGap, group = "Delta Summary")
+sum_show_lbl = input.bool(true, "Show Δ Text",   tooltip = t_sumLbl, group = "Delta Summary")
+sum_sqrt     = input.bool(true, "Sqrt Δ Scaling", tooltip = t_sqrt,  group = "Delta Summary")
+
+delta_pos_color  = input.color(color.new(color.lime, 20), "Δ Buy Color",     group = "Delta Styling")
+delta_neg_color  = input.color(color.new(color.red,  20), "Δ Sell Color",    group = "Delta Styling")
+delta_neutral_bg = input.color(color.new(color.gray, 90), "Δ Neutral BG",    group = "Delta Styling")
+delta_text_color = input.color(color.white,               "Δ Text Color",    group = "Delta Styling")
+//~~}
+
+// ~~ Session-anchored lookback {
+// Count bars since the start of the relevant session window so prd works for all three modes.
+var int sess_start_offset = 0
+new_sess = ta.change(time("D")) != 0
+var int sess_count = 0
+if new_sess
+    sess_count += 1
+
+bars_lookback = switch lkb_mode
+    "Bars"       => prd
+    "Session"    => ta.barssince(new_sess)
+    "N Sessions" => ta.barssince(ta.cum(new_sess ? 1 : 0) <= math.max(0, sess_count - nsess))
+    => prd
+bars_lookback := nz(bars_lookback, prd)
+bars_lookback := math.max(10, math.min(bars_lookback, 5000))
+//~~}
+
+// ~~ Own-drawing registry (so we never touch foreign boxes/labels) {
+var array<box>   myBoxes  = array.new<box>()
+var array<label> myLabels = array.new<label>()
+
+clearMyDrawings() =>
+    for b in myBoxes
+        box.delete(b)
+    myBoxes.clear()
+    for l in myLabels
+        label.delete(l)
+    myLabels.clear()
+
+addBox(box bx) =>
+    myBoxes.push(bx)
+    bx
+
+addLabel(label lb) =>
+    myLabels.push(lb)
+    lb
+//~~}
+
+b = bar_index
+
+if barstate.islast
+    clearMyDrawings()
+
+    int lkb = bars_lookback
+    hi = ta.highest(high, lkb)
+    lo = ta.lowest(low,  lkb)
+
+    // Range box
+    addBox(box.new(
+         chart.point.from_index(b - lkb, hi),
+         chart.point.from_index(b + width, lo),
+         color.new(chart.fg_color, 50), 2, line.style_dotted, bgcolor = color(na)))
+
+    // ~~ Build row boundaries with integer indexing (rows + 1 levels) {
+    float[] lvls      = array.new<float>(rows + 1, 0.0)
+    float[] bull_vols = array.new<float>(rows, 0.0)
+    float[] bear_vols = array.new<float>(rows, 0.0)
+    float[] traversed = array.new<float>(rows, 0.0) // bars that crossed the row
+    float step = (hi - lo) / rows
+    for i = 0 to rows
+        lvls.set(i, lo + step * i)
+    //~~}
+
+    // ~~ Volume assignment {
+    for i = lkb to 0
+        float v  = nz(volume[i])
+        float hb = high[i]
+        float lb = low[i]
+        float cb = close[i]
+        float ob = open[i]
+        float rng = hb - lb
+
+        // Range-weighted buy/sell shares (replaces close>open candle-color delta)
+        float buy_share  = rng > 0 ? (cb - lb) / rng : 0.5
+        float sell_share = 1.0 - buy_share
+        float v_buy  = v * buy_share
+        float v_sell = v * sell_share
+
+        if spread_vol and step > 0 and rng > 0
+            // Distribute across every row [low, high] traverses
+            int j_lo = math.max(0,        int(math.floor((lb - lo) / step)))
+            int j_hi = math.min(rows - 1, int(math.floor((hb - lo) / step)))
+            int span = math.max(1, j_hi - j_lo + 1)
+            float share_buy  = v_buy  / span
+            float share_sell = v_sell / span
+            for j = j_lo to j_hi
+                bull_vols.set(j, bull_vols.get(j) + share_buy)
+                bear_vols.set(j, bear_vols.get(j) + share_sell)
+                traversed.set(j, traversed.get(j) + 1.0)
+        else
+            // Legacy single-row dump for users who want it
+            float p = src[i]
+            int j = step > 0 ? math.max(0, math.min(rows - 1, int(math.floor((p - lo) / step)))) : 0
+            bull_vols.set(j, bull_vols.get(j) + v_buy)
+            bear_vols.set(j, bear_vols.get(j) + v_sell)
+            // Mark all traversed rows for gap detection regardless of spread setting
+            if rng > 0 and step > 0
+                int t_lo = math.max(0,        int(math.floor((lb - lo) / step)))
+                int t_hi = math.min(rows - 1, int(math.floor((hb - lo) / step)))
+                for tj = t_lo to t_hi
+                    traversed.set(tj, traversed.get(tj) + 1.0)
+    //~~}
+
+    // ~~ Compute max + median row volume {
+    float maxVol = 0.0
+    float[] totals = array.new<float>(rows, 0.0)
+    for i = 0 to rows - 1
+        float v_i = bull_vols.get(i) + bear_vols.get(i)
+        totals.set(i, v_i)
+        if v_i > maxVol
+            maxVol := v_i
+
+    // Median of *non-zero* totals (zero rows shouldn't pull the threshold to zero)
+    float[] nz_totals = array.new<float>()
+    for i = 0 to rows - 1
+        float v_i = totals.get(i)
+        if v_i > 0
+            nz_totals.push(v_i)
+    float med = 0.0
+    if nz_totals.size() > 0
+        nz_totals.sort()
+        int m = nz_totals.size() / 2
+        med := nz_totals.size() % 2 == 1 ? nz_totals.get(m) : (nz_totals.get(m - 1) + nz_totals.get(m)) / 2.0
+    float gap_thresh = gap_k * med
+    //~~}
+
+    // ~~ Draw profile rows (single box per row with internal buy/sell split via two boxes,
+    //     but only when volume > 0 — keeps box budget low) {
+    for i = 0 to rows - 1
+        float bull_i = bull_vols.get(i)
+        float bear_i = bear_vols.get(i)
+        float vol_i  = bull_i + bear_i
+        int norm_v   = maxVol > 0 ? int(math.round((vol_i / maxVol) * width)) : 0
+        if norm_v > 0
+            int norm_bull = vol_i > 0 ? int(math.round((bull_i / vol_i) * norm_v)) : 0
+            int norm_bear = norm_v - norm_bull
+            int left_start = b + width - norm_v
+            if norm_bull > 0
+                addBox(box.new(
+                     left = left_start, top = lvls.get(i + 1),
+                     right = left_start + norm_bull, bottom = lvls.get(i),
+                     border_color = color.new(chart.fg_color, 90), bgcolor = bull_color))
+            if norm_bear > 0
+                addBox(box.new(
+                     left = left_start + norm_bull, top = lvls.get(i + 1),
+                     right = b + width, bottom = lvls.get(i),
+                     border_color = color.new(chart.fg_color, 90), bgcolor = bear_color))
+    //~~}
+
+    // ~~ Gap detection: row was traversed by price AND volume below threshold {
+    bool[] is_gap = array.new<bool>(rows, false)
+    for i = 0 to rows - 1
+        if traversed.get(i) > 0 and totals.get(i) <= gap_thresh
+            is_gap.set(i, true)
+
+    // For each gap row, find the earliest bar (within lookback) whose range crossed it.
+    // That's the auction event that created the imbalance — anchor the zone there.
+    findCreationLeft(int rowIdx) =>
+        float rTop = lvls.get(rowIdx + 1)
+        float rBot = lvls.get(rowIdx)
+        int   leftIdx = b - lkb
+        for off = lkb to 0
+            if low[off] <= rTop and high[off] >= rBot
+                leftIdx := b - off
+                break
+        leftIdx
+
+    // Build zones — optionally merge adjacent gap rows.
+    int i_z = 0
+    while i_z < rows
+        if not is_gap.get(i_z)
+            i_z += 1
+            continue
+        int j_z = i_z
+        if merge_zones
+            while j_z + 1 < rows and is_gap.get(j_z + 1)
+                j_z += 1
+        int leftIdx = findCreationLeft(i_z)
+        if merge_zones
+            int leftIdx2 = findCreationLeft(j_z)
+            leftIdx := math.min(leftIdx, leftIdx2)
+        addBox(box.new(
+             left = leftIdx, top = lvls.get(j_z + 1),
+             right = b, bottom = lvls.get(i_z),
+             border_color = na, bgcolor = zone_color))
+        i_z := j_z + 1
+    //~~}
+
+    // ~~ Delta summary panel {
+    int secRows = math.max(1, int(math.floor(rows / float(sum_sections))))
+    int baseLeft  = b + width + sum_gap_x
+    int baseRight = baseLeft + sum_panel_w
+
+    for s = 0 to sum_sections - 1
+        int startIdx = s * secRows
+        int endIdx   = s == sum_sections - 1 ? rows - 1 : math.min(rows - 1, (s + 1) * secRows - 1)
+        if startIdx > endIdx or startIdx >= rows
+            continue
+        float segBull = 0.0
+        float segBear = 0.0
+        for j = startIdx to endIdx
+            segBull += bull_vols.get(j)
+            segBear += bear_vols.get(j)
+        float segTot = segBull + segBear
+        if segTot <= 0
+            continue
+
+        float segTop    = lvls.get(endIdx + 1)
+        float segBottom = lvls.get(startIdx)
+
+        // Neutral background panel
+        addBox(box.new(
+             left = baseLeft, top = segTop,
+             right = baseRight, bottom = segBottom,
+             border_color = color.new(chart.fg_color, 70),
+             bgcolor = delta_neutral_bg))
+
+        // Range-weighted Δ as % of total
+        float deltaPct = (segBull - segBear) / segTot * 100.0
+        float norm = math.min(1.0, math.abs(deltaPct) / 100.0)
+        float scaled = sum_sqrt ? math.sqrt(norm) : norm
+        float barLen = sum_panel_w * scaled
+
+        color colDelta = delta_neutral_bg
+        if deltaPct > 0
+            colDelta := delta_pos_color
+        else if deltaPct < 0
+            colDelta := delta_neg_color
+
+        if barLen >= 1.0
+            box dBox = addBox(box.new(
+                 left = baseLeft, top = segTop,
+                 right = baseLeft + int(math.round(barLen)), bottom = segBottom,
+                 border_color = color.new(chart.fg_color, 20),
+                 bgcolor = colDelta))
+            if sum_show_lbl
+                box.set_text(dBox, "Δ " + str.tostring(deltaPct, "#.0") + "%")
+                box.set_text_color(dBox, delta_text_color)
+                box.set_text_halign(dBox, text.align_center)
+                box.set_text_valign(dBox, text.align_center)
+        else if sum_show_lbl
+            // Small Δ that wouldn't render as a bar: pin a label inside the neutral panel
+            addLabel(label.new(
+                 x = baseLeft + sum_panel_w / 2,
+                 y = (segTop + segBottom) / 2,
+                 text = "Δ " + str.tostring(deltaPct, "#.0") + "%",
+                 xloc = xloc.bar_index, yloc = yloc.price,
+                 style = label.style_none, textcolor = delta_text_color, color = color(na)))
+    //~~}
