@@ -220,19 +220,9 @@ if barstate.islast
         if traversed.get(i) > 0 and totals.get(i) <= gap_thresh
             is_gap.set(i, true)
 
-    // For each gap row, find the earliest bar (within lookback) whose range crossed it.
-    // That's the auction event that created the imbalance — anchor the zone there.
-    findCreationLeft(int rowIdx) =>
-        float rTop = lvls.get(rowIdx + 1)
-        float rBot = lvls.get(rowIdx)
-        int   leftIdx = b - lkb
-        for off = lkb to 0
-            if low[off] <= rTop and high[off] >= rBot
-                leftIdx := b - off
-                break
-        leftIdx
-
     // Build zones — optionally merge adjacent gap rows.
+    // For each (merged) gap, the left edge anchors at the earliest bar within the
+    // lookback whose range crossed the gap — i.e. the auction event that created it.
     int i_z = 0
     while i_z < rows
         if not is_gap.get(i_z)
@@ -242,10 +232,14 @@ if barstate.islast
         if merge_zones
             while j_z + 1 < rows and is_gap.get(j_z + 1)
                 j_z += 1
-        int leftIdx = findCreationLeft(i_z)
-        if merge_zones
-            int leftIdx2 = findCreationLeft(j_z)
-            leftIdx := math.min(leftIdx, leftIdx2)
+        // Find earliest crossing bar for the whole (possibly merged) gap span.
+        float rTop = lvls.get(j_z + 1)
+        float rBot = lvls.get(i_z)
+        int leftIdx = b - lkb
+        for off = lkb to 0
+            if low[off] <= rTop and high[off] >= rBot
+                leftIdx := b - off
+                break
         addBox(box.new(
              left = leftIdx, top = lvls.get(j_z + 1),
              right = b, bottom = lvls.get(i_z),
