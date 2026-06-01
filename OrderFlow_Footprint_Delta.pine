@@ -21,7 +21,7 @@
 //   per-bar Footprint cells, Delta and Cumulative-Delta stats.
 //
 //@version=5
-indicator("Order Flow Profile — Footprint • Delta • Heatmap", overlay = true, max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+indicator("Order Flow Profile — Footprint • Delta • Heatmap", overlay = true, max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, dynamic_requests = true)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INPUTS
