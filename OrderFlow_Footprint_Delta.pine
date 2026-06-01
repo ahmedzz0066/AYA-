@@ -1,0 +1,392 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// Order Flow Profile — Footprint • Delta • Heatmap  (first-principles recreation)
+// Rebuilt from "Volume HeatMap With Profile [ChartPrime]".
+//
+// WHY A RECREATION (first principles):
+//   The original is a *close-print profile*: it bins each bar's CLOSE into a price level and
+//   classifies the WHOLE bar as bull/bear by close>open. That throws away (a) where inside the
+//   bar volume actually traded and (b) the buy/sell split that happened *within* the bar.
+//   It also has a real indexing bug: it accumulates `volume[x]` where `x` is the price-LEVEL
+//   index, not the bar index `i`, so the wrong bar's volume is added to each level.
+//
+//   Real order flow is built from individual trades tagged buyer- vs seller-initiated (traded at
+//   ask vs bid). TradingView does not expose true bid/ask trade data, so a *perfect* footprint is
+//   impossible here. The closest honest approximation is:
+//     1. Drill into each chart bar with request.security_lower_tf() to recover intrabar OHLCV.
+//     2. Estimate buy vs sell volume per intrabar (delta proxy) — two standard estimators below.
+//     3. Distribute each bar's volume across the price levels its range actually spans,
+//        instead of dumping it all at the close.
+//   From that we derive an accurate-as-possible Volume Profile, Delta Profile, POC, Value Area,
+//   per-bar Footprint cells, Delta and Cumulative-Delta stats.
+//
+//@version=5
+indicator("Order Flow Profile — Footprint • Delta • Heatmap", overlay = true, max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, dynamic_requests = true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+string G_WIN  = "Profile Window"
+string G_CLS  = "Order-Flow Estimation"
+string G_PRO  = "Profile Visuals"
+string G_HEAT = "Heatmap"
+string G_KEY  = "POC / Value Area"
+string G_FP   = "Footprint (last bar)"
+string G_STAT = "Stats Table"
+
+// Window ----------------------------------------------------------------------
+string winMode  = input.string("Rolling", "Window mode", options = ["Rolling", "From Date"], group = G_WIN, tooltip = "Rolling = last N bars. From Date = anchored profile from a fixed time to now.")
+int    lenBars  = input.int(200, "Rolling length (bars)", minval = 10, maxval = 5000, group = G_WIN)
+int    startT   = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Anchor start", group = G_WIN)
+int    rows     = input.int(25, "Price levels (rows)", minval = 5, maxval = 100, group = G_WIN, tooltip = "Vertical resolution of the profile grid.")
+
+// Estimation ------------------------------------------------------------------
+bool   useIntra = input.bool(true, "Use intrabar data (lower timeframe)", group = G_CLS, tooltip = "ON = drill into each bar with request.security_lower_tf for far more accurate delta. OFF = classify on the chart bar only.")
+bool   allowSec = input.bool(false, "Allow seconds timeframes (Premium plans only)", group = G_CLS, tooltip = "Seconds-based intrabar resolutions (1S/5S/15S) require a TradingView Premium plan. Leave OFF on Essential/lower plans — the script then uses minute resolutions only (and falls back to chart-bar estimation on sub-2-minute charts).")
+string ltfMan   = input.timeframe("", "Intrabar timeframe (blank = auto)", group = G_CLS, tooltip = "Leave blank to auto-pick a sensible sub-resolution. If you set one higher than/equal to the chart TF it is ignored. Seconds resolutions are ignored unless the Premium toggle above is ON.")
+string method   = input.string("Proportional", "Delta estimator", options = ["Proportional", "Polarity"], group = G_CLS, tooltip = "Proportional: split each intrabar's volume by where close sits in its range (accounts for wicks/rejection) — closest to true delta. Polarity: classic up/down tick rule (close vs open).")
+
+// Profile visuals -------------------------------------------------------------
+bool   showProf = input.bool(true, "Show volume profile", group = G_PRO)
+bool   placeR   = input.string("Right", "Placement", options = ["Right", "Left"], group = G_PRO) == "Right"
+string colorBy  = input.string("Delta", "Color / split by", options = ["Delta", "Volume"], group = G_PRO, tooltip = "Delta: split each level into a red (sell) and green (buy) segment — bid/ask style. Volume: single bar shaded by traded volume.")
+int    profW    = input.int(60, "Max profile width (bars)", minval = 5, maxval = 300, group = G_PRO)
+color  cBuy     = input.color(#26a69a, "Buy", inline = "pc", group = G_PRO)
+color  cSell    = input.color(#ef5350, "Sell", inline = "pc", group = G_PRO)
+
+// Heatmap ---------------------------------------------------------------------
+bool   showHeat = input.bool(true, "Show heatmap", inline = "h", group = G_HEAT)
+color  heatLo   = input.color(#13172233, "", inline = "h", group = G_HEAT)
+color  heatHi   = input.color(color.rgb(245, 127, 23, 80), "", inline = "h", group = G_HEAT)
+
+// POC / VA --------------------------------------------------------------------
+bool   showPOC  = input.bool(true, "Show POC", inline = "p", group = G_KEY)
+color  cPOC     = input.color(#ffeb3b, "", inline = "p", group = G_KEY)
+bool   showVA   = input.bool(true, "Show value area", inline = "v", group = G_KEY)
+color  cVA      = input.color(color.new(#2962ff, 80), "", inline = "v", group = G_KEY)
+float  vaPct    = input.float(70, "Value area %", minval = 30, maxval = 95, group = G_KEY) / 100.0
+
+// Footprint -------------------------------------------------------------------
+bool   showFP   = input.bool(true, "Show footprint table (last bar)", group = G_FP)
+int    fpRows   = input.int(14, "Footprint rows", minval = 4, maxval = 40, group = G_FP)
+float  imbRatio = input.float(3.0, "Imbalance ratio", minval = 1.5, maxval = 10, group = G_FP, tooltip = "Highlight a cell when one side is this many times the other (stacked imbalance).")
+
+// Stats -----------------------------------------------------------------------
+bool   showStat = input.bool(true, "Show stats table", group = G_STAT)
+
+color  CHART    = chart.fg_color
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto lower-timeframe. With seconds allowed (Premium) it can subdivide low TFs; otherwise it
+// stays minute-based and returns "" when no valid sub-resolution exists (e.g. <= 1-minute charts).
+// Pure-ternary form (no if/:= reassignment) so the result stays a *simple string*, which is the
+// qualifier request.security_lower_tf() requires for its timeframe argument.
+f_autoLtf(simple bool sec) =>
+    s = timeframe.in_seconds()
+    sec ? (s <= 60 ? "1S" : s <= 300 ? "5S" : s <= 900 ? "15S" : s <= 3600 ? "1" : s <= 14400 ? "5" : s <= 86400 ? "15" : "60") : (s <= 60 ? "" : s <= 900 ? "1" : s <= 3600 ? "5" : s <= 14400 ? "15" : s <= 86400 ? "60" : "240")
+
+// Effective intrabar TF: honour a valid manual override, else auto. A manual seconds TF is
+// ignored unless the Premium toggle is on, so the script never trips the seconds-plan error.
+bool   manualSec = str.contains(ltfMan, "S")
+bool   useMan    = ltfMan != "" and timeframe.in_seconds(ltfMan) < timeframe.in_seconds() and (allowSec or not manualSec)
+string ltf       = useMan ? ltfMan : f_autoLtf(allowSec)
+bool   intraOK   = useIntra and ltf != ""
+
+// Split one (intra)bar's volume into estimated buy / sell volume.
+f_classify(float o, float h, float l, float c, float v, bool prop) =>
+    float bv = 0.0
+    float sv = 0.0
+    if prop
+        rng  = h - l
+        frac = rng > 0 ? (c - l) / rng : 0.5    // where close sits in the range
+        bv  := v * frac
+        sv  := v * (1.0 - frac)
+    else
+        if c > o
+            bv := v
+        else if c < o
+            sv := v
+        else
+            bv := v * 0.5
+            sv := v * 0.5
+    [bv, sv]
+
+f_clearBoxes(arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            box.delete(array.get(arr, i))
+        array.clear(arr)
+f_clearLines(arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            line.delete(array.get(arr, i))
+        array.clear(arr)
+f_clearFills(arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            linefill.delete(array.get(arr, i))
+        array.clear(arr)
+f_clearLabels(arr) =>
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            label.delete(array.get(arr, i))
+        array.clear(arr)
+
+// One key/value row of the stats table.
+f_statRow(table tbl, int r, string k, string v, color vc) =>
+    table.cell(tbl, 0, r, k, text_color = CHART, text_halign = text.align_left,  text_size = size.small)
+    table.cell(tbl, 1, r, v, text_color = vc,    text_halign = text.align_right, text_size = size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-BAR ORDER-FLOW ESTIMATION  (runs every bar, builds the stored window)
+// ─────────────────────────────────────────────────────────────────────────────
+prop = method == "Proportional"
+
+// Only request intrabar data when a valid (plan-permitted) sub-resolution exists; on charts where
+// it does not, these stay na and we classify on the chart bar — no seconds-TF error is triggered.
+array<float> oA = na
+array<float> hA = na
+array<float> lA = na
+array<float> cA = na
+array<float> vA = na
+if intraOK
+    oA := request.security_lower_tf(syminfo.tickerid, ltf, open,   ignore_invalid_symbol = true)
+    hA := request.security_lower_tf(syminfo.tickerid, ltf, high,   ignore_invalid_symbol = true)
+    lA := request.security_lower_tf(syminfo.tickerid, ltf, low,    ignore_invalid_symbol = true)
+    cA := request.security_lower_tf(syminfo.tickerid, ltf, close,  ignore_invalid_symbol = true)
+    vA := request.security_lower_tf(syminfo.tickerid, ltf, volume, ignore_invalid_symbol = true)
+
+int   nIntra  = na(cA) ? 0 : array.size(cA)
+float barBuy  = 0.0
+float barSell = 0.0
+
+if intraOK and nIntra > 0
+    for k = 0 to nIntra - 1
+        [bv, sv] = f_classify(array.get(oA, k), array.get(hA, k), array.get(lA, k), array.get(cA, k), nz(array.get(vA, k)), prop)
+        barBuy  += bv
+        barSell += sv
+else
+    [bv, sv] = f_classify(open, high, low, close, nz(volume), prop)
+    barBuy  := bv
+    barSell := sv
+
+// Persistent stored window (chronological): geometry + estimated buy/sell per bar.
+var float[] sH    = array.new_float()
+var float[] sL    = array.new_float()
+var float[] sC    = array.new_float()
+var float[] sBuy  = array.new_float()
+var float[] sSell = array.new_float()
+
+bool inWindow = winMode == "Rolling" ? true : time >= startT
+int  capBars  = winMode == "Rolling" ? lenBars : 5000
+
+if inWindow and barstate.isconfirmed
+    array.push(sH, high)
+    array.push(sL, low)
+    array.push(sC, close)
+    array.push(sBuy, barBuy)
+    array.push(sSell, barSell)
+    while array.size(sH) > capBars
+        array.shift(sH)
+        array.shift(sL)
+        array.shift(sC)
+        array.shift(sBuy)
+        array.shift(sSell)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERSISTENT DRAWING HANDLES
+// ─────────────────────────────────────────────────────────────────────────────
+var box[]      profBoxes = array.new_box()
+var line[]     heatLines = array.new_line()
+var linefill[] heatFills = array.new_linefill()
+var label[]    keyLabels = array.new_label()
+var box        pocBox    = na
+var box        vaBox     = na
+var table      fpTable   = na
+var table      statTable = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FINALISE & RENDER  (on the last bar)
+// ─────────────────────────────────────────────────────────────────────────────
+if barstate.islast and array.size(sH) > 1
+    int sz = array.size(sH)
+    int xR = bar_index
+    int xL = bar_index - (sz - 1)
+
+    float top = array.max(sH)
+    float bot = array.min(sL)
+    float step = (top - bot) / rows
+
+    // Per-level accumulators ---------------------------------------------------
+    float[] buyL = array.new_float(rows, 0.0)
+    float[] selL = array.new_float(rows, 0.0)
+    float[] totL = array.new_float(rows, 0.0)
+
+    if step > 0
+        // Distribute each bar's estimated buy/sell volume across the levels its
+        // high-low range overlaps, weighted by the fraction of overlap.
+        for i = 0 to sz - 1
+            float bh = array.get(sH, i)
+            float bl = array.get(sL, i)
+            float bb = array.get(sBuy, i)
+            float bs = array.get(sSell, i)
+            float brange = bh - bl
+            if brange <= 0
+                int j = math.min(rows - 1, math.max(0, int((array.get(sC, i) - bot) / step)))
+                array.set(buyL, j, array.get(buyL, j) + bb)
+                array.set(selL, j, array.get(selL, j) + bs)
+            else
+                for j = 0 to rows - 1
+                    float lo = bot + step * j
+                    float hi = lo + step
+                    float ov = math.min(bh, hi) - math.max(bl, lo)
+                    if ov > 0
+                        float w = ov / brange
+                        array.set(buyL, j, array.get(buyL, j) + bb * w)
+                        array.set(selL, j, array.get(selL, j) + bs * w)
+        for j = 0 to rows - 1
+            array.set(totL, j, array.get(buyL, j) + array.get(selL, j))
+
+    float maxTot   = array.max(totL)
+    float totalVol = array.sum(totL)
+    float totalBuy = array.sum(buyL)
+    float totalSel = array.sum(selL)
+
+    // POC ---------------------------------------------------------------------
+    int pocIdx = array.indexof(totL, maxTot)
+    pocIdx := pocIdx < 0 ? 0 : pocIdx
+
+    // Value area (expand from POC, always taking the heavier neighbour) -------
+    int vaUp = pocIdx
+    int vaDn = pocIdx
+    float acc = array.get(totL, pocIdx)
+    float target = totalVol * vaPct
+    for _i = 0 to rows - 1
+        if acc >= target
+            break
+        float vUp = vaUp + 1 < rows ? array.get(totL, vaUp + 1) : -1.0
+        float vDn = vaDn - 1 >= 0   ? array.get(totL, vaDn - 1) : -1.0
+        if vUp < 0 and vDn < 0
+            break
+        if vUp >= vDn
+            vaUp += 1
+            acc  += vUp
+        else
+            vaDn -= 1
+            acc  += vDn
+
+    // ── PROFILE BARS ─────────────────────────────────────────────────────────
+    f_clearBoxes(profBoxes)
+    if showProf and maxTot > 0
+        int anchor = placeR ? xR : xL
+        for j = 0 to rows - 1
+            float tv = array.get(totL, j)
+            if tv <= 0
+                continue
+            float lo = bot + step * j
+            float hi = lo + step
+            int   px = int(tv / maxTot * profW)
+            if colorBy == "Volume"
+                color cg = color.from_gradient(tv, 0, maxTot, heatLo, heatHi)
+                int x1 = placeR ? anchor - px : anchor
+                int x2 = placeR ? anchor      : anchor + px
+                array.push(profBoxes, box.new(x1, hi, x2, lo, border_color = cg, bgcolor = cg, xloc = xloc.bar_index))
+            else
+                // bid/ask split: green (buy) and red (sell) segments sized by their share
+                int buyW  = int(px * array.get(buyL, j) / tv)
+                int bX2 = placeR ? anchor          : anchor + buyW
+                int bX1 = placeR ? anchor - buyW   : anchor
+                int sX2 = placeR ? anchor - buyW   : anchor + px
+                int sX1 = placeR ? anchor - px     : anchor + buyW
+                array.push(profBoxes, box.new(bX1, hi, bX2, lo, border_color = cBuy,  bgcolor = cBuy,  xloc = xloc.bar_index))
+                array.push(profBoxes, box.new(sX1, hi, sX2, lo, border_color = cSell, bgcolor = cSell, xloc = xloc.bar_index))
+
+    // ── HEATMAP ──────────────────────────────────────────────────────────────
+    f_clearLines(heatLines)
+    f_clearFills(heatFills)
+    if showHeat and maxTot > 0
+        for j = 0 to rows
+            float y = bot + step * j
+            array.push(heatLines, line.new(xL, y, xR, y, color = color.new(color.black, 100), xloc = xloc.bar_index))
+        for j = 0 to rows - 1
+            color cf = color.from_gradient(array.get(totL, j), 0, maxTot, heatLo, heatHi)
+            array.push(heatFills, linefill.new(array.get(heatLines, j), array.get(heatLines, j + 1), cf))
+
+    // ── POC / VALUE AREA ─────────────────────────────────────────────────────
+    box.delete(pocBox)
+    box.delete(vaBox)
+    f_clearLabels(keyLabels)
+    if showVA and step > 0
+        float vh = bot + step * (vaUp + 1)
+        float vl = bot + step * vaDn
+        vaBox := box.new(xL, vh, xR, vl, border_color = na, bgcolor = cVA, xloc = xloc.bar_index)
+    if showPOC and step > 0
+        float pl = bot + step * pocIdx
+        float ph = pl + step
+        pocBox := box.new(xL, ph, xR, pl, border_color = cPOC, bgcolor = color.new(cPOC, 70), xloc = xloc.bar_index, text = "POC", text_color = CHART, text_halign = text.align_center, text_valign = text.align_center)
+        array.push(keyLabels, label.new(xR, (pl + ph) / 2, str.tostring(math.round_to_mintick((pl + ph) / 2)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(cPOC, 30), textcolor = #000000, size = size.small))
+
+    // ── FOOTPRINT TABLE (last bar, from its intrabars) ───────────────────────
+    table.delete(fpTable)
+    if showFP
+        float fpTop = high
+        float fpBot = low
+        float fpStep = (fpTop - fpBot) / fpRows
+        float[] fbuy = array.new_float(fpRows, 0.0)
+        float[] fsel = array.new_float(fpRows, 0.0)
+        if fpStep > 0
+            if intraOK and nIntra > 0
+                for k = 0 to nIntra - 1
+                    [bv, sv] = f_classify(array.get(oA, k), array.get(hA, k), array.get(lA, k), array.get(cA, k), nz(array.get(vA, k)), prop)
+                    int j = math.min(fpRows - 1, math.max(0, int((array.get(cA, k) - fpBot) / fpStep)))
+                    array.set(fbuy, j, array.get(fbuy, j) + bv)
+                    array.set(fsel, j, array.get(fsel, j) + sv)
+            else
+                [bv, sv] = f_classify(open, high, low, close, nz(volume), prop)
+                int j = math.min(fpRows - 1, math.max(0, int((close - fpBot) / fpStep)))
+                array.set(fbuy, j, bv)
+                array.set(fsel, j, sv)
+
+            fpTable := table.new(position.middle_left, 4, fpRows + 1, border_width = 1, border_color = color.new(CHART, 70))
+            table.cell(fpTable, 0, 0, "Sell", text_color = CHART, bgcolor = color.new(cSell, 60), text_size = size.tiny)
+            table.cell(fpTable, 1, 0, "Price", text_color = CHART, bgcolor = color.new(CHART, 80), text_size = size.tiny)
+            table.cell(fpTable, 2, 0, "Buy",  text_color = CHART, bgcolor = color.new(cBuy, 60),  text_size = size.tiny)
+            table.cell(fpTable, 3, 0, "Δ",     text_color = CHART, bgcolor = color.new(CHART, 80), text_size = size.tiny)
+            // rows top→bottom = high→low
+            for r = 0 to fpRows - 1
+                int j = fpRows - 1 - r
+                float bvj = array.get(fbuy, j)
+                float svj = array.get(fsel, j)
+                float dj  = bvj - svj
+                float pj  = fpBot + fpStep * j + fpStep / 2
+                bool buyImb  = bvj >= svj * imbRatio and bvj > 0
+                bool sellImb = svj >= bvj * imbRatio and svj > 0
+                table.cell(fpTable, 0, r + 1, str.tostring(svj, format.volume), text_color = #ffffff, bgcolor = color.new(cSell, sellImb ? 0 : 65), text_size = size.tiny)
+                table.cell(fpTable, 1, r + 1, str.tostring(math.round_to_mintick(pj)), text_color = CHART, bgcolor = color.new(CHART, 90), text_size = size.tiny)
+                table.cell(fpTable, 2, r + 1, str.tostring(bvj, format.volume), text_color = #ffffff, bgcolor = color.new(cBuy, buyImb ? 0 : 65), text_size = size.tiny)
+                table.cell(fpTable, 3, r + 1, str.tostring(dj, format.volume), text_color = dj >= 0 ? cBuy : cSell, bgcolor = color.new(CHART, 92), text_size = size.tiny)
+
+    // ── STATS TABLE ──────────────────────────────────────────────────────────
+    table.delete(statTable)
+    if showStat
+        // cumulative delta excursion across the window
+        float cvd   = 0.0
+        float cvdHi = 0.0
+        float cvdLo = 0.0
+        for i = 0 to sz - 1
+            cvd += array.get(sBuy, i) - array.get(sSell, i)
+            cvdHi := math.max(cvdHi, cvd)
+            cvdLo := math.min(cvdLo, cvd)
+        float delta  = totalBuy - totalSel
+        float buyPct = totalVol > 0 ? totalBuy / totalVol * 100 : 0
+        statTable := table.new(position.top_right, 2, 8, border_width = 1, border_color = color.new(CHART, 70), bgcolor = color.new(#000000, 20))
+        f_statRow(statTable, 0, "Total volume", str.tostring(totalVol, format.volume), CHART)
+        f_statRow(statTable, 1, "Buy / Sell",   str.tostring(buyPct, "#.0") + "% / " + str.tostring(100 - buyPct, "#.0") + "%", CHART)
+        f_statRow(statTable, 2, "Delta",        str.tostring(delta, format.volume), delta >= 0 ? cBuy : cSell)
+        f_statRow(statTable, 3, "CVD (window)", str.tostring(cvd, format.volume),   cvd >= 0 ? cBuy : cSell)
+        f_statRow(statTable, 4, "CVD high",     str.tostring(cvdHi, format.volume), cBuy)
+        f_statRow(statTable, 5, "CVD low",      str.tostring(cvdLo, format.volume), cSell)
+        f_statRow(statTable, 6, "POC",          str.tostring(math.round_to_mintick(bot + step * pocIdx + step / 2)), cPOC)
+        f_statRow(statTable, 7, "Levels / TF",  str.tostring(rows) + " @ " + (intraOK ? ltf : "bar"), CHART)
