@@ -42,7 +42,8 @@ int    rows     = input.int(25, "Price levels (rows)", minval = 5, maxval = 100,
 
 // Estimation ------------------------------------------------------------------
 bool   useIntra = input.bool(true, "Use intrabar data (lower timeframe)", group = G_CLS, tooltip = "ON = drill into each bar with request.security_lower_tf for far more accurate delta. OFF = classify on the chart bar only.")
-string ltfMan   = input.timeframe("", "Intrabar timeframe (blank = auto)", group = G_CLS, tooltip = "Leave blank to auto-pick a sensible sub-resolution. If you set one higher than/equal to the chart TF it is ignored.")
+bool   allowSec = input.bool(false, "Allow seconds timeframes (Premium plans only)", group = G_CLS, tooltip = "Seconds-based intrabar resolutions (1S/5S/15S) require a TradingView Premium plan. Leave OFF on Essential/lower plans — the script then uses minute resolutions only (and falls back to chart-bar estimation on sub-2-minute charts).")
+string ltfMan   = input.timeframe("", "Intrabar timeframe (blank = auto)", group = G_CLS, tooltip = "Leave blank to auto-pick a sensible sub-resolution. If you set one higher than/equal to the chart TF it is ignored. Seconds resolutions are ignored unless the Premium toggle above is ON.")
 string method   = input.string("Proportional", "Delta estimator", options = ["Proportional", "Polarity"], group = G_CLS, tooltip = "Proportional: split each intrabar's volume by where close sits in its range (accounts for wicks/rejection) — closest to true delta. Polarity: classic up/down tick rule (close vs open).")
 
 // Profile visuals -------------------------------------------------------------
@@ -78,19 +79,23 @@ color  CHART    = chart.fg_color
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
-// Auto lower-timeframe: always strictly below the chart TF for normal (1m+) charts.
-f_autoLtf() =>
+// Auto lower-timeframe. With seconds allowed (Premium) it can subdivide low TFs; otherwise it
+// stays minute-based and returns "" when no valid sub-resolution exists (e.g. <= 1-minute charts).
+f_autoLtf(bool sec) =>
     s = timeframe.in_seconds()
-    s <= 60      ? "1S" :
-     s <= 300    ? "5S" :
-     s <= 900    ? "15S" :
-     s <= 3600   ? "1" :
-     s <= 14400  ? "5" :
-     s <= 86400  ? "15" : "60"
+    string r = ""
+    if sec
+        r := s <= 60 ? "1S" : s <= 300 ? "5S" : s <= 900 ? "15S" : s <= 3600 ? "1" : s <= 14400 ? "5" : s <= 86400 ? "15" : "60"
+    else
+        r := s <= 60 ? "" : s <= 900 ? "1" : s <= 3600 ? "5" : s <= 14400 ? "15" : s <= 86400 ? "60" : "240"
+    r
 
-// Effective intrabar TF: honour a valid manual override, else auto.
-bool   useMan = ltfMan != "" and timeframe.in_seconds(ltfMan) < timeframe.in_seconds()
-string ltf    = useMan ? ltfMan : f_autoLtf()
+// Effective intrabar TF: honour a valid manual override, else auto. A manual seconds TF is
+// ignored unless the Premium toggle is on, so the script never trips the seconds-plan error.
+bool   manualSec = str.contains(ltfMan, "S")
+bool   useMan    = ltfMan != "" and timeframe.in_seconds(ltfMan) < timeframe.in_seconds() and (allowSec or not manualSec)
+string ltf       = useMan ? ltfMan : f_autoLtf(allowSec)
+bool   intraOK   = useIntra and ltf != ""
 
 // Split one (intra)bar's volume into estimated buy / sell volume.
 f_classify(float o, float h, float l, float c, float v, bool prop) =>
@@ -142,19 +147,25 @@ f_statRow(table tbl, int r, string k, string v, color vc) =>
 // ─────────────────────────────────────────────────────────────────────────────
 prop = method == "Proportional"
 
-// Pull intrabar OHLCV. Called unconditionally at global scope (required for security calls);
-// arrays are empty on bars where TV has no intrabar history → we fall back to the chart bar.
-oA = request.security_lower_tf(syminfo.tickerid, ltf, open,   ignore_invalid_symbol = true)
-hA = request.security_lower_tf(syminfo.tickerid, ltf, high,   ignore_invalid_symbol = true)
-lA = request.security_lower_tf(syminfo.tickerid, ltf, low,    ignore_invalid_symbol = true)
-cA = request.security_lower_tf(syminfo.tickerid, ltf, close,  ignore_invalid_symbol = true)
-vA = request.security_lower_tf(syminfo.tickerid, ltf, volume, ignore_invalid_symbol = true)
+// Only request intrabar data when a valid (plan-permitted) sub-resolution exists; on charts where
+// it does not, these stay na and we classify on the chart bar — no seconds-TF error is triggered.
+array<float> oA = na
+array<float> hA = na
+array<float> lA = na
+array<float> cA = na
+array<float> vA = na
+if intraOK
+    oA := request.security_lower_tf(syminfo.tickerid, ltf, open,   ignore_invalid_symbol = true)
+    hA := request.security_lower_tf(syminfo.tickerid, ltf, high,   ignore_invalid_symbol = true)
+    lA := request.security_lower_tf(syminfo.tickerid, ltf, low,    ignore_invalid_symbol = true)
+    cA := request.security_lower_tf(syminfo.tickerid, ltf, close,  ignore_invalid_symbol = true)
+    vA := request.security_lower_tf(syminfo.tickerid, ltf, volume, ignore_invalid_symbol = true)
 
-int   nIntra  = array.size(cA)
+int   nIntra  = na(cA) ? 0 : array.size(cA)
 float barBuy  = 0.0
 float barSell = 0.0
 
-if useIntra and nIntra > 0
+if intraOK and nIntra > 0
     for k = 0 to nIntra - 1
         [bv, sv] = f_classify(array.get(oA, k), array.get(hA, k), array.get(lA, k), array.get(cA, k), nz(array.get(vA, k)), prop)
         barBuy  += bv
@@ -329,7 +340,7 @@ if barstate.islast and array.size(sH) > 1
         float[] fbuy = array.new_float(fpRows, 0.0)
         float[] fsel = array.new_float(fpRows, 0.0)
         if fpStep > 0
-            if useIntra and nIntra > 0
+            if intraOK and nIntra > 0
                 for k = 0 to nIntra - 1
                     [bv, sv] = f_classify(array.get(oA, k), array.get(hA, k), array.get(lA, k), array.get(cA, k), nz(array.get(vA, k)), prop)
                     int j = math.min(fpRows - 1, math.max(0, int((array.get(cA, k) - fpBot) / fpStep)))
@@ -381,4 +392,4 @@ if barstate.islast and array.size(sH) > 1
         f_statRow(statTable, 4, "CVD high",     str.tostring(cvdHi, format.volume), cBuy)
         f_statRow(statTable, 5, "CVD low",      str.tostring(cvdLo, format.volume), cSell)
         f_statRow(statTable, 6, "POC",          str.tostring(math.round_to_mintick(bot + step * pocIdx + step / 2)), cPOC)
-        f_statRow(statTable, 7, "Levels / TF",  str.tostring(rows) + " @ " + (useIntra ? ltf : "bar"), CHART)
+        f_statRow(statTable, 7, "Levels / TF",  str.tostring(rows) + " @ " + (intraOK ? ltf : "bar"), CHART)

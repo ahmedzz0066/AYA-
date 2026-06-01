@@ -67,10 +67,16 @@ The result looks like a profile but is a close‑print histogram, not order flow
 
 TradingView does **not** expose true bid/ask trade prints, so this is a high‑quality
 *estimation*, not exchange‑accurate footprint data. Accuracy is driven by intrabar granularity:
-the lower the intrabar timeframe relative to the chart, the closer to true delta. Use intrabar mode
-on **1‑minute and higher** charts (sub‑minute intrabar data may be unavailable, in which case the
-script falls back to chart‑bar classification). Intrabar history is also limited by TradingView, so
-very old bars in a long anchored window fall back to chart‑bar estimation.
+the lower the intrabar timeframe relative to the chart, the closer to true delta.
+
+**Plans:** seconds‑based resolutions (`1S`/`5S`/`15S`) require a TradingView **Premium** plan. By
+default the script uses **minute‑based** intrabar resolutions only, so it runs on any plan without
+the `RE10063` seconds‑timeframe error. On charts of ~2 minutes and up it drills down to minute
+intrabars; on **1‑minute and lower** charts (where the only sub‑resolution would be seconds) it
+automatically falls back to chart‑bar classification. If you *do* have Premium, enable
+**“Allow seconds timeframes”** to get sub‑minute precision on low‑timeframe charts. Intrabar
+history is also limited by TradingView, so very old bars in a long anchored window fall back to
+chart‑bar estimation.
 
 ## Usage
 
