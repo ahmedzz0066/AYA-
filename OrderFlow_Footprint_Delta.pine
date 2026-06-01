@@ -81,14 +81,11 @@ color  CHART    = chart.fg_color
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto lower-timeframe. With seconds allowed (Premium) it can subdivide low TFs; otherwise it
 // stays minute-based and returns "" when no valid sub-resolution exists (e.g. <= 1-minute charts).
-f_autoLtf(bool sec) =>
+// Pure-ternary form (no if/:= reassignment) so the result stays a *simple string*, which is the
+// qualifier request.security_lower_tf() requires for its timeframe argument.
+f_autoLtf(simple bool sec) =>
     s = timeframe.in_seconds()
-    string r = ""
-    if sec
-        r := s <= 60 ? "1S" : s <= 300 ? "5S" : s <= 900 ? "15S" : s <= 3600 ? "1" : s <= 14400 ? "5" : s <= 86400 ? "15" : "60"
-    else
-        r := s <= 60 ? "" : s <= 900 ? "1" : s <= 3600 ? "5" : s <= 14400 ? "15" : s <= 86400 ? "60" : "240"
-    r
+    sec ? (s <= 60 ? "1S" : s <= 300 ? "5S" : s <= 900 ? "15S" : s <= 3600 ? "1" : s <= 14400 ? "5" : s <= 86400 ? "15" : "60") : (s <= 60 ? "" : s <= 900 ? "1" : s <= 3600 ? "5" : s <= 14400 ? "15" : s <= 86400 ? "60" : "240")
 
 // Effective intrabar TF: honour a valid manual override, else auto. A manual seconds TF is
 // ignored unless the Premium toggle is on, so the script never trips the seconds-plan error.
