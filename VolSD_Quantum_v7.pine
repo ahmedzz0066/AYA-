@@ -1,0 +1,502 @@
+//@version=6
+// =====================================================================================
+//  VOLUMETRIC SUPPLY & DEMAND ZONES — QUANTUM v7  ("VolSD Quantum")
+//  A next-generation, non-repainting Supply/Demand engine that fuses Auction Market
+//  Theory (volume profile, POC/Value Area, HVN/LVN) with modern Smart Money Concepts
+//  (market structure BOS/CHoCH, Order Blocks, Fair Value Gaps, liquidity sweeps,
+//  premium/discount + OTE) into a single, math-normalized confluence score.
+//
+//  WHY v7 IS DIFFERENT (vs v6):
+//    v6 anchored zones to a raw "base→impulse" heuristic. v7 anchors zones to the
+//    *cause* of institutional moves: an Order Block at the origin of a structural
+//    break (BOS/CHoCH) that produced displacement + a Fair Value Gap, ideally after a
+//    liquidity sweep, sitting in the correct premium/discount half of the dealing
+//    range, aligned with a Volume-Profile HVN and the higher-timeframe bias. Each of
+//    those is an independent, normalized evidence channel; the score is their weighted
+//    mean, so more *orthogonal* confluence ⇒ higher, bounded conviction.
+//
+//  NON-REPAINTING: swing pivots confirm with `pivLen` lag; structure breaks evaluate
+//    on confirmed bars; Order Blocks reference already-closed candles; HTF uses
+//    lookahead_off. A printed zone never moves or vanishes on history.
+// =====================================================================================
+indicator("VolSD Quantum v7", "VolSD Q7", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+// =====================================================================================
+// INPUTS
+// =====================================================================================
+gS  = "1 · Market Structure (SMC core)"
+pivLen     = input.int(5,  "Swing pivot length", minval = 2, maxval = 50, group = gS,
+     tooltip = "Bars on each side of a swing. Larger = stronger, slower structure. Pivots confirm pivLen bars later (non-repaint).")
+useBody    = input.bool(false, "Order Block = candle body (else full wick)", group = gS)
+obScan     = input.int(12, "Order Block lookback (bars)", minval = 2, maxval = 50, group = gS,
+     tooltip = "How far back to find the last opposite candle (the Order Block) before the displacement that broke structure.")
+useCHoCH   = input.bool(true, "Allow CHoCH (reversal) zones", group = gS)
+useBOS     = input.bool(true, "Allow BOS (continuation) zones", group = gS)
+
+gD  = "2 · Displacement & Imbalance"
+dispATR    = input.float(1.3, "Min displacement (×ATR)", minval = 0.3, step = 0.1, group = gD,
+     tooltip = "Breakout candle range must exceed this ×ATR — proof of an aggressive, one-sided move.")
+volZmin    = input.float(0.8, "Min volume z-score", minval = -2, step = 0.1, group = gD,
+     tooltip = "Breakout volume must be this many standard deviations above its mean (adaptive, not a fixed multiple).")
+bodyRatio  = input.float(0.50, "Min body/range ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = gD)
+reqFVG     = input.bool(false, "Require Fair Value Gap to create a zone", group = gD)
+
+gQ  = "3 · Confluence (liquidity / location)"
+sweepLook  = input.int(15, "Liquidity sweep lookback", minval = 2, maxval = 60, group = gQ,
+     tooltip = "Window to detect a stop-hunt: price took out a prior swing then reclaimed it before the move.")
+useDealRange = input.bool(true, "Use premium/discount (dealing range)", group = gQ)
+oteLo      = input.float(0.62, "OTE retracement low", minval = 0.3, maxval = 0.9, step = 0.01, group = gQ)
+oteHi      = input.float(0.79, "OTE retracement high", minval = 0.4, maxval = 0.95, step = 0.01, group = gQ)
+
+gV  = "4 · Volume Profile"
+vpEnable   = input.bool(true, "Enable rolling volume profile (POC/VAH/VAL)", group = gV)
+vpLookback = input.int(200,  "Profile lookback (bars)", minval = 20, maxval = 1000, group = gV)
+vpBins     = input.int(24,   "Profile resolution (bins)", minval = 8, maxval = 100, group = gV)
+vaPct      = input.float(70, "Value Area %", minval = 50, maxval = 95, step = 1, group = gV)
+vpHist     = input.bool(true, "Draw profile histogram", group = gV)
+
+gW  = "5 · Strength Scoring (weights, 0-10)"
+wStruct    = input.float(2.0, "Weight: structure (CHoCH/BOS)", minval = 0, step = 0.1, group = gW)
+wVol       = input.float(1.5, "Weight: volume percentile",     minval = 0, step = 0.1, group = gW)
+wDisp      = input.float(1.5, "Weight: displacement strength", minval = 0, step = 0.1, group = gW)
+wDelta     = input.float(1.0, "Weight: delta imbalance",       minval = 0, step = 0.1, group = gW)
+wFVG       = input.float(1.5, "Weight: Fair Value Gap",        minval = 0, step = 0.1, group = gW)
+wSweep     = input.float(1.5, "Weight: liquidity sweep",       minval = 0, step = 0.1, group = gW)
+wLoc       = input.float(1.0, "Weight: premium/discount",      minval = 0, step = 0.1, group = gW)
+wHVN       = input.float(1.0, "Weight: HVN alignment",         minval = 0, step = 0.1, group = gW)
+wHTF       = input.float(1.5, "Weight: HTF bias",              minval = 0, step = 0.1, group = gW)
+wWidth     = input.float(0.5, "Weight: width efficiency",      minval = 0, step = 0.1, group = gW)
+maxWidthATR= input.float(2.5, "Width normalization (×ATR)",    minval = 0.5, step = 0.1, group = gW)
+minStrength= input.float(6.0, "Min strength to display (0-10)", minval = 0, maxval = 10, step = 0.5, group = gW)
+
+gM  = "6 · Mitigation & Lifecycle"
+freshHL    = input.int(150,  "Freshness half-life (bars)", minval = 5, group = gM)
+touchDecay = input.float(0.80, "Per-touch decay factor", minval = 0.1, maxval = 1.0, step = 0.05, group = gM)
+mitigType  = input.string("Close through", "Mitigation trigger", options = ["Close through", "Wick through"], group = gM)
+removeMit  = input.bool(true, "Remove mitigated zones", group = gM)
+maxZones   = input.int(10,   "Max active zones per side", minval = 1, maxval = 60, group = gM)
+
+gH  = "7 · Higher-Timeframe Bias"
+htfEnable  = input.bool(true, "Enable HTF bias confluence", group = gH)
+htfRes     = input.timeframe("240", "HTF resolution", group = gH)
+htfEmaLen  = input.int(50, "HTF trend EMA length", minval = 2, group = gH)
+
+gR  = "8 · Regime Filter"
+regimeFilt = input.bool(false, "Only create zones in trending regime", group = gR)
+adxLen     = input.int(14, "ADX length", minval = 2, group = gR)
+adxTrend   = input.float(20, "ADX trend threshold", minval = 5, step = 1, group = gR)
+
+gZ  = "9 · Visuals & Targets"
+colDem     = input.color(color.new(#26a69a, 0), "Demand color", group = gZ)
+colSup     = input.color(color.new(#ef5350, 0), "Supply color", group = gZ)
+showPOC    = input.bool(true,  "Show zone POC line", group = gZ)
+showLabel  = input.bool(true,  "Show strength label", group = gZ)
+showTarget = input.bool(true,  "Project target + R:R", group = gZ)
+showStruct = input.bool(true,  "Mark BOS/CHoCH", group = gZ)
+extendRt   = input.int(20, "Extend boxes (bars right)", minval = 0, group = gZ)
+maxTransp  = input.int(90, "Transparency (weak zones)", minval = 50, maxval = 99, group = gZ)
+minTransp  = input.int(55, "Transparency (strong zones)", minval = 0, maxval = 90, group = gZ)
+
+gA  = "10 · Alerts"
+alertRetest= input.bool(true, "Alert on strong-zone retest + rejection", group = gA)
+alertSpike = input.float(1.5, "Retest volume spike (×avg)", minval = 1.0, step = 0.1, group = gA)
+
+// =====================================================================================
+// CORE SERIES  (all ta.* hoisted — must run every bar)
+// =====================================================================================
+atr     = ta.atr(14)
+avgVol  = ta.sma(volume, 50)
+volSd   = ta.stdev(volume, 50)
+gVolZ   = volSd > 0 ? (volume - avgVol) / volSd : 0.0
+gVolPct = ta.percentrank(volume, 100) / 100.0
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+trending = adx >= adxTrend
+regimeOK = not regimeFilt or trending
+
+htfClose = htfEnable ? request.security(syminfo.tickerid, htfRes, close[1], lookahead = barmerge.lookahead_off) : close
+htfEma   = htfEnable ? request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_off) : close
+htfUp    = htfClose >  htfEma
+htfDn    = htfClose <  htfEma
+
+// Sweep extremes (hoisted: ta.* must run every bar)
+gLowest  = ta.lowest(low,  sweepLook)
+gHighest = ta.highest(high, sweepLook)
+
+// =====================================================================================
+// MARKET STRUCTURE ENGINE  (swings, BOS, CHoCH, dealing range)
+// =====================================================================================
+ph = ta.pivothigh(pivLen, pivLen)
+pl = ta.pivotlow(pivLen, pivLen)
+
+var float swH = na          // active (nullable) swing high used for break detection
+var float swL = na
+var float lastSwH = na      // persistent last swing high (range / liquidity ref)
+var float lastSwL = na
+var float prevSwH = na      // swing high prior to lastSwH
+var float prevSwL = na
+var int   bias    = 0       // +1 bullish structure, -1 bearish
+
+if not na(ph)
+    prevSwH := lastSwH
+    lastSwH := ph
+    swH     := ph
+if not na(pl)
+    prevSwL := lastSwL
+    lastSwL := pl
+    swL     := pl
+
+// Structure breaks on confirmed close
+bool bosUp   = false
+bool chochUp = false
+bool bosDn   = false
+bool chochDn = false
+
+// `swH`/`swL` are nulled on break, which prevents re-triggering, so no close[1]
+// guard is needed — this also catches breaks where the pivot confirmed late
+// (price already above the swing high when the pivot becomes known).
+if not na(swH) and close > swH
+    if bias == -1
+        chochUp := true
+    else
+        bosUp := true
+    bias := 1
+    swH  := na
+if not na(swL) and close < swL
+    if bias == 1
+        chochDn := true
+    else
+        bosDn := true
+    bias := -1
+    swL  := na
+
+// Dealing range (premium/discount) from persistent swings
+rngTop = math.max(nz(lastSwH, high), nz(prevSwH, high))
+rngBot = math.min(nz(lastSwL, low),  nz(prevSwL, low))
+rngMid = (rngTop + rngBot) / 2.0
+
+// =====================================================================================
+// FUNCTIONS
+// =====================================================================================
+// Rolling volume profile -> [poc, vah, val, bins, lo, step, maxBinVol]
+// State-free (manual hi/lo, no ta.*), so it is safe to call conditionally.
+f_profile(int lb, int nb, float vapct) =>
+    float hi = high
+    float lo = low
+    for i = 0 to lb - 1
+        hi := math.max(hi, high[i])
+        lo := math.min(lo, low[i])
+    float stp = (hi - lo) / nb
+    array<float> bv = array.new_float(nb, 0.0)
+    if stp > 0
+        for i = 0 to lb - 1
+            int loB = math.max(0, math.min(nb - 1, int((low[i]  - lo) / stp)))
+            int hiB = math.max(0, math.min(nb - 1, int((high[i] - lo) / stp)))
+            float per = volume[i] / (hiB - loB + 1)
+            for b = loB to hiB
+                array.set(bv, b, array.get(bv, b) + per)
+    int pocIdx = 0
+    float pocV = -1.0
+    for i = 0 to nb - 1
+        if array.get(bv, i) > pocV
+            pocV := array.get(bv, i)
+            pocIdx := i
+    float tot = array.sum(bv)
+    float tgt = tot * vapct / 100.0
+    float acc = array.get(bv, pocIdx)
+    int up = pocIdx + 1
+    int dn = pocIdx - 1
+    int vahI = pocIdx
+    int valI = pocIdx
+    while acc < tgt and (up < nb or dn >= 0)
+        float vU = up < nb ? array.get(bv, up) : -1.0
+        float vD = dn >= 0 ? array.get(bv, dn) : -1.0
+        if vU >= vD
+            acc := acc + vU
+            vahI := up
+            up := up + 1
+        else
+            acc := acc + vD
+            valI := dn
+            dn := dn - 1
+    [lo + (pocIdx + 0.5) * stp, lo + (vahI + 1) * stp, lo + valI * stp, bv, lo, stp, pocV]
+
+// Find Order Block: last opposite-direction candle before displacement. Returns offset (na if none).
+f_findOB(bool demand, int scan) =>
+    int idx = na
+    for k = 1 to scan
+        bool down = close[k] < open[k]
+        bool up   = close[k] > open[k]
+        if (demand and down) or (not demand and up)
+            idx := k
+            break
+    idx
+
+// Composite static strength 0..10 from orthogonal, normalized confluence channels.
+f_strength(bool dem, bool choch, float top, float bot, float rng, float clv,
+     bool fvg, float gap, bool sweep, bool locOK, bool hvn) =>
+    float sStruct = choch ? 1.0 : 0.75                              // reversal premium
+    float sVol    = gVolPct
+    float sDisp   = math.min(1.0, (rng / atr) / (dispATR * 1.6))
+    float sDelta  = clv                                             // 0..1 close-location
+    float sFVG    = fvg ? math.min(1.0, gap / (0.5 * atr)) : 0.0
+    float sSweep  = sweep ? 1.0 : 0.0
+    float sLoc    = locOK ? 1.0 : 0.0
+    float sHVN    = hvn ? 1.0 : 0.0
+    float sHTF    = not htfEnable ? 0.0 : (dem ? (htfUp ? 1.0 : 0.0) : (htfDn ? 1.0 : 0.0))
+    float sWidth  = math.max(0.0, 1.0 - (top - bot) / (atr * maxWidthATR))
+    float wH = htfEnable ? wHTF : 0.0
+    float sumW = wStruct + wVol + wDisp + wDelta + wFVG + wSweep + wLoc + wHVN + wH + wWidth
+    float num = wStruct * sStruct
+    num := num + wVol   * sVol
+    num := num + wDisp  * sDisp
+    num := num + wDelta * sDelta
+    num := num + wFVG   * sFVG
+    num := num + wSweep * sSweep
+    num := num + wLoc   * sLoc
+    num := num + wHVN   * sHVN
+    num := num + wH     * sHTF
+    num := num + wWidth * sWidth
+    sumW > 0 ? 10.0 * num / sumW : 0.0
+
+// =====================================================================================
+// ZONE TYPE & STORAGE
+// =====================================================================================
+type Zone
+    float top
+    float bot
+    float poc
+    float target
+    bool  isDemand
+    bool  choch
+    bool  fvg
+    bool  sweep
+    float baseStrength
+    int   createdBar
+    int   touches
+    bool  inside
+    bool  mitigated
+    box   bx
+    line  pocLn
+    line  tgtLn
+    label lbl
+
+var array<Zone> demZones = array.new<Zone>()
+var array<Zone> supZones = array.new<Zone>()
+
+f_live(Zone z) =>
+    float age   = math.max(0, bar_index - z.createdBar)
+    float fresh = math.pow(0.5, age / freshHL)
+    float tch   = math.pow(touchDecay, z.touches)
+    z.baseStrength * fresh * tch
+
+f_transp(float s) =>
+    float k = math.min(1.0, math.max(0.0, s / 10.0))
+    int(maxTransp - (maxTransp - minTransp) * k)
+
+f_tagText(Zone z, float live) =>
+    string t = (z.isDemand ? "DEMAND " : "SUPPLY ") + str.tostring(live, "#.0") + "/10"
+    t := t + (z.choch ? "  CHoCH" : "  BOS")
+    t := t + (z.fvg   ? " FVG" : "")
+    t := t + (z.sweep ? " SWEEP" : "")
+    t := t + (z.touches > 0 ? "  " + str.tostring(z.touches) + "T" : "")
+    t
+
+// =====================================================================================
+// ZONE CREATION  (structure-origin Order Blocks)
+// =====================================================================================
+f_createZone(bool dem, bool choch) =>
+    int ob = f_findOB(dem, obScan)
+    if not na(ob)
+        // Order Block geometry
+        float cTop = useBody ? math.max(open[ob], close[ob]) : high[ob]
+        float cBot = useBody ? math.min(open[ob], close[ob]) : low[ob]
+        float rng  = high - low                                       // breakout candle range
+        float clv  = dem ? (close - low) / math.max(high - low, syminfo.mintick)
+                         : (high - close) / math.max(high - low, syminfo.mintick)
+        // Fair Value Gap around the displacement (3-bar imbalance)
+        bool  fvgUp = low > high[2]
+        bool  fvgDn = high < low[2]
+        bool  fvg   = dem ? fvgUp : fvgDn
+        float gap   = dem ? math.max(0.0, low - high[2]) : math.max(0.0, low[2] - high)
+        // Liquidity sweep: took prior swing then reclaimed (uses hoisted extremes)
+        bool sweep  = dem ? (not na(prevSwL) and gLowest  < prevSwL and close > prevSwL)
+                          : (not na(prevSwH) and gHighest > prevSwH and close < prevSwH)
+        // Premium/discount location
+        bool locOK  = not useDealRange ? true : (dem ? (cTop <= rngMid) : (cBot >= rngMid))
+        // HVN alignment: does the OB overlap the Volume-Profile Value Area?
+        bool hvn = false
+        if vpEnable
+            [_p, vHi, vLo, _b, _l, _s, _m] = f_profile(vpLookback, vpBins, vaPct)
+            hvn := cTop >= vLo and cBot <= vHi
+        // Gate: displacement + adaptive volume + directional + optional FVG
+        bool gDisp = rng > dispATR * atr
+        bool gVol  = gVolZ >= volZmin
+        bool gDir  = dem ? close > open : close < open
+        bool gBody = high == low ? false : math.abs(close - open) / (high - low) >= bodyRatio
+        bool gFvg  = not reqFVG or fvg
+        bool gate  = gDisp and gVol and gDir and gBody and gFvg
+        if gate
+            float strength = f_strength(dem, choch, cTop, cBot, rng, clv, fvg, gap, sweep, locOK, hvn)
+            if strength >= minStrength
+                float poc    = (cTop + cBot) / 2.0
+                float target = dem ? rngTop : rngBot
+                color c  = dem ? colDem : colSup
+                int tr   = f_transp(strength)
+                box bx   = box.new(bar_index[ob], cTop, bar_index + extendRt, cBot,
+                     border_color = color.new(c, 25), bgcolor = color.new(c, tr), border_width = 1)
+                line pl2 = showPOC ? line.new(bar_index[ob], poc, bar_index + extendRt, poc,
+                     color = color.new(c, 10), style = line.style_dotted) : na
+                line tl  = (showTarget and not na(target)) ? line.new(bar_index, target, bar_index + extendRt, target,
+                     color = color.new(c, 40), style = line.style_dashed) : na
+                label lb = na
+                if showLabel
+                    float risk   = cTop - cBot
+                    float reward = dem ? (target - cTop) : (cBot - target)
+                    float rr     = risk > 0 ? reward / risk : na
+                    lb := label.new(bar_index + extendRt, dem ? cBot : cTop,
+                         (dem ? "DEMAND " : "SUPPLY ") + str.tostring(strength, "#.0") + "/10"
+                         + (choch ? "  CHoCH" : "  BOS") + (fvg ? " FVG" : "") + (sweep ? " SWEEP" : "")
+                         + (not na(rr) ? "  R:R " + str.tostring(rr, "#.1") : ""),
+                         style = dem ? label.style_label_up : label.style_label_down,
+                         color = color.new(c, 15), textcolor = color.white, size = size.small)
+                Zone z = Zone.new(cTop, cBot, poc, target, dem, choch, fvg, sweep, strength,
+                     bar_index, 0, false, false, bx, pl2, tl, lb)
+                array<Zone> arr = dem ? demZones : supZones
+                array.push(arr, z)
+                if array.size(arr) > maxZones
+                    Zone old = array.shift(arr)
+                    box.delete(old.bx)
+                    line.delete(old.pocLn)
+                    line.delete(old.tgtLn)
+                    label.delete(old.lbl)
+
+if barstate.isconfirmed and regimeOK
+    if (chochUp and useCHoCH) or (bosUp and useBOS)
+        f_createZone(true, chochUp)
+    if (chochDn and useCHoCH) or (bosDn and useBOS)
+        f_createZone(false, chochDn)
+
+// =====================================================================================
+// LIFECYCLE: mitigation, decay, retest alerts
+// =====================================================================================
+f_update(array<Zone> arr) =>
+    bool fired = false
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Zone z = array.get(arr, i)
+            if not z.mitigated
+                bool through = mitigType == "Close through"
+                     ? (z.isDemand ? close < z.bot : close > z.top)
+                     : (z.isDemand ? low   < z.bot : high  > z.top)
+                if through
+                    z.mitigated := true
+                    if removeMit
+                        box.delete(z.bx)
+                        line.delete(z.pocLn)
+                        line.delete(z.tgtLn)
+                        label.delete(z.lbl)
+                        array.remove(arr, i)
+                        continue
+                    else
+                        box.set_bgcolor(z.bx, color.new(color.gray, 92))
+                        box.set_border_color(z.bx, color.new(color.gray, 60))
+                else
+                    bool touchingNow = low <= z.top and high >= z.bot
+                    if touchingNow and not z.inside
+                        z.touches += 1
+                        z.inside  := true
+                        float liveT  = f_live(z)
+                        bool  reject = z.isDemand ? close > open : close < open
+                        bool  spike  = volume > alertSpike * avgVol
+                        if alertRetest and liveT >= minStrength and reject and spike
+                            fired := true
+                    if not touchingNow
+                        z.inside := false
+                    float live = f_live(z)
+                    box.set_right(z.bx, bar_index + extendRt)
+                    box.set_bgcolor(z.bx, color.new(z.isDemand ? colDem : colSup, f_transp(live)))
+                    if not na(z.pocLn)
+                        line.set_x2(z.pocLn, bar_index + extendRt)
+                    if not na(z.tgtLn)
+                        line.set_x2(z.tgtLn, bar_index + extendRt)
+                    if not na(z.lbl)
+                        label.set_x(z.lbl, bar_index + extendRt)
+                        label.set_text(z.lbl, f_tagText(z, live))
+    fired
+
+bool alertRetestFlag = false
+if barstate.isconfirmed
+    bool fD = f_update(demZones)
+    bool fS = f_update(supZones)
+    alertRetestFlag := fD or fS
+
+// =====================================================================================
+// STRUCTURE MARKERS
+// =====================================================================================
+plotshape(showStruct and bosUp,   "BOS up",   shape.triangleup,   location.belowbar, color.new(colDem, 0), size = size.tiny, text = "BOS")
+plotshape(showStruct and chochUp, "CHoCH up", shape.diamond,      location.belowbar, color.new(colDem, 0), size = size.tiny, text = "CHoCH")
+plotshape(showStruct and bosDn,   "BOS dn",   shape.triangledown, location.abovebar, color.new(colSup, 0), size = size.tiny, text = "BOS")
+plotshape(showStruct and chochDn, "CHoCH dn", shape.diamond,      location.abovebar, color.new(colSup, 0), size = size.tiny, text = "CHoCH")
+
+// =====================================================================================
+// ROLLING VOLUME PROFILE DRAWING (POC/VAH/VAL + histogram) on last bar
+// =====================================================================================
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+var array<box> histBoxes = array.new<box>()
+
+if vpEnable and barstate.islast
+    [vpPoc, vpVah, vpVal, bv, vpLo, vpStp, vpMaxV] = f_profile(vpLookback, vpBins, vaPct)
+    int xr = bar_index + extendRt
+    int xl = bar_index - vpLookback
+    line.delete(pocLine)
+    line.delete(vahLine)
+    line.delete(valLine)
+    pocLine := line.new(xl, vpPoc, xr, vpPoc, color = color.new(color.orange, 0), width = 2)
+    vahLine := line.new(xl, vpVah, xr, vpVah, color = color.new(color.blue, 0), style = line.style_dashed)
+    valLine := line.new(xl, vpVal, xr, vpVal, color = color.new(color.blue, 0), style = line.style_dashed)
+    if vpHist
+        if array.size(histBoxes) > 0
+            for i = 0 to array.size(histBoxes) - 1
+                box.delete(array.get(histBoxes, i))
+            array.clear(histBoxes)
+        float maxLen = vpLookback * 0.4
+        for b = 0 to vpBins - 1
+            float v = array.get(bv, b)
+            if v > 0 and vpMaxV > 0
+                int len = int(maxLen * v / vpMaxV)
+                float yTop = vpLo + (b + 1) * vpStp
+                float yBot = vpLo + b * vpStp
+                bool inVA = yBot >= vpVal and yTop <= vpVah
+                box hb = box.new(bar_index - len, yTop, bar_index, yBot,
+                     border_color = na, bgcolor = color.new(inVA ? color.blue : color.gray, 78))
+                array.push(histBoxes, hb)
+
+// =====================================================================================
+// ALERTS
+// =====================================================================================
+alertcondition(alertRetestFlag, "Strong zone retest + rejection", "VolSD Q7: strong zone retest with rejection & volume spike")
+if alertRetestFlag
+    alert("VolSD Quantum v7: strong supply/demand retest + rejection + volume spike on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+newDem = barstate.isconfirmed and regimeOK and ((chochUp and useCHoCH) or (bosUp and useBOS))
+newSup = barstate.isconfirmed and regimeOK and ((chochDn and useCHoCH) or (bosDn and useBOS))
+alertcondition(newDem, "New demand zone / bullish structure", "VolSD Q7: bullish structure break — demand zone candidate")
+alertcondition(newSup, "New supply zone / bearish structure", "VolSD Q7: bearish structure break — supply zone candidate")
+
+// =====================================================================================
+// DIAGNOSTICS TABLE
+// =====================================================================================
+var table info = table.new(position.top_right, 1, 4, frame_color = color.gray, frame_width = 1)
+if barstate.islast
+    string biasTxt = bias == 1 ? "BULLISH" : bias == -1 ? "BEARISH" : "NEUTRAL"
+    string locTxt  = close < rngMid ? "DISCOUNT" : "PREMIUM"
+    table.cell(info, 0, 0, "VolSD Quantum v7", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+    table.cell(info, 0, 1, "Struct: " + biasTxt, text_color = color.white,
+         bgcolor = color.new(bias == 1 ? color.teal : bias == -1 ? color.maroon : color.gray, 20), text_size = size.small)
+    table.cell(info, 0, 2, locTxt + (trending ? " · TREND" : " · RANGE") + "  ADX " + str.tostring(adx, "#.0"),
+         text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(info, 0, 3, "Dem " + str.tostring(array.size(demZones)) + " · Sup " + str.tostring(array.size(supZones)),
+         text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
