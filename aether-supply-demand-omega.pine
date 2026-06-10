@@ -346,8 +346,14 @@ compute_va(array<VolumeRow> rows, float total_vol, int poc_idx) =>
         int up = poc_idx + 1
         int dn = poc_idx - 1
         while cum < target and (up < rows.size() or dn >= 0)
-            float vol_up = up < rows.size() ? rows.get(up).volume : -1.0
-            float vol_dn = dn >= 0 ? rows.get(dn).volume : -1.0
+            // Pine ternaries evaluate both branches, so out-of-bounds
+            // array.get() must be guarded with real if-blocks.
+            float vol_up = -1.0
+            if up < rows.size()
+                vol_up := rows.get(up).volume
+            float vol_dn = -1.0
+            if dn >= 0
+                vol_dn := rows.get(dn).volume
             if vol_up >= vol_dn
                 cum += vol_up
                 up += 1
