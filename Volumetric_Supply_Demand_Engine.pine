@@ -1,0 +1,456 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Volumetric Supply/Demand Engine
+//
+// ============================================================================
+//  VOLUMETRIC SUPPLY / DEMAND ENGINE                                  Pine v6
+// ----------------------------------------------------------------------------
+//  Philosophy:
+//    Supply & demand zones are NOT lines. They are price *areas* left behind
+//    when a large, unfilled volume imbalance ignited an explosive departure.
+//    We therefore qualify a zone by the VOLUME SIGNATURE of its departure
+//    (relative volume + body conviction + departure speed + buy/sell
+//    imbalance), not merely by the shape of a price swing.
+//
+//  Pipeline:
+//    1. Base + Explosive-Departure detection (DBR / RBD / DBD / RBR).
+//    2. Volumetric 0-100 scoring (5 weighted components).
+//    3. Decay on retest (opacity fade + score reduction) and break logic.
+//    4. Cumulative Volume Delta overlay + divergence read for confirmation.
+//    5. Multi-timeframe confluence (HTF zone nesting highlight).
+//    6. Gradient visualization, dashboard table, and high-quality alerts.
+//
+//  Non-repainting: every zone is created only on barstate.isconfirmed and all
+//  HTF data is pulled with lookahead disabled + a [1] offset. Confirmed bars
+//  never mutate retroactively.
+// ============================================================================
+
+//@version=6
+indicator("Volumetric Supply/Demand Engine", shorttitle="VolSDE", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500, max_bars_back=1000)
+
+// ===========================================================================
+// INPUTS
+// ===========================================================================
+
+// ----- Group 1 : Departure qualification -----------------------------------
+g_dep = "1 · Departure Qualification"
+volLen      = input.int(20,  "Volume MA Length", minval=2, group=g_dep, tooltip="Rolling window for the average volume baseline that the explosive departure is measured against.")
+volMult     = input.float(2.0,"Min Departure Volume (× avg)", minval=1.0, step=0.1, group=g_dep, tooltip="Departure candle volume must be at least this multiple of the rolling average. Proves the move was driven by real participation, not drift.")
+bodyRatio   = input.float(0.55,"Min Body/Range Ratio", minval=0.1, maxval=1.0, step=0.05, group=g_dep, tooltip="Body ÷ full range of the departure candle. High values = decisive conviction candle, filters out wicky noise / indecision.")
+moveMult    = input.float(1.5,"Min Departure Speed (× ATR)", minval=0.0, step=0.1, group=g_dep, tooltip="The departure candle's range must exceed this multiple of ATR — i.e. it must MOVE, not crawl, away from the base.")
+atrLen      = input.int(14,  "ATR Length", minval=1, group=g_dep, tooltip="ATR length used for departure-speed normalization and zone freshness math.")
+
+// ----- Group 2 : Base definition -------------------------------------------
+g_base = "2 · Base Definition"
+maxBase     = input.int(3,   "Max Base Candles", minval=1, maxval=6, group=g_base, tooltip="How many small consolidation candles immediately before the departure are bundled into the zone. The tighter the base, the more potent the imbalance.")
+baseBodyMax = input.float(0.50,"Max Base Body/Range", minval=0.05, maxval=1.0, step=0.05, group=g_base, tooltip="A candle only counts as 'base' if its body/range is below this — i.e. it is genuine consolidation, not a trend candle.")
+useBodyZone = input.bool(true,"Zone From Bodies (not wicks)", group=g_base, tooltip="ON = zone bounds use base candle bodies (open/close). OFF = use full wicks (high/low). Bodies give tighter, higher-probability entries.")
+
+// ----- Group 3 : Scoring weights (0-100 total) ------------------------------
+g_score = "3 · Volumetric Scoring Weights"
+wVol    = input.float(30, "Weight · Departure Volume", minval=0, group=g_score, tooltip="Points for how violently above-average the departure volume was. The headline edge of a volumetric model.")
+wSpeed  = input.float(20, "Weight · Departure Speed", minval=0, group=g_score, tooltip="Points for how fast/far price travelled away from the zone (range vs ATR).")
+wFresh  = input.float(20, "Weight · Freshness", minval=0, group=g_score, tooltip="Points for an untested zone. Decays as touches accumulate.")
+wTime   = input.float(15, "Weight · Time-at-Zone", minval=0, group=g_score, tooltip="Points for an efficient (tight, short) base. Long bases bleed the imbalance and score lower.")
+wImbal  = input.float(15, "Weight · Volume Imbalance", minval=0, group=g_score, tooltip="Points for estimated buy/sell delta agreement with the zone direction (candle-anatomy proxy).")
+minScore= input.int(40,  "Min Score To Draw", minval=0, maxval=100, group=g_score, tooltip="Zones scoring below this are discarded at birth to keep the chart and the engine focused on high-quality areas.")
+
+// ----- Group 4 : Decay & break ---------------------------------------------
+g_decay = "4 · Decay & Break"
+touchPad     = input.float(0.0, "Touch Padding (× ATR)", minval=0.0, step=0.05, group=g_decay, tooltip="Expands the touch test by this much ATR so near-misses still register as a tap. 0 = exact zone edge.")
+decayPerTap  = input.float(15,  "Score Reduction / Tap", minval=0, group=g_decay, tooltip="Score points removed each time price retests the zone. Models the consumption of resting orders.")
+breakVolMult = input.float(1.2, "Break Volume (× avg)", minval=0.5, step=0.1, group=g_decay, tooltip="A close beyond the zone only counts as BROKEN if volume ≥ this × average — a genuine absorption, not a wick poke.")
+maxZones     = input.int(60,   "Max Live Zones / Side", minval=5, maxval=250, group=g_decay, tooltip="Cap on simultaneously tracked supply (and demand) zones. Oldest broken/weakest are pruned first. Keeps redraw ≤ 500 boxes.")
+keepBroken   = input.bool(false,"Keep Broken Zones On Chart", group=g_decay, tooltip="ON = leave a faded outline where a zone broke (flip levels). OFF = remove on break.")
+
+// ----- Group 5 : Volume Delta ----------------------------------------------
+g_delta = "5 · Volume Delta"
+showDelta   = input.bool(true, "Show Cumulative Delta Divergence", group=g_delta, tooltip="Plots normalized cumulative volume delta vs price in the data window / status line for divergence confirmation at zones.")
+deltaLen    = input.int(14, "Delta Smoothing", minval=1, group=g_delta, tooltip="EMA length applied to the per-bar delta proxy before accumulation read-out.")
+deltaDivLen = input.int(20, "Divergence Lookback", minval=2, group=g_delta, tooltip="Bars over which price/delta divergence is evaluated for the confirmation flag used in alerts.")
+
+// ----- Group 6 : Multi-timeframe confluence --------------------------------
+g_mtf = "6 · Multi-Timeframe Confluence"
+useMTF   = input.bool(true,  "Enable HTF Confluence", group=g_mtf, tooltip="Pull supply/demand zone bounds from a higher timeframe and flag current-TF zones that nest inside them.")
+htfTF    = input.timeframe("240", "Higher Timeframe", group=g_mtf, tooltip="The HTF whose zones define institutional context. Current-TF zones nested inside an HTF zone are the highest-probability areas.")
+mtfBoost = input.float(10, "Confluence Score Boost", minval=0, group=g_mtf, tooltip="Bonus points (capped at 100 total) granted to a current-TF zone that sits inside an aligned HTF zone.")
+
+// ----- Group 7 : Visualization & dashboard ---------------------------------
+g_viz = "7 · Visualization & Dashboard"
+supLow   = input.color(color.new(#ef5350, 80), "Supply · Weak", group=g_viz, inline="sup")
+supHigh  = input.color(color.new(#b71c1c, 35), "Strong", group=g_viz, inline="sup", tooltip="Supply zones are gradient-filled from Weak→Strong by score.")
+demLow   = input.color(color.new(#26a69a, 80), "Demand · Weak", group=g_viz, inline="dem")
+demHigh  = input.color(color.new(#1b5e20, 35), "Strong", group=g_viz, inline="dem", tooltip="Demand zones are gradient-filled from Weak→Strong by score.")
+mtfCol   = input.color(color.new(color.yellow, 70), "HTF Confluence Tint", group=g_viz, tooltip="Border tint applied to zones nested inside an HTF zone.")
+showLbl  = input.bool(true, "Show Zone Score Labels", group=g_viz)
+showDash = input.bool(true, "Show Dashboard Table", group=g_viz)
+dashPos  = input.string("Top Right", "Dashboard Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=g_viz)
+dashRows = input.int(8, "Dashboard Rows", minval=1, maxval=20, group=g_viz, tooltip="Number of strongest live zones listed in the dashboard.")
+
+// ----- Group 8 : Alerts -----------------------------------------------------
+g_alert = "8 · Alerts"
+alertScore = input.int(70, "Alert · Min Zone Score", minval=0, maxval=100, group=g_alert, tooltip="Only fire entry alerts for zones at/above this quality.")
+alertFresh = input.bool(true, "Alert · Fresh Zones Only", group=g_alert, tooltip="Require the zone to be untested for the entry alert.")
+alertDelta = input.bool(true, "Alert · Require Delta Confirmation", group=g_alert, tooltip="Require cumulative delta to be diverging in the zone's favor before alerting.")
+
+// ===========================================================================
+// USER-DEFINED TYPE : one supply/demand zone
+// ===========================================================================
+type Zone
+    float top            // upper bound of the area
+    float bot            // lower bound of the area
+    int   startBar       // bar_index where the base began
+    int   dir            //  1 = demand (buy)   -1 = supply (sell)
+    float score          // current 0-100 quality score
+    float scoreInit      // score at creation (for label/decay reference)
+    int   touches        // number of retests
+    bool  broken         // consumed by an opposing close
+    bool  mtf            // nested inside an aligned HTF zone
+    bool  inside         // was price inside the zone on the previous bar (per-zone touch latch)
+    box   bx             // drawing handle
+    label lb             // score-label handle
+
+// Persistent zone registries (one per side keeps pruning simple & cheap).
+var array<Zone> demandZones = array.new<Zone>()
+var array<Zone> supplyZones = array.new<Zone>()
+
+// ===========================================================================
+// CORE SERIES
+// ===========================================================================
+rng      = high - low
+body     = math.abs(close - open)
+bodyPct  = rng > 0 ? body / rng : 0.0
+avgVol   = ta.sma(volume, volLen)
+atr      = ta.atr(atrLen)
+relVol   = avgVol > 0 ? volume / avgVol : 0.0
+
+// --- Per-bar buy/sell delta proxy from candle anatomy ----------------------
+// buyVol  ≈ volume weighted by how much price closed up its range
+// sellVol ≈ the complement.  Crude but monotonic and non-repainting.
+buyVol  = rng > 0 ? volume * (close - low) / rng : volume * 0.5
+sellVol = rng > 0 ? volume * (high - close) / rng : volume * 0.5
+barDelta = buyVol - sellVol
+cumDelta = ta.cum(barDelta)                 // cumulative volume delta
+cumDeltaEma = ta.ema(cumDelta, deltaLen)
+
+// --- Delta divergence flags (price vs CVD over lookback) -------------------
+priceUp  = close > close[deltaDivLen]
+priceDn  = close < close[deltaDivLen]
+deltaUp  = cumDelta > cumDelta[deltaDivLen]
+deltaDn  = cumDelta < cumDelta[deltaDivLen]
+bullDiv  = priceDn and deltaUp              // price lower, delta higher → hidden buying
+bearDiv  = priceUp and deltaDn              // price higher, delta lower → hidden selling
+
+// ===========================================================================
+// HELPER : zone bounds from a base window ending at `lastBaseOffset`
+// ===========================================================================
+// Returns [top, bot, startBarIndex] for `n` base candles ending at offset b.
+f_baseBounds(int n, int b) =>
+    float t = na
+    float bb = na
+    for i = b to b + n - 1
+        hi = useBodyZone ? math.max(open[i], close[i]) : high[i]
+        lo = useBodyZone ? math.min(open[i], close[i]) : low[i]
+        t  := na(t)  ? hi : math.max(t, hi)
+        bb := na(bb) ? lo : math.min(bb, lo)
+    [t, bb, bar_index[b + n - 1]]
+
+// ===========================================================================
+// HELPER : count consecutive base candles immediately before the departure
+// ===========================================================================
+// The departure candle is at offset 1 (the just-confirmed bar). The base is
+// the run of small-body candles starting at offset 2.
+f_countBase() =>
+    int cnt = 0
+    for i = 2 to maxBase + 1
+        bp = (high[i] - low[i]) > 0 ? math.abs(close[i] - open[i]) / (high[i] - low[i]) : 1.0
+        if bp <= baseBodyMax
+            cnt += 1
+        else
+            break
+    math.max(cnt, 1)
+
+// ===========================================================================
+// SCORING
+// ===========================================================================
+// Each component is normalized 0..1 then multiplied by its weight, so total
+// naturally lands on the 0..100 scale defined by the weight inputs.
+f_score(float depRelVol, float depBodyPct, float depRangeAtr, int baseN, float imbalance) =>
+    // (a) departure volume intensity — saturate at 4× average
+    cVol   = math.min(depRelVol / 4.0, 1.0) * wVol
+    // (b) departure speed — saturate at 3× ATR
+    cSpeed = math.min(depRangeAtr / 3.0, 1.0) * wSpeed
+    // (c) freshness — full at birth (decays later via touches)
+    cFresh = 1.0 * wFresh
+    // (d) time-at-zone — tighter/shorter base scores higher
+    cTime  = (1.0 - (baseN - 1) / math.max(maxBase, 1)) * wTime
+    // (e) imbalance — |buy-sell| share of departure, must agree w/ direction
+    cImbal = math.min(math.abs(imbalance), 1.0) * wImbal
+    total  = cVol + cSpeed + cFresh + cTime + cImbal
+    math.min(total, 100.0)
+
+// ===========================================================================
+// HTF CONFLUENCE  (non-repainting via [1] + lookahead_off)
+// ===========================================================================
+// We re-run a lightweight version of the departure test on the HTF and export
+// the bounds of the most recent supply & demand zone. State persists across
+// HTF bars through `var` inside the function evaluated by request.security.
+f_htfZones() =>
+    var float hSupTop = na
+    var float hSupBot = na
+    var float hDemTop = na
+    var float hDemBot = na
+    rngH  = high - low
+    bodyH = math.abs(close - open)
+    bpH   = rngH > 0 ? bodyH / rngH : 0.0
+    rvH   = ta.sma(volume, volLen) > 0 ? volume / ta.sma(volume, volLen) : 0.0
+    atrH  = ta.atr(atrLen)
+    qualH = rvH >= volMult and bpH >= bodyRatio and rngH >= moveMult * atrH
+    if qualH and close > open          // explosive up → HTF demand at prior candle
+        hDemTop := math.max(open[1], high[1])
+        hDemBot := math.min(open[1], low[1])
+    if qualH and close < open          // explosive down → HTF supply at prior candle
+        hSupTop := math.max(open[1], high[1])
+        hSupBot := math.min(open[1], low[1])
+    [hSupTop, hSupBot, hDemTop, hDemBot]
+
+// NOTE: request.security is called unconditionally (Pine forbids a ternary
+// that returns a tuple); the useMTF switch is applied to the results instead.
+[rawSupTop, rawSupBot, rawDemTop, rawDemBot] = request.security(syminfo.tickerid, htfTF, f_htfZones(), lookahead=barmerge.lookahead_off)
+htfSupTop = useMTF ? rawSupTop : na
+htfSupBot = useMTF ? rawSupBot : na
+htfDemTop = useMTF ? rawDemTop : na
+htfDemBot = useMTF ? rawDemBot : na
+
+// True if [bot,top] sits (mostly) inside the relevant HTF zone.
+f_nested(float bot, float top, int dir) =>
+    htop = dir == 1 ? htfDemTop : htfSupTop
+    hbot = dir == 1 ? htfDemBot : htfSupBot
+    not na(htop) and not na(hbot) and bot >= hbot and top <= htop
+
+// ===========================================================================
+// COLOR / DRAWING HELPERS
+// ===========================================================================
+f_zoneColor(int dir, float score) =>
+    dir == 1 ? color.from_gradient(score, minScore, 100, demLow, demHigh) : color.from_gradient(score, minScore, 100, supLow, supHigh)
+
+f_borderColor(Zone z) =>
+    z.mtf ? mtfCol : color.new(f_zoneColor(z.dir, z.score), 0)
+
+// ===========================================================================
+// ZONE CREATION  (only on confirmed bars → no repaint)
+// ===========================================================================
+// Departure candle = offset 1 (the bar that just closed & confirmed).
+depRelVol  = relVol[1]
+depBodyPct = bodyPct[1]
+depRange   = rng[1]
+depRangeAtr= atr[1] > 0 ? depRange / atr[1] : 0.0
+depUp      = close[1] > open[1]
+// Departure imbalance, signed to its own direction: + means it agrees.
+depBuy     = depRange > 0 ? (close[1] - low[1]) / depRange : 0.5
+depSell    = depRange > 0 ? (high[1] - close[1]) / depRange : 0.5
+depImbal   = depUp ? (depBuy - depSell) : (depSell - depBuy)
+
+qualifies  = depRelVol >= volMult and depBodyPct >= bodyRatio and depRangeAtr >= moveMult
+
+if barstate.isconfirmed and qualifies and not na(avgVol)
+    baseN = f_countBase()
+    [bTop, bBot, bStart] = f_baseBounds(baseN, 2)   // base starts at offset 2
+    if not na(bTop) and not na(bBot) and bTop > bBot
+        dir = depUp ? 1 : -1                         // up departure → demand
+        sc  = f_score(depRelVol, depBodyPct, depRangeAtr, baseN, depImbal)
+        nested = f_nested(bBot, bTop, dir)
+        if nested
+            sc := math.min(sc + mtfBoost, 100.0)
+        if sc >= minScore
+            col = f_zoneColor(dir, sc)
+            bx  = box.new(bStart, bTop, bar_index, bBot, border_color=nested ? mtfCol : color.new(col,0), border_width=nested ? 2 : 1, bgcolor=col, extend=extend.right)
+            label lb = na
+            if showLbl
+                lbTxt = (dir == 1 ? "DZ " : "SZ ") + str.tostring(math.round(sc)) + (nested ? " ★" : "")
+                lb := label.new(bar_index, dir == 1 ? bBot : bTop, lbTxt, style=dir == 1 ? label.style_label_up : label.style_label_down, color=color.new(col,0), textcolor=color.white, size=size.small)
+            z = Zone.new(bTop, bBot, bStart, dir, sc, sc, 0, false, nested, false, bx, lb)
+            if dir == 1
+                array.unshift(demandZones, z)        // newest at front
+            else
+                array.unshift(supplyZones, z)
+
+// ===========================================================================
+// ZONE MAINTENANCE : touch decay, break detection, redraw, pruning
+// ===========================================================================
+f_maintain(array<Zone> arr) =>
+    pad = touchPad * atr
+    i = 0
+    while i < array.size(arr)
+        z = array.get(arr, i)
+        if not z.broken
+            inZone = high >= (z.bot - pad) and low <= (z.top + pad)
+            // --- break: a confirmed close beyond the zone on real volume ---
+            brokeDem = z.dir == 1  and close < z.bot and relVol >= breakVolMult
+            brokeSup = z.dir == -1 and close > z.top and relVol >= breakVolMult
+            if barstate.isconfirmed and (brokeDem or brokeSup)
+                z.broken := true
+                z.score  := 0
+                if not keepBroken
+                    box.delete(z.bx)
+                    if not na(z.lb)
+                        label.delete(z.lb)
+                else
+                    box.set_extend(z.bx, extend.none)
+                    box.set_right(z.bx, bar_index)
+                    box.set_bgcolor(z.bx, color.new(color.gray, 90))
+                    box.set_border_color(z.bx, color.new(color.gray, 60))
+                    if not na(z.lb)
+                        label.delete(z.lb)
+            // --- touch decay (one tap per fresh re-entry) ------------------
+            else if barstate.isconfirmed and inZone and not z.inside
+                z.touches := z.touches + 1
+                z.score   := math.max(z.score - decayPerTap, 0)
+                // fade fill via gradient + extra transparency per tap
+                newCol = f_zoneColor(z.dir, z.score)
+                box.set_bgcolor(z.bx, color.new(newCol, math.min(80 + z.touches * 5, 95)))
+                box.set_border_color(z.bx, f_borderColor(z))
+                if not na(z.lb)
+                    label.set_text(z.lb, (z.dir == 1 ? "DZ " : "SZ ") + str.tostring(math.round(z.score)) + (z.mtf ? " ★" : "") + " ·" + str.tostring(z.touches))
+                    label.set_color(z.lb, color.new(newCol, 0))
+            // keep the live box anchored to the right edge & label current
+            if not z.broken and not na(z.lb)
+                label.set_x(z.lb, bar_index)
+            // refresh the per-zone touch latch on confirmed bars (no repaint)
+            if barstate.isconfirmed and not z.broken
+                z.inside := inZone
+            array.set(arr, i, z)
+        i += 1
+    // --- pruning: drop broken (when not kept) then enforce the side cap ----
+    if not keepBroken
+        j = array.size(arr) - 1
+        while j >= 0
+            if array.get(arr, j).broken
+                array.remove(arr, j)
+            j -= 1
+    while array.size(arr) > maxZones
+        old = array.pop(arr)                         // remove oldest
+        box.delete(old.bx)
+        if not na(old.lb)
+            label.delete(old.lb)
+
+f_maintain(demandZones)
+f_maintain(supplyZones)
+
+// Collect live (non-broken) zones into flat arrays for the dashboard.
+// Declared at global scope (Pine forbids function definitions inside blocks).
+f_collect(array<Zone> arr, array<float> scores, array<int> refDir, array<float> refTop, array<float> refBot, array<int> refTch, array<bool> refMtf) =>
+    for i = 0 to (array.size(arr) > 0 ? array.size(arr) - 1 : 0)
+        if array.size(arr) == 0
+            break
+        z = array.get(arr, i)
+        if not z.broken
+            array.push(scores, z.score)
+            array.push(refDir, z.dir)
+            array.push(refTop, z.top)
+            array.push(refBot, z.bot)
+            array.push(refTch, z.touches)
+            array.push(refMtf, z.mtf)
+
+// ===========================================================================
+// VOLUME DELTA OVERLAY  (status-line / data-window confirmation read-out)
+// ===========================================================================
+// Normalized so it shares the price pane unobtrusively via plot in a separate
+// scale; we expose CVD & its EMA plus divergence markers.
+plot(showDelta ? cumDelta : na, "Cumulative Delta", color=cumDelta >= cumDeltaEma ? color.new(color.teal,0) : color.new(color.red,0), display=display.data_window + display.status_line)
+plot(showDelta ? cumDeltaEma : na, "CVD EMA", color=color.new(color.gray,0), display=display.data_window + display.status_line)
+plotshape(showDelta and bullDiv and not bullDiv[1] ? low : na, "Bullish CVD Divergence", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime,0), size=size.tiny)
+plotshape(showDelta and bearDiv and not bearDiv[1] ? high : na, "Bearish CVD Divergence", style=shape.triangledown, location=location.abovebar, color=color.new(color.orange,0), size=size.tiny)
+
+// ===========================================================================
+// ALERTS : price enters a high-score fresh zone with confirming delta
+// ===========================================================================
+f_entrySignal(array<Zone> arr) =>
+    bool fired = false
+    bestScore = 0.0
+    for i = 0 to (array.size(arr) > 0 ? array.size(arr) - 1 : 0)
+        if array.size(arr) == 0
+            break
+        z = array.get(arr, i)
+        if not z.broken
+            entered  = high >= z.bot and low <= z.top and not (high[1] >= z.bot and low[1] <= z.top)
+            okScore  = z.score >= alertScore
+            okFresh  = not alertFresh or z.touches == 0
+            okDelta  = not alertDelta or (z.dir == 1 ? (bullDiv or cumDelta > cumDeltaEma) : (bearDiv or cumDelta < cumDeltaEma))
+            if entered and okScore and okFresh and okDelta
+                fired := true
+                bestScore := math.max(bestScore, z.score)
+    [fired, bestScore]
+
+[demEntry, demBest] = f_entrySignal(demandZones)
+[supEntry, supBest] = f_entrySignal(supplyZones)
+
+alertcondition(demEntry, "Demand Zone Entry", "Price entered a high-score fresh DEMAND zone with confirming delta.")
+alertcondition(supEntry, "Supply Zone Entry", "Price entered a high-score fresh SUPPLY zone with confirming delta.")
+
+if demEntry
+    alert("VolSDE ▸ DEMAND entry · score " + str.tostring(math.round(demBest)) + " @ " + str.tostring(close), alert.freq_once_per_bar)
+if supEntry
+    alert("VolSDE ▸ SUPPLY entry · score " + str.tostring(math.round(supBest)) + " @ " + str.tostring(close), alert.freq_once_per_bar)
+
+// ===========================================================================
+// DASHBOARD TABLE
+// ===========================================================================
+var table dash = na
+if showDash
+    pos = dashPos == "Top Right" ? position.top_right : dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : position.bottom_left
+    if na(dash)
+        dash := table.new(pos, 5, dashRows + 2, border_width=1, frame_color=color.new(color.gray,50), frame_width=1)
+
+// Build a merged, score-sorted view of live zones for the dashboard.
+if showDash and barstate.islast
+    table.clear(dash, 0, 0, 4, dashRows + 1)
+    // header
+    table.cell(dash, 0, 0, "VolSDE", text_color=color.white, bgcolor=color.new(color.black,0), text_size=size.small)
+    table.cell(dash, 1, 0, "Type", text_color=color.white, bgcolor=color.new(color.black,0), text_size=size.small)
+    table.cell(dash, 2, 0, "Score", text_color=color.white, bgcolor=color.new(color.black,0), text_size=size.small)
+    table.cell(dash, 3, 0, "Dist%", text_color=color.white, bgcolor=color.new(color.black,0), text_size=size.small)
+    table.cell(dash, 4, 0, "MTF", text_color=color.white, bgcolor=color.new(color.black,0), text_size=size.small)
+    // gather live zones into temp arrays of score + reference
+    scores = array.new<float>()
+    refDir = array.new<int>()
+    refTop = array.new<float>()
+    refBot = array.new<float>()
+    refTch = array.new<int>()
+    refMtf = array.new<bool>()
+    f_collect(demandZones, scores, refDir, refTop, refBot, refTch, refMtf)
+    f_collect(supplyZones, scores, refDir, refTop, refBot, refTch, refMtf)
+    // simple selection of top-N by score
+    shown = 0
+    used  = array.new<bool>(array.size(scores), false)
+    while shown < dashRows and shown < array.size(scores)
+        // find max remaining
+        bestIdx = -1
+        bestVal = -1.0
+        for i = 0 to (array.size(scores) > 0 ? array.size(scores) - 1 : 0)
+            if array.size(scores) == 0
+                break
+            if not array.get(used, i) and array.get(scores, i) > bestVal
+                bestVal := array.get(scores, i)
+                bestIdx := i
+        if bestIdx < 0
+            break
+        array.set(used, bestIdx, true)
+        d   = array.get(refDir, bestIdx)
+        top = array.get(refTop, bestIdx)
+        bot = array.get(refBot, bestIdx)
+        mid = (top + bot) / 2.0
+        dist= close != 0 ? (mid - close) / close * 100.0 : 0.0
+        r   = shown + 1
+        zc  = f_zoneColor(d, bestVal)
+        table.cell(dash, 0, r, str.tostring(r), text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, r, d == 1 ? "Demand" : "Supply", text_color=color.white, bgcolor=color.new(zc, 30), text_size=size.tiny)
+        table.cell(dash, 2, r, str.tostring(math.round(bestVal)), text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 3, r, str.tostring(dist, "#.##") + "%", text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 4, r, array.get(refMtf, bestIdx) ? "★" : "·", text_color=array.get(refMtf, bestIdx) ? color.yellow : color.gray, text_size=size.tiny)
+        shown += 1
+    // footer summary
+    table.cell(dash, 0, dashRows + 1, "Live", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, dashRows + 1, "D:" + str.tostring(array.size(demandZones)), text_color=color.teal, text_size=size.tiny)
+    table.cell(dash, 2, dashRows + 1, "S:" + str.tostring(array.size(supplyZones)), text_color=color.red, text_size=size.tiny)
+    table.cell(dash, 3, dashRows + 1, "CVD", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 4, dashRows + 1, cumDelta >= cumDeltaEma ? "▲" : "▼", text_color=cumDelta >= cumDeltaEma ? color.teal : color.red, text_size=size.tiny)
