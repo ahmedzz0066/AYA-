@@ -2,9 +2,24 @@
 
 Math-first **Supply & Demand zone** indicators for TradingView (**Pine Script v6**),
 grounded in auction-market theory and volume profiling rather than subjective swing
-drawing. Three generations are included.
+drawing. Four generations are included.
 
-## 🧠 Latest: VolSD v8 — Self-Learning
+## 🚀 Latest: VolSD v9 — Apex
+
+v8 torn down from first principles and rebuilt: **shadow learning** (the model trains
+on ALL candidate zones — the display filter no longer biases what it learns),
+**soft labels** from Maximum Favorable Excursion (partial bounces carry partial
+credit), **dual regime experts** (separate TREND/RANGE weight vectors gated by ADX),
+**deterministic experience replay + L2**, **EV in R-multiples** on every zone,
+**graded entry signals** (exhaustion + wick + rejection + volume, ≥3 of 4), overlap
+dedup, and an **auto-derived trade threshold** ("trade P ≥ 60%, break-even 41%")
+computed from realized calibration and zone geometry.
+
+- **[`VolSD_v9_Apex.pine`](./VolSD_v9_Apex.pine)** — the indicator.
+- **[`DOCUMENTATION_v9.md`](./DOCUMENTATION_v9.md)** — the v8 defect→fix review table,
+  exact learning math, usage, and limitations.
+
+## VolSD v8 — Self-Learning
 
 The v6 engine upgraded into a **self-calibrating probability system**: an online
 logistic-regression model learns per symbol/timeframe which confluence factors
@@ -32,7 +47,8 @@ channels** (0–10). Non-repainting.
 
 ## Contents
 
-- **[`VolSD_v8_SelfLearning.pine`](./VolSD_v8_SelfLearning.pine)** + **[`DOCUMENTATION_v8.md`](./DOCUMENTATION_v8.md)** — v8 Self-Learning (recommended).
+- **[`VolSD_v9_Apex.pine`](./VolSD_v9_Apex.pine)** + **[`DOCUMENTATION_v9.md`](./DOCUMENTATION_v9.md)** — v9 Apex (recommended).
+- **[`VolSD_v8_SelfLearning.pine`](./VolSD_v8_SelfLearning.pine)** + **[`DOCUMENTATION_v8.md`](./DOCUMENTATION_v8.md)** — v8 Self-Learning.
 - **[`VolSD_Quantum_v7.pine`](./VolSD_Quantum_v7.pine)** + **[`DOCUMENTATION_v7.md`](./DOCUMENTATION_v7.md)** — v7 Elite (SMC + auction confluence).
 - **[`VolumetricSupplyDemandZones_v6.pine`](./VolumetricSupplyDemandZones_v6.pine)** +
   **[`DOCUMENTATION.md`](./DOCUMENTATION.md)** — v6 (base→impulse + volume profile),
