@@ -2,9 +2,23 @@
 
 Math-first **Supply & Demand zone** indicators for TradingView (**Pine Script v6**),
 grounded in auction-market theory and volume profiling rather than subjective swing
-drawing. Two generations are included.
+drawing. Three generations are included.
 
-## ⭐ Latest: VolSD Quantum v7 (Elite)
+## 🧠 Latest: VolSD v8 — Self-Learning
+
+The v6 engine upgraded into a **self-calibrating probability system**: an online
+logistic-regression model learns per symbol/timeframe which confluence factors
+actually predict bounces (walk-forward, non-repainting), every zone shows
+**P(bounce) + the historical bounce rate of similar zones** ("P:72% | hist 68%
+(n=23)"), retests are graded by an **absorption model** (defended vs consumed)
+instead of blind decay, plus **true intrabar delta** (lower-TF), **time-of-day
+relative volume**, and a **news-shock filter**.
+
+- **[`VolSD_v8_SelfLearning.pine`](./VolSD_v8_SelfLearning.pine)** — the indicator.
+- **[`DOCUMENTATION_v8.md`](./DOCUMENTATION_v8.md)** — the learning math, lifecycle,
+  usage, calibration-based validation, and honest limitations.
+
+## VolSD Quantum v7 (Elite)
 
 Next-generation engine that fuses Auction Market Theory with **Smart Money Concepts** —
 market structure (**BOS/CHoCH**), **Order Blocks**, **Fair Value Gaps**, **liquidity
@@ -18,7 +32,8 @@ channels** (0–10). Non-repainting.
 
 ## Contents
 
-- **[`VolSD_Quantum_v7.pine`](./VolSD_Quantum_v7.pine)** + **[`DOCUMENTATION_v7.md`](./DOCUMENTATION_v7.md)** — v7 Elite (recommended).
+- **[`VolSD_v8_SelfLearning.pine`](./VolSD_v8_SelfLearning.pine)** + **[`DOCUMENTATION_v8.md`](./DOCUMENTATION_v8.md)** — v8 Self-Learning (recommended).
+- **[`VolSD_Quantum_v7.pine`](./VolSD_Quantum_v7.pine)** + **[`DOCUMENTATION_v7.md`](./DOCUMENTATION_v7.md)** — v7 Elite (SMC + auction confluence).
 - **[`VolumetricSupplyDemandZones_v6.pine`](./VolumetricSupplyDemandZones_v6.pine)** +
   **[`DOCUMENTATION.md`](./DOCUMENTATION.md)** — v6 (base→impulse + volume profile),
   retained for reference and comparison.
