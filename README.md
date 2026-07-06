@@ -16,6 +16,7 @@ strictly validated against institutional order-flow logic before they are ever d
 
 | Module | What it does |
 |---|---|
+| 💣 Bomb Zone Engine | Finds the terminal extreme of a stop-run: price raids the liquidity of the entire lookback range (often PDL/PDH too), then explodes away with displacement ≥ 3 × ATR inside a few bars. The thin burgundy/gold band at that extreme is the **Bomb Zone** — its retest is the strongest entry available, with the stop just beyond the extreme for very high R/R. Every zone is graded by a 0–100 **Bomb Score** (sweep depth, displacement power, rejection wick, PDL/PDH raid, FVG in the leg, volume spike, HTF confluence); only zones above your minimum score print, and ≥ 80 is tagged **A+**. Bomb trades take absolute priority in the trade engine and use their own high-R targets (default 5R / 10R). 💥 markers flag live explosion candles. |
 | Smart Structure | BOS / CHoCH mapping with an ATR volatility filter (swings must displace ≥ 0.3 × ATR) so retail micro-structure is ignored. Optional internal (dotted) structure layer. |
 | Order Blocks | "Scorecard" validation: displacement body ratio ≥ 60%, relative-volume check, and a Trinity test (liquidity sweep + FVG displacement + structure break) that promotes a zone to **Tier 1 / A+**. First touch marks a zone mitigated and hides it instantly — no ghost zones. |
 | Fair Value Gaps | Volatility-normalized: gap ≥ 0.4 × ATR and middle-candle body ≥ 72%. A close past the 50% level (CE) invalidates the gap. Optional 50%-Zone render mode halves the visual footprint. Overlapping OB + FVG areas are merged into a single confluence zone. |
@@ -30,6 +31,9 @@ strictly validated against institutional order-flow logic before they are ever d
 
 ## How to use
 
+0. **Hunt the 💣 Bomb** — when a burgundy/gold `💣 BOMB` band prints, set the alert and wait
+   for the retest. Entry at the band, stop just beyond the extreme, targets 5R–10R+. The panel's
+   `💣 Bomb Zone` row always shows the nearest live bomb and its score.
 1. **Read the bias** from the BOS/CHoCH structure lines and the Trend Cloud.
 2. **Wait for Tier 1 zones** — solid/neon A+ Order Blocks or ◆/★ FVGs are the high-probability POIs.
 3. **Prefer swept liquidity** — an `✕ SSL` / `✕ BSL` marker near your POI is added confluence.
@@ -38,8 +42,9 @@ strictly validated against institutional order-flow logic before they are ever d
 
 ## Alerts
 
-BOS, CHoCH, CISD trigger, liquidity sweep, IFVG formed, zone touched, trade confirmed,
-take-profit hit, and stop-loss hit are all available via `alertcondition`.
+💣 Bomb Zone formed, 💣 Bomb Zone touched, 💥 explosion candle, BOS, CHoCH, CISD trigger,
+liquidity sweep, IFVG formed, zone touched, trade confirmed, take-profit hit, and stop-loss
+hit are all available via `alertcondition`.
 
 ## Notes
 
