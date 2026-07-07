@@ -1,0 +1,496 @@
+//@version=6
+// =====================================================================================
+//  VOLUMETRIC SUPPLY & DEMAND ZONES — v8  "SELF-LEARNING"
+//  Built on the v6 base->impulse architecture, upgraded with three Tier-1 systems:
+//
+//   1) ONLINE-LEARNING WEIGHTS (logistic regression, SGD): every zone stores its
+//      normalized feature vector at creation. When the zone RESOLVES (tested & bounced
+//      = 1, broken = 0) the model does one gradient step. The indicator learns which
+//      confluence factors actually predict bounces on THIS symbol/timeframe, walking
+//      forward over history — no look-ahead, no repainting (a zone's displayed
+//      probability is fixed at creation using the weights known at that time).
+//
+//   2) EMPIRICAL PROBABILITY MEMORY: resolved outcomes are bucketed by predicted
+//      probability. Each zone shows both the model's P(bounce) and the historical
+//      bounce rate of similar-probability zones ("P:72% · hist 68% (n=23)").
+//      Evidence, not opinion.
+//
+//   3) ABSORPTION-AWARE TOUCH DECAY: instead of a blind fixed decay per touch, each
+//      retest is graded — shallow penetration + strong rejection close + high volume
+//      = DEFENDED (little/no decay); deep penetration = CONSUMED (heavy decay).
+//
+//  Data-quality upgrades: TRUE DELTA from lower-timeframe intrabars (fallback: CLV),
+//  time-of-day RELATIVE VOLUME (session-aware), and a volatility SHOCK FILTER that
+//  suspends zone creation around news candles.
+//
+//  NON-REPAINTING: zones form on confirmed bars from closed candles; HTF uses
+//  lookahead_off; the model only trains on already-resolved past zones.
+// =====================================================================================
+indicator("Volumetric S/D Zones v8 — Self-Learning", "VolSD v8", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500,
+     max_bars_back = 5000, dynamic_requests = true)
+
+// -------------------------------------------------------------------------------------
+// INPUTS
+// -------------------------------------------------------------------------------------
+gD  = "1 · Base → Impulse Detection"
+lenBase    = input.int(3,    "Base length (consolidation bars)", minval = 1, maxval = 20, group = gD)
+baseMaxATR = input.float(2.0, "Max base range (×ATR)", minval = 0.2, step = 0.1, group = gD)
+impATRmult = input.float(1.6, "Impulse range (×ATR)", minval = 0.5, step = 0.1, group = gD)
+volZmin    = input.float(0.8, "Impulse volume z-score (adaptive)", minval = -2, step = 0.1, group = gD,
+     tooltip = "Volume must be this many standard deviations above its 50-bar mean. Adaptive: self-calibrates to each instrument.")
+bodyRatio  = input.float(0.55, "Impulse body/range ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = gD)
+
+gL  = "2 · Self-Learning Model"
+lrRate     = input.float(0.05, "Learning rate (SGD step)", minval = 0.001, maxval = 0.5, step = 0.005, group = gL,
+     tooltip = "Size of the gradient step per resolved zone. Higher = adapts faster but noisier.")
+reactMult  = input.float(1.5, "Bounce target (×ATR from zone edge)", minval = 0.3, step = 0.1, group = gL,
+     tooltip = "A TESTED zone that then moves this many ATR away from its proximal edge is labeled a BOUNCE (y=1). A broken zone is labeled y=0.")
+minProb    = input.float(0.50, "Min P(bounce) to display", minval = 0.0, maxval = 0.95, step = 0.05, group = gL,
+     tooltip = "Zones whose predicted probability is below this are not drawn. During warm-up (few resolved zones) the prior weights act like the v6 static score.")
+alertProb  = input.float(0.65, "Min P(bounce) for retest alerts", minval = 0.0, maxval = 0.95, step = 0.05, group = gL)
+
+gA2 = "3 · Absorption-Aware Touch Decay"
+touchDecay = input.float(0.80, "Base per-touch decay", minval = 0.1, maxval = 1.0, step = 0.05, group = gA2,
+     tooltip = "Applied to a NEUTRAL touch. Defended touches (shallow + rejected + volume) decay far less; deep consuming touches decay twice as hard.")
+penDeep    = input.float(0.80, "Deep-penetration threshold (0-1 of zone height)", minval = 0.3, maxval = 1.0, step = 0.05, group = gA2)
+freshHL    = input.int(200,  "Freshness half-life (bars)", minval = 5, group = gA2)
+
+gDl = "4 · True Delta (lower-timeframe)"
+useLTF     = input.bool(true, "Use true intrabar delta (fallback: close-location)", group = gDl)
+ltfRes     = input.timeframe("1", "Lower timeframe for delta", group = gDl,
+     tooltip = "Must be lower than the chart timeframe; otherwise the close-location proxy is used automatically.")
+
+gSv = "5 · Session-Relative Volume & Shock Filter"
+sessN      = input.int(20, "Time-of-day volume smoothing (obs.)", minval = 2, group = gSv,
+     tooltip = "Volume is compared to the running average for the SAME hour of day, so an Asia-session spike and a NY-open spike are judged fairly.")
+shockOn    = input.bool(true, "Suspend zone creation after volatility shocks (news)", group = gSv)
+shockZ     = input.float(4.0, "Shock threshold (true-range z-score)", minval = 2, step = 0.5, group = gSv)
+shockBars  = input.int(3, "Suspension length (bars)", minval = 1, maxval = 20, group = gSv)
+
+gV  = "6 · Volume Profile"
+vpEnable   = input.bool(true, "Enable rolling profile (POC/VAH/VAL + HVN feature)", group = gV)
+vpLookback = input.int(200,  "Profile lookback (bars)", minval = 20, maxval = 1000, group = gV)
+vpBins     = input.int(24,   "Profile resolution (bins)", minval = 8, maxval = 100, group = gV)
+vaPct      = input.float(70, "Value Area %", minval = 50, maxval = 95, step = 1, group = gV)
+vpHist     = input.bool(true, "Draw profile histogram", group = gV)
+
+gM  = "7 · Mitigation & Lifecycle"
+mitigType  = input.string("Close through", "Mitigation trigger", options = ["Close through", "Wick through"], group = gM)
+removeMit  = input.bool(true, "Remove mitigated zones", group = gM)
+maxZones   = input.int(12, "Max active zones per side", minval = 1, maxval = 60, group = gM)
+
+gH  = "8 · Higher Timeframe"
+htfEnable  = input.bool(true, "Enable HTF trend feature", group = gH)
+htfRes     = input.timeframe("240", "HTF resolution", group = gH)
+htfEmaLen  = input.int(50, "HTF trend EMA length", minval = 2, group = gH)
+
+gR  = "9 · Regime"
+regimeFilt = input.bool(false, "Only create zones in trending regime", group = gR)
+adxLen     = input.int(14, "ADX length", minval = 2, group = gR)
+adxTrend   = input.float(20, "ADX trend threshold", minval = 5, step = 1, group = gR)
+
+gZ  = "10 · Visuals"
+colDem     = input.color(color.new(#26a69a, 0), "Demand color", group = gZ)
+colSup     = input.color(color.new(#ef5350, 0), "Supply color", group = gZ)
+showPOC    = input.bool(true, "Show zone POC line", group = gZ)
+showLabel  = input.bool(true, "Show probability label", group = gZ)
+extendRt   = input.int(15, "Extend boxes (bars right)", minval = 0, group = gZ)
+maxTransp  = input.int(90, "Transparency (weak zones)", minval = 50, maxval = 99, group = gZ)
+minTransp  = input.int(58, "Transparency (strong zones)", minval = 0, maxval = 90, group = gZ)
+
+gAl = "11 · Alerts"
+alertRetest= input.bool(true, "Alert on high-P zone retest + rejection", group = gAl)
+alertSpike = input.float(1.5, "Retest volume spike (×avg)", minval = 1.0, step = 0.1, group = gAl)
+
+// -------------------------------------------------------------------------------------
+// CORE SERIES (all ta.* hoisted — must run every bar)
+// -------------------------------------------------------------------------------------
+atr     = ta.atr(14)
+avgVol  = ta.sma(volume, 50)
+volSd   = ta.stdev(volume, 50)
+gVolZ   = volSd > 0 ? (volume - avgVol) / volSd : 0.0
+gVolPct = ta.percentrank(volume, 100) / 100.0
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+trending = adx >= adxTrend
+regimeOK = not regimeFilt or trending
+
+// Shock filter (news candles): true-range z-score
+trMean = ta.sma(ta.tr, 100)
+trSd   = ta.stdev(ta.tr, 100)
+trZ    = trSd > 0 ? (ta.tr - trMean) / trSd : 0.0
+var int shockUntil = -1
+if shockOn and trZ >= shockZ
+    shockUntil := bar_index + shockBars
+blockNew = shockOn and bar_index <= shockUntil
+
+// HTF trend (non-repainting)
+htfClose = htfEnable ? request.security(syminfo.tickerid, htfRes, close[1], lookahead = barmerge.lookahead_off) : close
+htfEma   = htfEnable ? request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_off) : close
+htfUp    = htfClose > htfEma
+htfDn    = htfClose < htfEma
+
+// True intrabar delta ratio in [-1, 1]; falls back to close-location value (CLV)
+clvRatio = high == low ? 0.0 : (2.0 * close - high - low) / (high - low)
+bool ltfOK = useLTF and timeframe.in_seconds(ltfRes) < timeframe.in_seconds(timeframe.period)
+float gDeltaRatio = clvRatio
+if ltfOK
+    [sArr, vArr] = request.security_lower_tf(syminfo.tickerid, ltfRes,
+         [volume * (close >= open ? 1.0 : -1.0), volume])
+    if array.size(vArr) > 0
+        float vSum = array.sum(vArr)
+        if vSum > 0
+            gDeltaRatio := array.sum(sArr) / vSum
+
+// Session-relative volume: volume vs running mean for the SAME hour of day
+var array<float> hodVol = array.new_float(24, na)
+float gRelVol = 1.0
+if timeframe.isintraday
+    int hIdx = hour
+    float hAvg = array.get(hodVol, hIdx)
+    gRelVol := na(hAvg) or hAvg <= 0 ? 1.0 : volume / hAvg
+    array.set(hodVol, hIdx, na(hAvg) ? volume : hAvg + (volume - hAvg) / sessN)
+else
+    gRelVol := avgVol > 0 ? volume / avgVol : 1.0
+
+// -------------------------------------------------------------------------------------
+// LEARNING STATE  (globals mutated only via array.set — Pine-legal inside functions)
+// -------------------------------------------------------------------------------------
+int NF = 7   // features: 0 volPct, 1 impulse, 2 delta, 3 width, 4 htf, 5 hvn, 6 relVol
+var array<float> W  = array.new_float(NF, 1.0)          // prior: all factors matter equally
+var array<float> Bb = array.new_float(1, -2.5)          // bias -> prior p≈0.5 for average zones
+var array<float> bucketN = array.new_float(5, 0.0)      // resolved count per predicted-p quintile
+var array<float> bucketY = array.new_float(5, 0.0)      // bounces per quintile
+var array<float> mstats  = array.new_float(2, 0.0)      // [0]=resolved n, [1]=total bounces
+
+f_clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+
+f_sigmoid(float z) => 1.0 / (1.0 + math.exp(-f_clamp(z, -30, 30)))
+
+f_predict(array<float> x) =>
+    float z = array.get(Bb, 0)
+    for i = 0 to NF - 1
+        z := z + array.get(W, i) * array.get(x, i)
+    f_sigmoid(z)
+
+// One SGD step of logistic regression on a resolved zone (y = 1 bounce, 0 break)
+f_learn(array<float> x, float y) =>
+    float p   = f_predict(x)
+    float err = y - p
+    for i = 0 to NF - 1
+        array.set(W, i, f_clamp(array.get(W, i) + lrRate * err * array.get(x, i), -4.0, 4.0))
+    array.set(Bb, 0, f_clamp(array.get(Bb, 0) + lrRate * err, -6.0, 6.0))
+    int b = int(math.min(4, math.floor(p * 5)))
+    array.set(bucketN, b, array.get(bucketN, b) + 1.0)
+    array.set(bucketY, b, array.get(bucketY, b) + y)
+    array.set(mstats, 0, array.get(mstats, 0) + 1.0)
+    array.set(mstats, 1, array.get(mstats, 1) + y)
+
+// Historical bounce rate of the predicted-probability bucket this zone falls in
+f_bucketTxt(float p) =>
+    int b = int(math.min(4, math.floor(p * 5)))
+    float n = array.get(bucketN, b)
+    float y = array.get(bucketY, b)
+    n > 0 ? str.tostring(100.0 * y / n, "#") + "% (n=" + str.tostring(int(n)) + ")" : "n/a"
+
+// -------------------------------------------------------------------------------------
+// VOLUME PROFILE (state-free: manual min/max, safe to call conditionally)
+// -------------------------------------------------------------------------------------
+f_profile(int lb, int nb, float vapct) =>
+    float hi = high
+    float lo = low
+    for i = 0 to lb - 1
+        hi := math.max(hi, high[i])
+        lo := math.min(lo, low[i])
+    float stp = (hi - lo) / nb
+    array<float> bv = array.new_float(nb, 0.0)
+    if stp > 0
+        for i = 0 to lb - 1
+            int loB = math.max(0, math.min(nb - 1, int((low[i]  - lo) / stp)))
+            int hiB = math.max(0, math.min(nb - 1, int((high[i] - lo) / stp)))
+            float per = volume[i] / (hiB - loB + 1)
+            for b = loB to hiB
+                array.set(bv, b, array.get(bv, b) + per)
+    int pocIdx = 0
+    float pocV = -1.0
+    for i = 0 to nb - 1
+        if array.get(bv, i) > pocV
+            pocV := array.get(bv, i)
+            pocIdx := i
+    float tot = array.sum(bv)
+    float tgt = tot * vapct / 100.0
+    float acc = array.get(bv, pocIdx)
+    int up = pocIdx + 1
+    int dn = pocIdx - 1
+    int vahI = pocIdx
+    int valI = pocIdx
+    while acc < tgt and (up < nb or dn >= 0)
+        float vU = up < nb ? array.get(bv, up) : -1.0
+        float vD = dn >= 0 ? array.get(bv, dn) : -1.0
+        if vU >= vD
+            acc := acc + vU
+            vahI := up
+            up := up + 1
+        else
+            acc := acc + vD
+            valI := dn
+            dn := dn - 1
+    [lo + (pocIdx + 0.5) * stp, lo + (vahI + 1) * stp, lo + valI * stp, bv, lo, stp, pocV]
+
+// -------------------------------------------------------------------------------------
+// ZONE TYPE & STORAGE
+// -------------------------------------------------------------------------------------
+type Zone
+    float top
+    float bot
+    float poc
+    float prob          // P(bounce) fixed at creation — never repaints
+    bool  isDemand
+    array<float> feat   // feature vector for learning at resolution
+    int   createdBar
+    float atr0          // ATR at creation (bounce target reference)
+    float decayMult     // cumulative absorption multiplier (starts 1.0)
+    int   touches
+    bool  inside
+    bool  touched
+    bool  resolved      // labeled (learned from) — terminal for training
+    bool  mitigated
+    box   bx
+    line  pocLn
+    label lbl
+
+var array<Zone> demZones = array.new<Zone>()
+var array<Zone> supZones = array.new<Zone>()
+
+f_live(Zone z) =>
+    float age   = math.max(0, bar_index - z.createdBar)
+    float fresh = math.pow(0.5, age / freshHL)
+    z.prob * fresh * z.decayMult
+
+f_transp(float liveP) =>
+    float k = f_clamp(liveP, 0.0, 1.0)
+    int(maxTransp - (maxTransp - minTransp) * k)
+
+f_tagText(Zone z) =>
+    string t = (z.isDemand ? "DEMAND " : "SUPPLY ") + "P:" + str.tostring(z.prob * 100, "#") + "%"
+    t := t + " | hist " + f_bucketTxt(z.prob)
+    t := t + (z.touches > 0 ? " | " + str.tostring(z.touches) + "T" : "")
+    t := t + (z.resolved and not z.mitigated ? " | HELD" : "")
+    t
+
+// Base VWAP = volume-weighted fair value of the base (local POC proxy)
+f_baseVwap(int startOff, int n) =>
+    float pv = 0.0
+    float vv = 0.0
+    for i = startOff to startOff + n - 1
+        pv += hlc3[i] * volume[i]
+        vv += volume[i]
+    vv > 0 ? pv / vv : hlc3[startOff]
+
+// -------------------------------------------------------------------------------------
+// DETECTION (confirmed bars; impulse = last closed bar, offset 1)
+// -------------------------------------------------------------------------------------
+impOff  = 1
+baseOff = impOff + 1
+
+rng1   = high[impOff] - low[impOff]
+body1  = math.abs(close[impOff] - open[impOff])
+direc  = body1 / math.max(rng1, syminfo.mintick)
+
+isImp  = rng1 > impATRmult * atr and gVolZ[1] >= volZmin and direc >= bodyRatio
+impUp  = isImp and close[impOff] > open[impOff]
+impDn  = isImp and close[impOff] < open[impOff]
+
+baseHi = ta.highest(high, lenBase)[baseOff]
+baseLo = ta.lowest(low,  lenBase)[baseOff]
+baseTight = (baseHi - baseLo) < baseMaxATR * atr
+
+f_addZone(bool dem) =>
+    float top = baseHi
+    float bot = baseLo
+    // ---- feature vector (each normalized to 0..1) ----
+    float xVol   = gVolPct[1]
+    float xImp   = math.min(1.0, (rng1 / atr) / (impATRmult * 1.5))
+    float dRatio = gDeltaRatio[1]
+    float xDelta = dem ? (dRatio + 1.0) / 2.0 : (1.0 - dRatio) / 2.0
+    float xWidth = math.max(0.0, 1.0 - (top - bot) / (atr * 3.0))
+    float xHtf   = not htfEnable ? 0.5 : (dem ? (htfUp ? 1.0 : 0.0) : (htfDn ? 1.0 : 0.0))
+    float xHvn   = 0.5
+    if vpEnable
+        [_p, vHi, vLo, _b, _l, _s, _m] = f_profile(vpLookback, vpBins, vaPct)
+        xHvn := (top >= vLo and bot <= vHi) ? 1.0 : 0.0
+    float xRvol  = math.min(1.0, gRelVol[1] / 3.0)
+    array<float> x = array.from(xVol, xImp, xDelta, xWidth, xHtf, xHvn, xRvol)
+    float prob = f_predict(x)
+    if prob >= minProb
+        float poc = f_baseVwap(baseOff, lenBase)
+        color c   = dem ? colDem : colSup
+        box bx    = box.new(bar_index[baseOff + lenBase - 1], top, bar_index + extendRt, bot,
+             border_color = color.new(c, 30), bgcolor = color.new(c, f_transp(prob)), border_width = 1)
+        line ln   = showPOC ? line.new(bar_index[baseOff], poc, bar_index + extendRt, poc,
+             color = color.new(c, 10), style = line.style_dotted) : na
+        label lb  = showLabel ? label.new(bar_index + extendRt, dem ? bot : top,
+             (dem ? "DEMAND " : "SUPPLY ") + "P:" + str.tostring(prob * 100, "#") + "% | hist " + f_bucketTxt(prob),
+             style = dem ? label.style_label_up : label.style_label_down,
+             color = color.new(c, 20), textcolor = color.white, size = size.small) : na
+        Zone z = Zone.new(top, bot, poc, prob, dem, x, bar_index, atr, 1.0, 0, false, false, false, false, bx, ln, lb)
+        array<Zone> arr = dem ? demZones : supZones
+        array.push(arr, z)
+        if array.size(arr) > maxZones
+            Zone old = array.shift(arr)
+            box.delete(old.bx)
+            line.delete(old.pocLn)
+            label.delete(old.lbl)
+
+if barstate.isconfirmed and isImp and baseTight and regimeOK and not blockNew
+    if impUp
+        f_addZone(true)
+    if impDn
+        f_addZone(false)
+
+// -------------------------------------------------------------------------------------
+// LIFECYCLE: resolution (learning), absorption decay, mitigation, alerts
+// -------------------------------------------------------------------------------------
+f_update(array<Zone> arr) =>
+    bool fired = false
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Zone z = array.get(arr, i)
+            if not z.mitigated
+                float height = math.max(z.top - z.bot, syminfo.mintick)
+                bool touchingNow = low <= z.top and high >= z.bot
+                // ---- new touch: grade it (absorption model) ----
+                if touchingNow and not z.inside
+                    z.touches += 1
+                    z.touched := true
+                    float pen = z.isDemand ? f_clamp((z.top - low) / height, 0.0, 1.0)
+                                           : f_clamp((high - z.bot) / height, 0.0, 1.0)
+                    bool rejected = z.isDemand ? close > z.top - 0.25 * height
+                                               : close < z.bot + 0.25 * height
+                    bool volHigh  = gVolZ >= 1.0
+                    float m = rejected and volHigh and pen < 0.5 ? 1.0 :
+                         rejected ? math.pow(touchDecay, 0.5) :
+                         pen >= penDeep ? touchDecay * touchDecay : touchDecay
+                    z.decayMult := z.decayMult * m
+                    // retest alert on high-probability zones
+                    bool rejCandle = z.isDemand ? close > open : close < open
+                    bool spike     = volume > alertSpike * avgVol
+                    if alertRetest and z.prob >= alertProb and rejCandle and spike
+                        fired := true
+                z.inside := touchingNow
+                // ---- resolution: tested zone reaches its bounce target -> learn y=1 ----
+                if not z.resolved and z.touched
+                    bool bounce = z.isDemand ? high >= z.top + reactMult * z.atr0
+                                             : low  <= z.bot - reactMult * z.atr0
+                    if bounce
+                        f_learn(z.feat, 1.0)
+                        z.resolved := true
+                // ---- mitigation: broken zone -> learn y=0 (only if it was tested) ----
+                bool through = mitigType == "Close through"
+                     ? (z.isDemand ? close < z.bot : close > z.top)
+                     : (z.isDemand ? low   < z.bot : high  > z.top)
+                if through
+                    if not z.resolved and z.touched
+                        f_learn(z.feat, 0.0)
+                    z.resolved  := true
+                    z.mitigated := true
+                    if removeMit
+                        box.delete(z.bx)
+                        line.delete(z.pocLn)
+                        label.delete(z.lbl)
+                        array.remove(arr, i)
+                        continue
+                    else
+                        box.set_bgcolor(z.bx, color.new(color.gray, 92))
+                        box.set_border_color(z.bx, color.new(color.gray, 60))
+                else
+                    // ---- refresh visuals from live (decayed) probability ----
+                    float live = f_live(z)
+                    box.set_right(z.bx, bar_index + extendRt)
+                    box.set_bgcolor(z.bx, color.new(z.isDemand ? colDem : colSup, f_transp(live)))
+                    if not na(z.pocLn)
+                        line.set_x2(z.pocLn, bar_index + extendRt)
+                    if not na(z.lbl)
+                        label.set_x(z.lbl, bar_index + extendRt)
+                        label.set_text(z.lbl, f_tagText(z))
+    fired
+
+bool alertRetestFlag = false
+if barstate.isconfirmed
+    bool fD = f_update(demZones)
+    bool fS = f_update(supZones)
+    alertRetestFlag := fD or fS
+
+// -------------------------------------------------------------------------------------
+// ROLLING VOLUME PROFILE DRAWING (last bar)
+// -------------------------------------------------------------------------------------
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+var array<box> histBoxes = array.new<box>()
+
+if vpEnable and barstate.islast
+    [vpPoc, vpVah, vpVal, bv, vpLo, vpStp, vpMaxV] = f_profile(vpLookback, vpBins, vaPct)
+    int xr = bar_index + extendRt
+    int xl = bar_index - vpLookback
+    line.delete(pocLine)
+    line.delete(vahLine)
+    line.delete(valLine)
+    pocLine := line.new(xl, vpPoc, xr, vpPoc, color = color.new(color.orange, 0), width = 2)
+    vahLine := line.new(xl, vpVah, xr, vpVah, color = color.new(color.blue, 0), style = line.style_dashed)
+    valLine := line.new(xl, vpVal, xr, vpVal, color = color.new(color.blue, 0), style = line.style_dashed)
+    if vpHist
+        if array.size(histBoxes) > 0
+            for i = 0 to array.size(histBoxes) - 1
+                box.delete(array.get(histBoxes, i))
+            array.clear(histBoxes)
+        float maxLen = vpLookback * 0.4
+        for b = 0 to vpBins - 1
+            float v = array.get(bv, b)
+            if v > 0 and vpMaxV > 0
+                int len = int(maxLen * v / vpMaxV)
+                float yTop = vpLo + (b + 1) * vpStp
+                float yBot = vpLo + b * vpStp
+                bool inVA = yBot >= vpVal and yTop <= vpVah
+                box hb = box.new(bar_index - len, yTop, bar_index, yBot,
+                     border_color = na, bgcolor = color.new(inVA ? color.blue : color.gray, 78))
+                array.push(histBoxes, hb)
+
+// -------------------------------------------------------------------------------------
+// ALERTS
+// -------------------------------------------------------------------------------------
+alertcondition(alertRetestFlag, "High-P zone retest + rejection", "VolSD v8: high-probability zone retest with rejection & volume spike")
+if alertRetestFlag
+    alert("VolSD v8: high-probability S/D zone retest + rejection + volume spike on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+newDem = barstate.isconfirmed and isImp and impUp and baseTight and regimeOK and not blockNew
+newSup = barstate.isconfirmed and isImp and impDn and baseTight and regimeOK and not blockNew
+alertcondition(newDem, "New demand zone candidate", "VolSD v8: new demand zone candidate")
+alertcondition(newSup, "New supply zone candidate", "VolSD v8: new supply zone candidate")
+
+// -------------------------------------------------------------------------------------
+// MODEL DASHBOARD
+// -------------------------------------------------------------------------------------
+var table info = table.new(position.top_right, 1, 6, frame_color = color.gray, frame_width = 1)
+if barstate.islast
+    float nRes = array.get(mstats, 0)
+    float nBnc = array.get(mstats, 1)
+    string modelTxt = nRes > 0
+         ? "Learned: n=" + str.tostring(int(nRes)) + " | bounce " + str.tostring(100.0 * nBnc / nRes, "#") + "%"
+         : "Learning: warm-up (no resolved zones yet)"
+    string wTxt = "w  vol " + str.tostring(array.get(W, 0), "#.0")
+         + "  imp " + str.tostring(array.get(W, 1), "#.0")
+         + "  dlt " + str.tostring(array.get(W, 2), "#.0")
+         + "  wid " + str.tostring(array.get(W, 3), "#.0")
+    string wTxt2 = "     htf " + str.tostring(array.get(W, 4), "#.0")
+         + "  hvn " + str.tostring(array.get(W, 5), "#.0")
+         + "  rvol " + str.tostring(array.get(W, 6), "#.0")
+    table.cell(info, 0, 0, "VolSD v8 - Self-Learning", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+    table.cell(info, 0, 1, (trending ? "TRENDING" : "RANGING") + "  ADX " + str.tostring(adx, "#.0") + (blockNew ? "  | SHOCK PAUSE" : ""),
+         text_color = color.white, bgcolor = color.new(trending ? color.teal : color.maroon, 20), text_size = size.small)
+    table.cell(info, 0, 2, "Dem " + str.tostring(array.size(demZones)) + " | Sup " + str.tostring(array.size(supZones))
+         + "  |  delta: " + (ltfOK ? "true (LTF " + ltfRes + ")" : "CLV proxy"),
+         text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(info, 0, 3, modelTxt, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.small)
+    table.cell(info, 0, 4, wTxt,  text_color = color.silver, bgcolor = color.new(color.black, 20), text_size = size.tiny)
+    table.cell(info, 0, 5, wTxt2, text_color = color.silver, bgcolor = color.new(color.black, 20), text_size = size.tiny)
