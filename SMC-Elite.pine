@@ -1,0 +1,1244 @@
+//@version=6
+// ╔═══════════════════════════════════════════════════════════════════════════════╗
+// ║  SMC ELITE — Smart Money Concepts Suite (Pine Script v6)                       ║
+// ║                                                                                ║
+// ║  Modules:                                                                      ║
+// ║   • Smart Structure (BOS / CHoCH) with ATR volatility filter                   ║
+// ║   • Order Blocks — "Scorecard" validation (volume, displacement, sweep, FVG)   ║
+// ║   • Fair Value Gaps — adaptive ATR filter, 50% rule, CE mode                   ║
+// ║   • Inverted FVG (IFVG) — inversion zones with displacement / P&D filters      ║
+// ║   • CISD — Change In State of Delivery (Origin Break / Raid Candle modes)      ║
+// ║   • Liquidity — EQH/EQL pools, sweep detection with wick-to-body filter        ║
+// ║   • PDH / PDL, Premium–Discount dealing range                                  ║
+// ║   • HTF Multi-Timeframe zones (2 layers, Auto/Manual) + ★ confluence engine    ║
+// ║   • Trend Cloud — EMA 13/21/50 gradient ribbon with twist points              ║
+// ║   • Risk Engine — live lot-size calculation per asset class                    ║
+// ║   • Trade Guide Panel — zone watch → touch → confirmation → Entry/SL/TP        ║
+// ╚═══════════════════════════════════════════════════════════════════════════════╝
+indicator("SMC Elite — Smart Money Concepts", "SMC Elite", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ═════════════════════════════════ INPUTS ═══════════════════════════════════════
+
+// ── ① General & Theme ───────────────────────────────────────────────────────────
+string GRP_G = "① General & Theme"
+theme      = input.string("Classic", "Color Theme", options = ["Classic", "Royal", "Dark"], group = GRP_G)
+maxZones   = input.int(6, "Zone Display Limit", minval = 2, maxval = 20, group = GRP_G, tooltip = "Maximum zones kept per family (OB / FVG / IFVG). Oldest zones are pruned first so only the freshest areas stay on the chart.")
+showCloud  = input.bool(true, "Trend Cloud (EMA 13/21/50)", group = GRP_G)
+showPD     = input.bool(true, "Premium / Discount Overlay", group = GRP_G)
+showPdhPdl = input.bool(true, "Previous Day High / Low", group = GRP_G)
+
+// ── ② Market Structure ──────────────────────────────────────────────────────────
+string GRP_S = "② Market Structure"
+showStruct    = input.bool(true, "Show BOS / CHoCH", group = GRP_S)
+swingLen      = input.int(10, "Swing Length", minval = 3, maxval = 50, group = GRP_S, tooltip = "Pivot lookback for macro structure. 10 keeps only the swings relevant to institutional flow.")
+structAtrMult = input.float(0.3, "ATR Structure Filter", minval = 0.0, maxval = 2.0, step = 0.1, group = GRP_S, tooltip = "A swing is only accepted if price moved away from the opposite swing by at least this many ATRs. Filters retail micro-structure.")
+showInternal  = input.bool(false, "Show Internal Structure", group = GRP_S)
+internalLen   = input.int(5, "Internal Swing Length", minval = 2, maxval = 20, group = GRP_S)
+
+// ── ③ Order Blocks ──────────────────────────────────────────────────────────────
+string GRP_OB = "③ Order Blocks"
+showOB        = input.bool(true, "Show Order Blocks", group = GRP_OB)
+obDispBody    = input.float(0.60, "Displacement Body Ratio", minval = 0.3, maxval = 0.95, step = 0.05, group = GRP_OB, tooltip = "The structure-breaking candle must close with a body of at least this fraction of its range. Rejects small-body / huge-wick candles.")
+obUseVol      = input.bool(true, "Relative Volume Validation", group = GRP_OB)
+obRelVol      = input.float(1.2, "Min Relative Volume", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_OB, tooltip = "Volume of the displacement candle vs its 20-bar average.")
+obHideMit     = input.bool(true, "Hide Mitigated Zones Instantly", group = GRP_OB, tooltip = "Freshness simulation: the moment a zone is tapped it is marked mitigated and hidden — no ghost zones.")
+
+// ── ④ Fair Value Gaps ───────────────────────────────────────────────────────────
+string GRP_F = "④ Fair Value Gaps"
+showFVG    = input.bool(true, "Show FVG", group = GRP_F)
+fvgAtrMult = input.float(0.4, "Min Gap Size (× ATR)", minval = 0.0, maxval = 3.0, step = 0.1, group = GRP_F)
+fvgBodyMin = input.float(0.72, "Min Middle-Candle Body Ratio", minval = 0.3, maxval = 0.95, step = 0.01, group = GRP_F)
+fvgMode    = input.string("Full Gap", "FVG Render Mode", options = ["Full Gap", "50% Zone (CE)"], group = GRP_F, tooltip = "50% Zone renders only the proximal half of the gap (entry edge to Consequent Encroachment), reducing chart noise.")
+showIFVG   = input.bool(false, "Show Inverted FVG (IFVG)", group = GRP_F)
+ifvgPdFilt = input.bool(true, "IFVG Premium/Discount Filter", group = GRP_F, tooltip = "Bearish IFVGs only in Premium, bullish IFVGs only in Discount of the dealing range.")
+
+// ── ⑤ Liquidity ─────────────────────────────────────────────────────────────────
+string GRP_L = "⑤ Liquidity"
+showLiq      = input.bool(true, "Show Liquidity Pools (EQH / EQL)", group = GRP_L)
+liqLen       = input.int(5, "Liquidity Pivot Length", minval = 2, maxval = 20, group = GRP_L)
+liqTolAtr    = input.float(0.10, "Equal-Level Tolerance (× ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = GRP_L)
+sweepWickMin = input.float(1.0, "Sweep Wick-to-Body Ratio", minval = 0.0, maxval = 5.0, step = 0.1, group = GRP_L, tooltip = "The raid candle's rejection wick must be at least this many times its body for a valid stop-run.")
+liqOnlySwept = input.bool(true, "Show Levels Only After Sweep", group = GRP_L, tooltip = "Keeps the chart clean: pools appear only once they have actually been raided.")
+
+// ── ⑥ CISD ──────────────────────────────────────────────────────────────────────
+string GRP_C = "⑥ CISD — Change In State of Delivery"
+showCISD     = input.bool(true, "Show CISD", group = GRP_C)
+cisdMode     = input.string("Origin Break", "CISD Logic Mode", options = ["Origin Break", "Raid Candle"], group = GRP_C, tooltip = "Origin Break = body close beyond the open of the impulsive series origin. Raid Candle = body close beyond the raid candle's opposite extreme.")
+cisdTrendFlt = input.bool(false, "CISD Trend Filter", group = GRP_C, tooltip = "Only display CISD signals that align with the Trend Cloud direction.")
+showCisdZone = input.bool(true, "Show CISD Zone (ultra-light)", group = GRP_C)
+
+// ── ⑦ HTF Zones ─────────────────────────────────────────────────────────────────
+string GRP_H = "⑦ HTF Multi-Timeframe Zones"
+htfEnable  = input.bool(true, "Enable HTF Zones", group = GRP_H)
+htfMode    = input.string("Auto", "HTF Selection", options = ["Auto", "Manual"], group = GRP_H)
+htf1In     = input.timeframe("60", "HTF Layer 1 (Manual)", group = GRP_H)
+htf2In     = input.timeframe("240", "HTF Layer 2 (Manual)", group = GRP_H)
+htfShowFVG = input.bool(true, "HTF Fair Value Gaps", group = GRP_H)
+htfShowOB  = input.bool(true, "HTF Order Blocks", group = GRP_H)
+
+// ── ⑧ Risk Engine & Trade Guide ─────────────────────────────────────────────────
+string GRP_R = "⑧ Risk Engine & Trade Guide"
+acctSize   = input.float(10000.0, "Account Size ($)", minval = 1.0, group = GRP_R)
+riskPct    = input.float(1.0, "Risk Per Trade (%)", minval = 0.05, maxval = 25.0, step = 0.05, group = GRP_R)
+assetClass = input.string("Forex (100k contract)", "Asset Class", options = ["Forex (100k contract)", "Metals / XAU (100 oz)", "Indices (1 pt = $1)", "Crypto (1 unit)", "Stocks (1 share)"], group = GRP_R)
+rr1        = input.float(1.5, "TP1 (R multiple)", minval = 0.5, step = 0.25, group = GRP_R)
+rr2        = input.float(3.0, "TP2 (R multiple)", minval = 1.0, step = 0.25, group = GRP_R)
+slBufAtr   = input.float(0.25, "SL Buffer (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = GRP_R)
+confBars   = input.int(5, "Confirmation Window (bars)", minval = 1, maxval = 30, group = GRP_R, tooltip = "After a zone is tapped, a confirming body close from the final zone edge must print within this many bars.")
+aPlusOnly  = input.bool(false, "Trade A+ Setups Only", group = GRP_R)
+tradeTrend = input.bool(true, "Trade With Structure Bias Only", group = GRP_R)
+showTrade  = input.bool(true, "Show Entry / SL / TP Lines", group = GRP_R)
+showRRBox  = input.bool(true, "Show Risk/Reward Trade Box", group = GRP_R)
+
+// ── ⑩ 💣 Bomb Zone Engine ───────────────────────────────────────────────────────
+string GRP_B = "⑩ 💣 Bomb Zone Engine"
+bombEnable   = input.bool(true, "Enable Bomb Zones", group = GRP_B, tooltip = "A Bomb Zone is the terminal extreme of a stop-run: price sweeps the liquidity of the whole lookback range, then explodes away with massive displacement. The thin band at that extreme is where the reversal detonated — its retest is the strongest, tightest-stop entry the market offers.")
+bombWindow   = input.int(8, "Explosion Window (bars)", minval = 3, maxval = 30, group = GRP_B, tooltip = "The extreme must be within this many bars back, and the explosion away from it must complete inside this window.")
+bombLookback = input.int(30, "Sweep Lookback (bars)", minval = 10, maxval = 100, group = GRP_B, tooltip = "The extreme must take out the lowest low / highest high of this many prior bars — a genuine liquidity raid, not a pullback.")
+bombDispMult = input.float(3.0, "Min Explosion Move (× ATR)", minval = 1.0, maxval = 10.0, step = 0.25, group = GRP_B, tooltip = "Distance price must displace away from the extreme for the move to qualify as an explosion.")
+bombZoneAtr  = input.float(0.5, "Max Zone Height (× ATR)", minval = 0.1, maxval = 2.0, step = 0.05, group = GRP_B, tooltip = "Keeps the Bomb band thin, so the stop beyond it stays tiny and the R/R stays huge.")
+bombMinScore = input.int(60, "Min Bomb Score (0–100)", minval = 30, maxval = 95, step = 5, group = GRP_B)
+bombMax      = input.int(3, "Max Bomb Zones per Side", minval = 1, maxval = 6, group = GRP_B)
+bombRR1      = input.float(5.0, "Bomb TP1 (R multiple)", minval = 1.0, step = 0.5, group = GRP_B)
+bombRR2      = input.float(10.0, "Bomb TP2 (R multiple)", minval = 2.0, step = 0.5, group = GRP_B)
+showExplosion = input.bool(true, "Mark Explosion Candles 💥", group = GRP_B)
+bombExplMult = input.float(2.0, "Explosion Candle Range (× ATR)", minval = 1.0, maxval = 6.0, step = 0.25, group = GRP_B)
+
+// ── ⑨ Panel ─────────────────────────────────────────────────────────────────────
+string GRP_P = "⑨ Trade Guide Panel"
+showPanel = input.bool(true, "Show Panel", group = GRP_P)
+panelPos  = input.string("Top Right", "Panel Position", options = ["Top Right", "Middle Right", "Bottom Right", "Bottom Left", "Top Left"], group = GRP_P)
+panelSize = input.string("Small", "Panel Text Size", options = ["Tiny", "Small", "Normal"], group = GRP_P, tooltip = "Use Tiny on mobile to avoid overlap.")
+
+// ═══════════════════════════════ THEME ENGINE ═══════════════════════════════════
+// Intelligent styling: the palette adapts across every element when a theme is picked.
+[cBull, cBear, cObBull, cObBear, cFvgBull, cFvgBear, cLiq, cCisd] = switch theme
+    "Royal" => [color(#C9A227), color(#5C6BC0), color(#8C8C99), color(#3F51B5), color(#B29638), color(#7986CB), color(#D4AF37), color(#9FA8DA)]
+    "Dark"  => [color(#26A69A), color(#EF5350), color(#6B6F76), color(#C62828), color(#00897B), color(#E53935), color(#FFCA28), color(#90A4AE)]
+    =>         [color(#2962FF), color(#F23645), color(#787B86), color(#B22833), color(#089981), color(#F7525F), color(#FFB74D), color(#B2B5BE)]
+
+// Fixed accents (independent of theme)
+color cNeonBull = #00E676   // A+ electric green
+color cNeonBear = #FF1744   // A+ electric red
+color cIfvgBull = #FF9800   // bullish inversion — orange
+color cIfvgBear = #9C27B0   // bearish inversion — purple
+color cDiscount = #089981
+color cNeutral  = #787B86
+color cBombBg   = #5C1A2E   // 💣 bomb band — dark burgundy, like the reference charts
+color cBombGold = #FFD700   // 💣 bomb text/border — gold
+
+// ═════════════════════════════ CORE SERIES ══════════════════════════════════════
+atrVal  = ta.atr(14)
+volSma  = ta.sma(nz(volume), 20)
+ema13   = ta.ema(close, 13)
+ema21   = ta.ema(close, 21)
+ema50   = ta.ema(close, 50)
+cloudUp = ema13 >= ema50
+
+tfSec   = timeframe.in_seconds(timeframe.period)
+dailyOk = tfSec < 86400
+
+// Rolling range extremes for the 💣 Bomb sweep test (computed globally so the
+// series stays consistent; indexed with a dynamic offset inside the engine)
+lowestLB  = ta.lowest(low, bombLookback)
+highestLB = ta.highest(high, bombLookback)
+
+// Previous Day High / Low (confirmed, non-repainting)
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+// ═══════════════════════════════ TYPES ══════════════════════════════════════════
+type Zone
+    box    bx
+    line   ce
+    float  top     = na
+    float  bot     = na
+    float  mid     = na
+    bool   isBull  = true
+    bool   tier1   = false
+    bool   htfStar = false
+    bool   touched = false
+    int    born    = 0
+    int    kind    = 0        // 0 = OB · 1 = FVG · 2 = IFVG · 3 = HTF · 4 = 💣 BOMB
+    string txt     = ""
+    string tag     = ""
+    float  score   = 0.0
+
+type Liq
+    line   ln
+    label  lb
+    float  price   = na
+    int    fromBar = 0
+    bool   isHigh  = true
+    bool   swept   = false
+
+var array<Zone> obs      = array.new<Zone>()
+var array<Zone> fvgs     = array.new<Zone>()
+var array<Zone> ifvgs    = array.new<Zone>()
+var array<Zone> htfZones = array.new<Zone>()
+var array<Zone> bombs    = array.new<Zone>()
+var array<Liq>  liqs     = array.new<Liq>()
+
+// ═══════════════════════════════ HELPERS ════════════════════════════════════════
+f_bodyRatio(int o) =>
+    rng = high[o] - low[o]
+    rng > 0 ? math.abs(close[o] - open[o]) / rng : 0.0
+
+f_overlap(float t1, float b1, float t2, float b2) =>
+    t1 >= b2 and t2 >= b1
+
+f_delZone(Zone z) =>
+    box.delete(z.bx)
+    line.delete(z.ce)
+
+f_capZones(array<Zone> arr, int mx) =>
+    while arr.size() > mx
+        f_delZone(arr.shift())
+
+f_htfMatch(float top, float bot, bool isBull) =>
+    bool found = false
+    string tag = ""
+    if htfZones.size() > 0
+        for z in htfZones
+            if z.isBull == isBull and f_overlap(top, bot, z.top, z.bot)
+                found := true
+                tag := z.tag
+                break
+    [found, tag]
+
+f_capBombs(bool isBull) =>
+    int cnt = 0
+    if bombs.size() > 0
+        for z in bombs
+            if z.isBull == isBull
+                cnt += 1
+    if cnt > bombMax and bombs.size() > 0
+        for i = 0 to bombs.size() - 1
+            Zone z = bombs.get(i)
+            if z.isBull == isBull
+                f_delZone(z)
+                bombs.remove(i)
+                break
+
+// Risk Engine — contract value per 1.00 of price movement, per 1 lot/contract
+unitVal = switch assetClass
+    "Forex (100k contract)" => 100000.0
+    "Metals / XAU (100 oz)" => 100.0
+    "Indices (1 pt = $1)"   => 1.0
+    "Crypto (1 unit)"       => 1.0
+    "Stocks (1 share)"      => 1.0
+    => 1.0
+
+riskMoney = acctSize * riskPct / 100.0
+
+f_lots(float slDist) =>
+    slDist > 0 ? riskMoney / (slDist * unitVal) : na
+
+f_tfName(string tf) =>
+    switch tf
+        "1"    => "1m"
+        "3"    => "3m"
+        "5"    => "5m"
+        "15"   => "15m"
+        "30"   => "30m"
+        "45"   => "45m"
+        "60"   => "1H"
+        "120"  => "2H"
+        "240"  => "4H"
+        "480"  => "8H"
+        "720"  => "12H"
+        "D"    => "1D"
+        "1D"   => "1D"
+        "W"    => "1W"
+        "1W"   => "1W"
+        "M"    => "1M"
+        => tf
+
+// ═════════════════════ SMART STRUCTURE (BOS / CHoCH) ════════════════════════════
+// A swing is only accepted when price has displaced from the opposite swing by
+// at least `atrMult` ATRs — micro-structure that traps retail is filtered out.
+f_structure(int len, float atrMult, bool draw, bool internal) =>
+    var float sH      = na
+    var int   sHb     = na
+    var bool  sHdone  = true
+    var float sL      = na
+    var int   sLb     = na
+    var bool  sLdone  = true
+    var float prevSH  = na
+    var float prevSL  = na
+    var int   biasV   = 0
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        if na(sL) or math.abs(ph - sL) >= atrMult * atrVal
+            prevSH := sH
+            sH := ph
+            sHb := bar_index - len
+            sHdone := false
+    if not na(pl)
+        if na(sH) or math.abs(sH - pl) >= atrMult * atrVal
+            prevSL := sL
+            sL := pl
+            sLb := bar_index - len
+            sLdone := false
+    bool bosUp = false
+    bool bosDn = false
+    bool chUp  = false
+    bool chDn  = false
+    if not sHdone and not na(sH) and close > sH and barstate.isconfirmed
+        sHdone := true
+        if biasV == 1
+            bosUp := true
+        else
+            chUp := true
+        biasV := 1
+    if not sLdone and not na(sL) and close < sL and barstate.isconfirmed
+        sLdone := true
+        if biasV == -1
+            bosDn := true
+        else
+            chDn := true
+        biasV := -1
+    if draw and (bosUp or chUp)
+        line.new(sHb, sH, bar_index, sH, color = color.new(cBull, internal ? 45 : 0), style = internal ? line.style_dotted : line.style_solid, width = internal ? 1 : 2)
+        label.new(int(math.avg(sHb, bar_index)), sH, chUp ? "CHoCH" : "BOS", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(cBull, internal ? 40 : 0), size = internal ? size.tiny : size.small)
+    if draw and (bosDn or chDn)
+        line.new(sLb, sL, bar_index, sL, color = color.new(cBear, internal ? 45 : 0), style = internal ? line.style_dotted : line.style_solid, width = internal ? 1 : 2)
+        label.new(int(math.avg(sLb, bar_index)), sL, chDn ? "CHoCH" : "BOS", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(cBear, internal ? 40 : 0), size = internal ? size.tiny : size.small)
+    [biasV, bosUp, bosDn, chUp, chDn, sH, sL, sHb, sLb, prevSH, prevSL]
+
+[bias, bosUp, bosDn, chochUp, chochDn, swHigh, swLow, swHighBar, swLowBar, prevSwHigh, prevSwLow] = f_structure(swingLen, structAtrMult, showStruct, false)
+[iBias, iBosUp, iBosDn, iChUp, iChDn, iSH, iSL, iSHb, iSLb, iPSH, iPSL] = f_structure(internalLen, 0.0, showInternal, true)
+
+structUp = bosUp or chochUp
+structDn = bosDn or chochDn
+eqLevel  = not na(swHigh) and not na(swLow) ? math.avg(swHigh, swLow) : na
+
+// ═════════════════════════ ZONE MANAGEMENT (each bar) ═══════════════════════════
+// Freshness simulation: a virtual limit order rests at the zone edge. The first
+// touch marks the zone Mitigated — instantly hidden so no "ghost zones" remain.
+if obs.size() > 0
+    for i = obs.size() - 1 to 0
+        Zone z = obs.get(i)
+        bool kill = false
+        if z.isBull
+            if close < z.bot
+                kill := true
+            else if low <= z.top and bar_index > z.born
+                if obHideMit
+                    kill := true
+                else if not z.touched
+                    z.touched := true
+                    box.set_bgcolor(z.bx, color.new(cNeutral, 90))
+        else
+            if close > z.top
+                kill := true
+            else if high >= z.bot and bar_index > z.born
+                if obHideMit
+                    kill := true
+                else if not z.touched
+                    z.touched := true
+                    box.set_bgcolor(z.bx, color.new(cNeutral, 90))
+        if kill
+            f_delZone(z)
+            obs.remove(i)
+        else
+            box.set_right(z.bx, bar_index + 4)
+
+// FVG lifecycle: touch = retest (kept, dimmed) · close past CE = invalidated (50%
+// rule / Zone Preservation) · full body break = inversion candidate (IFVG).
+bool evtIfvgBull = false
+bool evtIfvgBear = false
+if fvgs.size() > 0
+    for i = fvgs.size() - 1 to 0
+        Zone z = fvgs.get(i)
+        bool kill = false
+        if z.isBull
+            if close < z.bot
+                if showIFVG and barstate.isconfirmed and f_bodyRatio(0) >= 0.5 and (not ifvgPdFilt or na(eqLevel) or z.mid >= eqLevel)
+                    evtIfvgBear := true
+                    bxN = box.new(bar_index, z.top, bar_index + 5, z.bot, border_color = color.new(cIfvgBear, 25), border_width = 2, bgcolor = color.new(cIfvgBear, 85), text = "IFVG ▼", text_size = size.tiny, text_color = color.new(cIfvgBear, 15), text_halign = text.align_right, text_valign = text.align_top)
+                    ifvgs.push(Zone.new(bx = bxN, top = z.top, bot = z.bot, mid = z.mid, isBull = false, born = bar_index, kind = 2, txt = "IFVG ▼"))
+                    f_capZones(ifvgs, maxZones)
+                kill := true
+            else if close < z.mid
+                kill := true
+            else if low <= z.top and bar_index > z.born and not z.touched
+                z.touched := true
+                box.set_bgcolor(z.bx, color.new(cFvgBull, 90))
+        else
+            if close > z.top
+                if showIFVG and barstate.isconfirmed and f_bodyRatio(0) >= 0.5 and (not ifvgPdFilt or na(eqLevel) or z.mid <= eqLevel)
+                    evtIfvgBull := true
+                    bxN = box.new(bar_index, z.top, bar_index + 5, z.bot, border_color = color.new(cIfvgBull, 25), border_width = 2, bgcolor = color.new(cIfvgBull, 85), text = "IFVG ▲", text_size = size.tiny, text_color = color.new(cIfvgBull, 15), text_halign = text.align_right, text_valign = text.align_bottom)
+                    ifvgs.push(Zone.new(bx = bxN, top = z.top, bot = z.bot, mid = z.mid, isBull = true, born = bar_index, kind = 2, txt = "IFVG ▲"))
+                    f_capZones(ifvgs, maxZones)
+                kill := true
+            else if close > z.mid
+                kill := true
+            else if high >= z.bot and bar_index > z.born and not z.touched
+                z.touched := true
+                box.set_bgcolor(z.bx, color.new(cFvgBear, 90))
+        if kill
+            f_delZone(z)
+            fvgs.remove(i)
+        else
+            box.set_right(z.bx, bar_index + 4)
+
+// IFVG lifecycle
+if ifvgs.size() > 0
+    for i = ifvgs.size() - 1 to 0
+        Zone z = ifvgs.get(i)
+        bool kill = false
+        if z.isBull
+            if close < z.bot
+                kill := true
+            else if low <= z.top and bar_index > z.born and not z.touched
+                z.touched := true
+                box.set_bgcolor(z.bx, color.new(cIfvgBull, 92))
+        else
+            if close > z.top
+                kill := true
+            else if high >= z.bot and bar_index > z.born and not z.touched
+                z.touched := true
+                box.set_bgcolor(z.bx, color.new(cIfvgBear, 92))
+        if kill
+            f_delZone(z)
+            ifvgs.remove(i)
+        else
+            box.set_right(z.bx, bar_index + 4)
+
+// 💣 Bomb lifecycle: the band stays fresh until tapped — the tap IS the trigger.
+// A body close through the extreme defuses the zone.
+bool evtBombTouch = false
+if bombs.size() > 0
+    for i = bombs.size() - 1 to 0
+        Zone z = bombs.get(i)
+        bool kill = false
+        if z.isBull
+            if close < z.bot
+                kill := true
+            else if low <= z.top and bar_index > z.born and not z.touched
+                z.touched := true
+                evtBombTouch := true
+                box.set_bgcolor(z.bx, color.new(cBombBg, 75))
+        else
+            if close > z.top
+                kill := true
+            else if high >= z.bot and bar_index > z.born and not z.touched
+                z.touched := true
+                evtBombTouch := true
+                box.set_bgcolor(z.bx, color.new(cBombBg, 75))
+        if kill or bar_index - z.born > 500
+            f_delZone(z)
+            bombs.remove(i)
+        else
+            box.set_right(z.bx, bar_index + 4)
+
+// HTF zone lifecycle
+if htfZones.size() > 0
+    for i = htfZones.size() - 1 to 0
+        Zone z = htfZones.get(i)
+        bool kill = false
+        if z.isBull
+            if close < z.bot
+                kill := true
+        else
+            if close > z.top
+                kill := true
+        if kill
+            f_delZone(z)
+            htfZones.remove(i)
+        else
+            box.set_right(z.bx, bar_index + 12)
+
+// ═══════════════════════ CISD — CHANGE IN STATE OF DELIVERY ═════════════════════
+// Tracks the impulsive series that raided liquidity. The trigger is a candle BODY
+// close through the level — the surest sign the stop-run is complete.
+var float dnOrigin    = na
+var int   dnStartBar  = na
+var float dnLow       = na
+var float dnRaidHigh  = na
+var bool  dnSwept     = false
+var float upOrigin    = na
+var int   upStartBar  = na
+var float upHigh      = na
+var float upRaidLow   = na
+var bool  upSwept     = false
+var int   lastCisdBullBar = -99999
+var int   lastCisdBearBar = -99999
+
+bool evtCisdBull = false
+bool evtCisdBear = false
+
+dnCandle = close < open
+upCandle = close > open
+
+if barstate.isconfirmed
+    // --- track bearish delivery series (candidate for bullish CISD) -------------
+    if dnCandle
+        if not dnCandle[1] or na(dnOrigin)
+            dnOrigin := open
+            dnStartBar := bar_index
+            dnLow := low
+            dnRaidHigh := high
+            dnSwept := false
+        else if low < dnLow
+            dnLow := low
+            dnRaidHigh := high
+        if (not na(swLow) and low < swLow) or (not na(prevSwLow) and low < prevSwLow) or (dailyOk and not na(pdl) and low < pdl)
+            dnSwept := true
+    // --- track bullish delivery series (candidate for bearish CISD) -------------
+    if upCandle
+        if not upCandle[1] or na(upOrigin)
+            upOrigin := open
+            upStartBar := bar_index
+            upHigh := high
+            upRaidLow := low
+            upSwept := false
+        else if high > upHigh
+            upHigh := high
+            upRaidLow := low
+        if (not na(swHigh) and high > swHigh) or (not na(prevSwHigh) and high > prevSwHigh) or (dailyOk and not na(pdh) and high > pdh)
+            upSwept := true
+    // --- bullish CISD trigger ----------------------------------------------------
+    float bullLvl = cisdMode == "Origin Break" ? dnOrigin : dnRaidHigh
+    if showCISD and not na(bullLvl) and dnSwept and upCandle and close > bullLvl and (not cisdTrendFlt or cloudUp)
+        evtCisdBull := true
+        lastCisdBullBar := bar_index
+        line.new(dnStartBar, bullLvl, bar_index, bullLvl, color = color.new(cCisd, 20), style = line.style_solid, width = 1)
+        label.new(bar_index, bullLvl, "CISD ▲", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cCisd, 10), size = size.tiny)
+        if showCisdZone
+            box.new(dnStartBar, bullLvl, bar_index + 6, bullLvl - 0.2 * atrVal, border_color = color.new(cCisd, 75), border_style = line.style_dotted, bgcolor = color.new(cCisd, 96))
+        dnOrigin := na
+        dnSwept := false
+    // --- bearish CISD trigger ----------------------------------------------------
+    float bearLvl = cisdMode == "Origin Break" ? upOrigin : upRaidLow
+    if showCISD and not na(bearLvl) and upSwept and dnCandle and close < bearLvl and (not cisdTrendFlt or not cloudUp)
+        evtCisdBear := true
+        lastCisdBearBar := bar_index
+        line.new(upStartBar, bearLvl, bar_index, bearLvl, color = color.new(cCisd, 20), style = line.style_solid, width = 1)
+        label.new(bar_index, bearLvl, "CISD ▼", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cCisd, 10), size = size.tiny)
+        if showCisdZone
+            box.new(upStartBar, bearLvl, bar_index + 6, bearLvl + 0.2 * atrVal, border_color = color.new(cCisd, 75), border_style = line.style_dotted, bgcolor = color.new(cCisd, 96))
+        upOrigin := na
+        upSwept := false
+
+// ═════════════════════ ORDER BLOCKS — "SCORECARD" VALIDATION ════════════════════
+// Created only on a structure-confirmed displacement. Graded validation:
+//   A. Volume & momentum   — relative volume + body-to-wick ratio of displacement
+//   B. Liquidity sweep     — wick below the prior swing before the move (Trinity 1)
+//   C. FVG displacement    — imbalance within 2 candles of the OB (Trinity 2)
+//   D. Structure break     — inherent: creation requires BOS/CHoCH (Trinity 3)
+// All three "Trinity" checks promote the zone to Tier 1 (A+, solid color).
+volOk = not obUseVol or na(volume) or volume > volSma * obRelVol
+
+if showOB and barstate.isconfirmed and structUp and f_bodyRatio(0) >= obDispBody and volOk
+    int off = na
+    for o = 1 to 20
+        if close[o] < open[o]
+            off := o
+            break
+    if not na(off)
+        float zTop = high[off]
+        float zBot = low[off]
+        if zTop > zBot and close > zTop
+            float mn = low[off]
+            for o2 = off to math.min(off + 4, 40)
+                mn := math.min(mn, low[o2])
+            bool sweep   = not na(prevSwLow) and mn < prevSwLow
+            bool fvgNear = off >= 2 and low[off - 2] > high[off]
+            bool tier1   = sweep and fvgNear
+            [star, tag]  = f_htfMatch(zTop, zBot, true)
+            float lots   = f_lots(zTop - zBot + slBufAtr * atrVal)
+            string t     = "OB" + (tier1 ? " A+" : "") + (star ? " ★ [" + f_tfName(tag) + "]" : "") + (na(lots) ? "" : "  ·  " + str.tostring(lots, "#.##") + " lot")
+            color zc     = tier1 ? cNeonBull : cObBull
+            bxN = box.new(bar_index - off, zTop, bar_index + 4, zBot, border_color = color.new(zc, star ? 20 : 55), border_width = star ? 2 : 1, bgcolor = color.new(cObBull, tier1 ? 60 : 75), text = t, text_size = size.tiny, text_color = color.new(zc, 20), text_halign = text.align_right, text_valign = text.align_center)
+            obs.push(Zone.new(bx = bxN, top = zTop, bot = zBot, mid = math.avg(zTop, zBot), isBull = true, tier1 = tier1, htfStar = star, born = bar_index, kind = 0, txt = t, tag = tag))
+            f_capZones(obs, maxZones)
+
+if showOB and barstate.isconfirmed and structDn and f_bodyRatio(0) >= obDispBody and volOk
+    int off = na
+    for o = 1 to 20
+        if close[o] > open[o]
+            off := o
+            break
+    if not na(off)
+        float zTop = high[off]
+        float zBot = low[off]
+        if zTop > zBot and close < zBot
+            float mx = high[off]
+            for o2 = off to math.min(off + 4, 40)
+                mx := math.max(mx, high[o2])
+            bool sweep   = not na(prevSwHigh) and mx > prevSwHigh
+            bool fvgNear = off >= 2 and high[off - 2] < low[off]
+            bool tier1   = sweep and fvgNear
+            [star, tag]  = f_htfMatch(zTop, zBot, false)
+            float lots   = f_lots(zTop - zBot + slBufAtr * atrVal)
+            string t     = "OB" + (tier1 ? " A+" : "") + (star ? " ★ [" + f_tfName(tag) + "]" : "") + (na(lots) ? "" : "  ·  " + str.tostring(lots, "#.##") + " lot")
+            color zc     = tier1 ? cNeonBear : cObBear
+            bxN = box.new(bar_index - off, zTop, bar_index + 4, zBot, border_color = color.new(zc, star ? 20 : 55), border_width = star ? 2 : 1, bgcolor = color.new(cObBear, tier1 ? 60 : 75), text = t, text_size = size.tiny, text_color = color.new(zc, 20), text_halign = text.align_right, text_valign = text.align_center)
+            obs.push(Zone.new(bx = bxN, top = zTop, bot = zBot, mid = math.avg(zTop, zBot), isBull = false, tier1 = tier1, htfStar = star, born = bar_index, kind = 0, txt = t, tag = tag))
+            f_capZones(obs, maxZones)
+
+// ═══════════════════ FAIR VALUE GAPS — ADAPTIVE FILTERING ═══════════════════════
+// Volatility-normalized: GapSize ≥ fvgAtrMult × ATR(14) and the displacement
+// (middle) candle must close with a dominant body. Overlapping OB + FVG areas
+// are merged into a single confluence zone instead of stacking boxes.
+if showFVG and barstate.isconfirmed and low > high[2]
+    float gapSz = low - high[2]
+    if gapSz >= fvgAtrMult * atrVal and f_bodyRatio(1) >= fvgBodyMin
+        float zTop = low
+        float zBot = high[2]
+        float zMid = math.avg(zTop, zBot)
+        bool merged = false
+        if obs.size() > 0
+            for z in obs
+                if z.isBull and f_overlap(zTop, zBot, z.top, z.bot)
+                    merged := true
+                    if not z.tier1
+                        z.tier1 := true
+                        z.txt += "  +FVG"
+                        box.set_text(z.bx, z.txt)
+                        box.set_border_color(z.bx, color.new(cNeonBull, 30))
+                    break
+        if not merged
+            bool diamond = bar_index - lastCisdBullBar <= 3
+            [star, tag]  = f_htfMatch(zTop, zBot, true)
+            bool aplus   = diamond or star
+            string t     = "FVG" + (diamond ? " ◆ A+" : star ? " A+" : "") + (star ? " ★ [" + f_tfName(tag) + "]" : "")
+            color zc     = aplus ? cNeonBull : cFvgBull
+            float bTop   = zTop
+            float bBot   = fvgMode == "50% Zone (CE)" ? zMid : zBot
+            bxN = box.new(bar_index - 1, bTop, bar_index + 5, bBot, border_color = color.new(zc, star ? 20 : 60), border_width = star ? 2 : 1, bgcolor = color.new(zc, aplus ? 70 : 82), text = t, text_size = size.tiny, text_color = color.new(zc, 15), text_halign = text.align_right, text_valign = text.align_center)
+            ceLn = line.new(bar_index - 1, zMid, bar_index + 5, zMid, color = color.new(zc, 65), style = line.style_dotted)
+            fvgs.push(Zone.new(bx = bxN, ce = ceLn, top = zTop, bot = zBot, mid = zMid, isBull = true, tier1 = aplus, htfStar = star, born = bar_index, kind = 1, txt = t, tag = tag))
+            f_capZones(fvgs, maxZones)
+
+if showFVG and barstate.isconfirmed and high < low[2]
+    float gapSz = low[2] - high
+    if gapSz >= fvgAtrMult * atrVal and f_bodyRatio(1) >= fvgBodyMin
+        float zTop = low[2]
+        float zBot = high
+        float zMid = math.avg(zTop, zBot)
+        bool merged = false
+        if obs.size() > 0
+            for z in obs
+                if not z.isBull and f_overlap(zTop, zBot, z.top, z.bot)
+                    merged := true
+                    if not z.tier1
+                        z.tier1 := true
+                        z.txt += "  +FVG"
+                        box.set_text(z.bx, z.txt)
+                        box.set_border_color(z.bx, color.new(cNeonBear, 30))
+                    break
+        if not merged
+            bool diamond = bar_index - lastCisdBearBar <= 3
+            [star, tag]  = f_htfMatch(zTop, zBot, false)
+            bool aplus   = diamond or star
+            string t     = "FVG" + (diamond ? " ◆ A+" : star ? " A+" : "") + (star ? " ★ [" + f_tfName(tag) + "]" : "")
+            color zc     = aplus ? cNeonBear : cFvgBear
+            float bTop   = fvgMode == "50% Zone (CE)" ? zMid : zTop
+            float bBot   = zBot
+            bxN = box.new(bar_index - 1, bTop, bar_index + 5, bBot, border_color = color.new(zc, star ? 20 : 60), border_width = star ? 2 : 1, bgcolor = color.new(zc, aplus ? 70 : 82), text = t, text_size = size.tiny, text_color = color.new(zc, 15), text_halign = text.align_right, text_valign = text.align_center)
+            ceLn = line.new(bar_index - 1, zMid, bar_index + 5, zMid, color = color.new(zc, 65), style = line.style_dotted)
+            fvgs.push(Zone.new(bx = bxN, ce = ceLn, top = zTop, bot = zBot, mid = zMid, isBull = false, tier1 = aplus, htfStar = star, born = bar_index, kind = 1, txt = t, tag = tag))
+            f_capZones(fvgs, maxZones)
+
+// ═══════════════════ 💣 BOMB ZONE ENGINE — EXPLOSION ORIGINS ════════════════════
+// Anatomy of a Bomb: (1) price raids the liquidity of the ENTIRE lookback range
+// (new extreme beyond every prior low/high — often PDL/PDH too), then (2) V-reverses
+// and EXPLODES away with displacement ≥ N × ATR inside the explosion window.
+// The thin band at that terminal extreme is where the detonation happened.
+// Its retest is the strongest entry available: the stop sits just beyond the
+// extreme, so the reward-to-risk on the next leg is enormous.
+//
+// Bomb Score (0–100):  base 40 for a valid sweep + explosion
+//   + up to 15  extra displacement beyond the minimum
+//   + 10        rejection wick ≥ body on the raid candle
+//   + 10        the raid also took the Previous Day Low / High
+//   + 10        an FVG printed inside the explosion leg
+//   + 10        volume spike on the raid or the explosion
+//   + 15        the band overlaps a Higher-Timeframe POI
+bool evtBombNew = false
+if bombEnable and barstate.isconfirmed
+    // ── bullish bomb: sweep of the lows → explosion up ───────────────────────────
+    int   bOffL = 0
+    float bMinL = low
+    for o = 1 to bombWindow
+        if low[o] < bMinL
+            bMinL := low[o]
+            bOffL := o
+    if bOffL >= 1 and close > high[bOffL] and (close - bMinL) >= bombDispMult * atrVal and bMinL < lowestLB[bOffL + 1]
+        float sc = 40.0
+        sc += math.min(15.0, 5.0 * ((close - bMinL) / atrVal - bombDispMult))
+        float wickL = math.min(open[bOffL], close[bOffL]) - bMinL
+        float bodyL = math.abs(close[bOffL] - open[bOffL])
+        sc += wickL >= bodyL ? 10.0 : 0.0
+        sc += dailyOk and not na(pdl) and bMinL < pdl ? 10.0 : 0.0
+        bool legFvgL = false
+        if bOffL >= 2
+            for o = 0 to bOffL - 2
+                if low[o] > high[o + 2]
+                    legFvgL := true
+                    break
+        sc += legFvgL ? 10.0 : 0.0
+        sc += nz(volume[bOffL]) > 1.5 * volSma[bOffL] or nz(volume) > 1.5 * volSma ? 10.0 : 0.0
+        float rawTopL = math.min(open[bOffL], close[bOffL])
+        float zTopL   = math.min(math.max(rawTopL, bMinL + 0.15 * atrVal), bMinL + bombZoneAtr * atrVal)
+        [hStarL, hTagL] = f_htfMatch(zTopL, bMinL, true)
+        sc += hStarL ? 15.0 : 0.0
+        sc := math.min(sc, 100.0)
+        if sc >= bombMinScore
+            bool dupL = false
+            if bombs.size() > 0
+                for z in bombs
+                    if z.isBull and f_overlap(zTopL, bMinL, z.top, z.bot)
+                        dupL := true
+                        break
+            if not dupL
+                evtBombNew := true
+                float lotsL = f_lots(zTopL - bMinL + slBufAtr * atrVal)
+                string tL = "💣 BOMB ▲ " + (sc >= 80 ? "A+ · " : "") + str.tostring(sc, "#") + (hStarL ? " ★ [" + f_tfName(hTagL) + "]" : "") + (na(lotsL) ? "" : " · " + str.tostring(lotsL, "#.##") + " lot")
+                bxB = box.new(bar_index - bOffL, zTopL, bar_index + 4, bMinL, border_color = color.new(cBombGold, 15), border_width = 2, bgcolor = color.new(cBombBg, 40), text = tL, text_size = size.tiny, text_color = color.new(cBombGold, 0), text_halign = text.align_center, text_valign = text.align_center)
+                bombs.push(Zone.new(bx = bxB, top = zTopL, bot = bMinL, mid = math.avg(zTopL, bMinL), isBull = true, tier1 = true, htfStar = hStarL, born = bar_index, kind = 4, txt = tL, tag = hTagL, score = sc))
+                f_capBombs(true)
+    // ── bearish bomb: sweep of the highs → explosion down ────────────────────────
+    int   bOffH = 0
+    float bMaxH = high
+    for o = 1 to bombWindow
+        if high[o] > bMaxH
+            bMaxH := high[o]
+            bOffH := o
+    if bOffH >= 1 and close < low[bOffH] and (bMaxH - close) >= bombDispMult * atrVal and bMaxH > highestLB[bOffH + 1]
+        float sc = 40.0
+        sc += math.min(15.0, 5.0 * ((bMaxH - close) / atrVal - bombDispMult))
+        float wickH = bMaxH - math.max(open[bOffH], close[bOffH])
+        float bodyH = math.abs(close[bOffH] - open[bOffH])
+        sc += wickH >= bodyH ? 10.0 : 0.0
+        sc += dailyOk and not na(pdh) and bMaxH > pdh ? 10.0 : 0.0
+        bool legFvgH = false
+        if bOffH >= 2
+            for o = 0 to bOffH - 2
+                if high[o] < low[o + 2]
+                    legFvgH := true
+                    break
+        sc += legFvgH ? 10.0 : 0.0
+        sc += nz(volume[bOffH]) > 1.5 * volSma[bOffH] or nz(volume) > 1.5 * volSma ? 10.0 : 0.0
+        float rawBotH = math.max(open[bOffH], close[bOffH])
+        float zBotH   = math.max(math.min(rawBotH, bMaxH - 0.15 * atrVal), bMaxH - bombZoneAtr * atrVal)
+        [hStarH, hTagH] = f_htfMatch(bMaxH, zBotH, false)
+        sc += hStarH ? 15.0 : 0.0
+        sc := math.min(sc, 100.0)
+        if sc >= bombMinScore
+            bool dupH = false
+            if bombs.size() > 0
+                for z in bombs
+                    if not z.isBull and f_overlap(bMaxH, zBotH, z.top, z.bot)
+                        dupH := true
+                        break
+            if not dupH
+                evtBombNew := true
+                float lotsH = f_lots(bMaxH - zBotH + slBufAtr * atrVal)
+                string tH = "💣 BOMB ▼ " + (sc >= 80 ? "A+ · " : "") + str.tostring(sc, "#") + (hStarH ? " ★ [" + f_tfName(hTagH) + "]" : "") + (na(lotsH) ? "" : " · " + str.tostring(lotsH, "#.##") + " lot")
+                bxB = box.new(bar_index - bOffH, bMaxH, bar_index + 4, zBotH, border_color = color.new(cBombGold, 15), border_width = 2, bgcolor = color.new(cBombBg, 40), text = tH, text_size = size.tiny, text_color = color.new(cBombGold, 0), text_halign = text.align_center, text_valign = text.align_center)
+                bombs.push(Zone.new(bx = bxB, top = bMaxH, bot = zBotH, mid = math.avg(bMaxH, zBotH), isBull = false, tier1 = true, htfStar = hStarH, born = bar_index, kind = 4, txt = tH, tag = hTagH, score = sc))
+                f_capBombs(false)
+
+// ═══════════════════ LIQUIDITY — EQH / EQL POOLS & SWEEPS ═══════════════════════
+liqPh = ta.pivothigh(high, liqLen, liqLen)
+liqPl = ta.pivotlow(low, liqLen, liqLen)
+
+var float lastPh  = na
+var int   lastPhB = na
+var float lastPl  = na
+var int   lastPlB = na
+
+if showLiq and not na(liqPh)
+    if not na(lastPh) and math.abs(liqPh - lastPh) <= liqTolAtr * atrVal
+        float lvl = math.max(liqPh, lastPh)
+        line lnN = na
+        if not liqOnlySwept
+            lnN := line.new(lastPhB, lvl, bar_index, lvl, color = color.new(cLiq, 40), style = line.style_dotted)
+        liqs.push(Liq.new(ln = lnN, price = lvl, fromBar = lastPhB, isHigh = true))
+    lastPh := liqPh
+    lastPhB := bar_index - liqLen
+
+if showLiq and not na(liqPl)
+    if not na(lastPl) and math.abs(liqPl - lastPl) <= liqTolAtr * atrVal
+        float lvl = math.min(liqPl, lastPl)
+        line lnN = na
+        if not liqOnlySwept
+            lnN := line.new(lastPlB, lvl, bar_index, lvl, color = color.new(cLiq, 40), style = line.style_dotted)
+        liqs.push(Liq.new(ln = lnN, price = lvl, fromBar = lastPlB, isHigh = false))
+    lastPl := liqPl
+    lastPlB := bar_index - liqLen
+
+bool evtSweep = false
+if liqs.size() > 0
+    for i = liqs.size() - 1 to 0
+        Liq L = liqs.get(i)
+        bool kill = false
+        float bodySz = math.abs(close - open)
+        if L.isHigh
+            if not L.swept
+                if high > L.price
+                    float upWick = high - math.max(open, close)
+                    if close < L.price and upWick >= sweepWickMin * bodySz
+                        L.swept := true
+                        evtSweep := true
+                        if na(L.ln)
+                            L.ln := line.new(L.fromBar, L.price, bar_index, L.price, color = color.new(cLiq, 15), style = line.style_solid)
+                        else
+                            line.set_x2(L.ln, bar_index)
+                            line.set_style(L.ln, line.style_solid)
+                        L.lb := label.new(bar_index, L.price, "✕ BSL", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(cLiq, 10), size = size.tiny)
+                    else
+                        kill := true
+                else if not na(L.ln)
+                    line.set_x2(L.ln, bar_index)
+            else if close > L.price
+                kill := true
+        else
+            if not L.swept
+                if low < L.price
+                    float dnWick = math.min(open, close) - low
+                    if close > L.price and dnWick >= sweepWickMin * bodySz
+                        L.swept := true
+                        evtSweep := true
+                        if na(L.ln)
+                            L.ln := line.new(L.fromBar, L.price, bar_index, L.price, color = color.new(cLiq, 15), style = line.style_solid)
+                        else
+                            line.set_x2(L.ln, bar_index)
+                            line.set_style(L.ln, line.style_solid)
+                        L.lb := label.new(bar_index, L.price, "✕ SSL", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(cLiq, 10), size = size.tiny)
+                    else
+                        kill := true
+                else if not na(L.ln)
+                    line.set_x2(L.ln, bar_index)
+            else if close < L.price
+                kill := true
+        if kill or bar_index - L.fromBar > 400
+            line.delete(L.ln)
+            label.delete(L.lb)
+            liqs.remove(i)
+while liqs.size() > 12
+    Liq Lold = liqs.shift()
+    line.delete(Lold.ln)
+    label.delete(Lold.lb)
+
+// ── PDH / PDL ───────────────────────────────────────────────────────────────────
+var line  pdhLn = na
+var line  pdlLn = na
+var label pdhLb = na
+var label pdlLb = na
+if showPdhPdl and dailyOk and barstate.islast and not na(pdh)
+    if na(pdhLn)
+        pdhLn := line.new(bar_index - 50, pdh, bar_index + 8, pdh, color = color.new(cNeutral, 30), style = line.style_dashed)
+        pdlLn := line.new(bar_index - 50, pdl, bar_index + 8, pdl, color = color.new(cNeutral, 30), style = line.style_dashed)
+        pdhLb := label.new(bar_index + 8, pdh, "PDH", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cNeutral, 20), size = size.tiny)
+        pdlLb := label.new(bar_index + 8, pdl, "PDL", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cNeutral, 20), size = size.tiny)
+    else
+        line.set_xy1(pdhLn, bar_index - 50, pdh)
+        line.set_xy2(pdhLn, bar_index + 8, pdh)
+        line.set_xy1(pdlLn, bar_index - 50, pdl)
+        line.set_xy2(pdlLn, bar_index + 8, pdl)
+        label.set_xy(pdhLb, bar_index + 8, pdh)
+        label.set_xy(pdlLb, bar_index + 8, pdl)
+
+// ═════════════════════ PREMIUM / DISCOUNT DEALING RANGE ═════════════════════════
+var box  premBox = na
+var box  discBox = na
+var line eqLn    = na
+var label eqLb   = na
+if showPD and barstate.islast and not na(swHigh) and not na(swLow) and swHigh > swLow
+    int lft = math.min(swHighBar, swLowBar)
+    int rgt = bar_index + 8
+    float eqV = math.avg(swHigh, swLow)
+    if na(premBox)
+        premBox := box.new(lft, swHigh, rgt, eqV, border_color = color.new(cBear, 85), border_style = line.style_dotted, bgcolor = color.new(cBear, 95), text = "PREMIUM", text_size = size.tiny, text_color = color.new(cBear, 45), text_halign = text.align_right, text_valign = text.align_top)
+        discBox := box.new(lft, eqV, rgt, swLow, border_color = color.new(cDiscount, 85), border_style = line.style_dotted, bgcolor = color.new(cDiscount, 95), text = "DISCOUNT", text_size = size.tiny, text_color = color.new(cDiscount, 45), text_halign = text.align_right, text_valign = text.align_bottom)
+        eqLn := line.new(lft, eqV, rgt, eqV, color = color.new(cNeutral, 40), style = line.style_dashed)
+        eqLb := label.new(rgt, eqV, "EQ 50%", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(cNeutral, 30), size = size.tiny)
+    else
+        box.set_lefttop(premBox, lft, swHigh)
+        box.set_rightbottom(premBox, rgt, eqV)
+        box.set_lefttop(discBox, lft, eqV)
+        box.set_rightbottom(discBox, rgt, swLow)
+        line.set_xy1(eqLn, lft, eqV)
+        line.set_xy2(eqLn, rgt, eqV)
+        label.set_xy(eqLb, rgt, eqV)
+
+// ═══════════════════ HTF MULTI-TIMEFRAME ZONES (2 LAYERS) ═══════════════════════
+// Auto mode picks the optimal pair of higher timeframes for the chart TF.
+string autoH1 = tfSec <= 300 ? "60" : tfSec <= 1800 ? "240" : tfSec <= 14400 ? "D" : "W"
+string autoH2 = tfSec <= 300 ? "240" : tfSec <= 1800 ? "D" : tfSec <= 14400 ? "W" : "M"
+string htf1 = htfMode == "Auto" ? autoH1 : htf1In
+string htf2 = htfMode == "Auto" ? autoH2 : htf2In
+
+// Confirmed HTF bars only (offsets ≥ 1 with lookahead_on → non-repainting).
+f_htfData(string tf) =>
+    request.security(syminfo.tickerid, tf, [time[1], high[1], low[1], open[1], close[1], high[2], low[2], open[2], close[2], high[3], low[3]], lookahead = barmerge.lookahead_on)
+
+[h1T, h1H1, h1L1, h1O1, h1C1, h1H2, h1L2, h1O2, h1C2, h1H3, h1L3] = f_htfData(htf1)
+[h2T, h2H1, h2L1, h2O1, h2C1, h2H2, h2L2, h2O2, h2C2, h2H3, h2L3] = f_htfData(htf2)
+
+bool newH1 = ta.change(h1T) != 0
+bool newH2 = ta.change(h2T) != 0
+
+f_htfDup(float top, float bot, bool isBull) =>
+    bool dup = false
+    if htfZones.size() > 0
+        for z in htfZones
+            if z.isBull == isBull and f_overlap(top, bot, z.top, z.bot)
+                dup := true
+                break
+    dup
+
+// Ultra-transparent styling (96% bg / 75% border) — confluence context, not clutter.
+f_addHtf(float top, float bot, bool isBull, string knd, string tf) =>
+    if top > bot and not f_htfDup(top, bot, isBull)
+        color zc = isBull ? cBull : cBear
+        string t = "HTF " + knd + " · " + f_tfName(tf)
+        bxN = box.new(bar_index, top, bar_index + 12, bot, border_color = color.new(zc, 75), border_style = line.style_dashed, bgcolor = color.new(zc, 96), text = t, text_size = size.tiny, text_color = color.new(zc, 55), text_halign = text.align_left, text_valign = isBull ? text.align_bottom : text.align_top)
+        htfZones.push(Zone.new(bx = bxN, top = top, bot = bot, mid = math.avg(top, bot), isBull = isBull, born = bar_index, kind = 3, txt = t, tag = tf))
+        f_capZones(htfZones, 8)
+        true
+    else
+        false
+
+bool htfAdded = false
+if htfEnable and newH1 and timeframe.in_seconds(htf1) > tfSec
+    if htfShowFVG
+        if h1L1 > h1H3
+            htfAdded := f_addHtf(h1L1, h1H3, true, "FVG", htf1) or htfAdded
+        if h1H1 < h1L3
+            htfAdded := f_addHtf(h1L3, h1H1, false, "FVG", htf1) or htfAdded
+    if htfShowOB
+        if h1C1 > h1H2 and h1C2 < h1O2
+            htfAdded := f_addHtf(h1H2, h1L2, true, "OB", htf1) or htfAdded
+        if h1C1 < h1L2 and h1C2 > h1O2
+            htfAdded := f_addHtf(h1H2, h1L2, false, "OB", htf1) or htfAdded
+
+if htfEnable and newH2 and timeframe.in_seconds(htf2) > tfSec
+    if htfShowFVG
+        if h2L1 > h2H3
+            htfAdded := f_addHtf(h2L1, h2H3, true, "FVG", htf2) or htfAdded
+        if h2H1 < h2L3
+            htfAdded := f_addHtf(h2L3, h2H1, false, "FVG", htf2) or htfAdded
+    if htfShowOB
+        if h2C1 > h2H2 and h2C2 < h2O2
+            htfAdded := f_addHtf(h2H2, h2L2, true, "OB", htf2) or htfAdded
+        if h2C1 < h2L2 and h2C2 > h2O2
+            htfAdded := f_addHtf(h2H2, h2L2, false, "OB", htf2) or htfAdded
+
+// Dynamic HTF confluence: when an HTF zone forms over an existing LTF zone, the
+// LTF zone is instantly upgraded — thicker border and a ★ added to its label.
+if htfAdded
+    if obs.size() > 0
+        for z in obs
+            if not z.htfStar
+                [st, tg] = f_htfMatch(z.top, z.bot, z.isBull)
+                if st
+                    z.htfStar := true
+                    z.tier1 := true
+                    z.txt += " ★ [" + f_tfName(tg) + "]"
+                    box.set_text(z.bx, z.txt)
+                    box.set_border_width(z.bx, 2)
+    if fvgs.size() > 0
+        for z in fvgs
+            if not z.htfStar
+                [st, tg] = f_htfMatch(z.top, z.bot, z.isBull)
+                if st
+                    z.htfStar := true
+                    z.tier1 := true
+                    z.txt += " ★ [" + f_tfName(tg) + "]"
+                    box.set_text(z.bx, z.txt)
+                    box.set_border_width(z.bx, 2)
+
+// ═════════════════ TREND CLOUD — 3-LAYER EMA GRADIENT RIBBON ════════════════════
+color cCloud = cloudUp ? cBull : cBear
+pE1 = plot(showCloud ? ema13 : na, "EMA 13", color = color.new(cCloud, 55), width = 1)
+pE2 = plot(showCloud ? ema21 : na, "EMA 21", color = color.new(cCloud, 70), width = 1)
+pE3 = plot(showCloud ? ema50 : na, "EMA 50", color = color.new(cCloud, 35), width = 2)
+fill(pE1, pE2, color = showCloud ? color.new(cCloud, 88) : na)
+fill(pE2, pE3, color = showCloud ? color.new(cCloud, 93) : na)
+bool twist = ta.cross(ema13, ema50)
+plotshape(showCloud and twist ? ema50 : na, "Twist Point ◉", shape.circle, location.absolute, color = color.new(cCloud, 0), size = size.tiny)
+
+// 💥 Explosion candles — outsized range + participation. These are the "detonations"
+// that both validate freshly printed Bomb origins and flag live volatility bursts.
+bool explosionUp = showExplosion and close > open and (high - low) >= bombExplMult * atrVal and (na(volume) or nz(volume) > 1.3 * volSma)
+bool explosionDn = showExplosion and close < open and (high - low) >= bombExplMult * atrVal and (na(volume) or nz(volume) > 1.3 * volSma)
+plotchar(explosionUp, "Explosion Up 💥", "💥", location.belowbar, color.new(cBombGold, 20), size = size.tiny)
+plotchar(explosionDn, "Explosion Down 💥", "💥", location.abovebar, color.new(cBombGold, 20), size = size.tiny)
+
+// ═════════════════ TRADE GUIDE — CONFIRMATION & EXECUTION ENGINE ════════════════
+// State machine:  0 Idle → 1 Watching zone → 2 Touched (waiting confirmation)
+//                 → 3 Running (Entry / SL / TP management)
+// Confirmation waits for a valid retest and a price-action body close from the
+// final zone edge — no random early entries on freshly printed candles.
+f_scanZones(int biasNow) =>
+    bool   fnd   = false
+    bool   fBull = true
+    float  fTop  = na
+    float  fBot  = na
+    bool   fT1   = false
+    bool   fStar = false
+    string fName = ""
+    int    fKind = 0
+    float  best  = -1.0e10
+    for fam = 0 to 3
+        array<Zone> arr = fam == 0 ? obs : fam == 1 ? fvgs : fam == 2 ? ifvgs : bombs
+        string nm = fam == 0 ? "OB" : fam == 1 ? "FVG" : fam == 2 ? "IFVG" : "💣 BOMB"
+        if arr.size() > 0
+            for z in arr
+                if z.touched
+                    continue
+                // 💣 bombs are inherently A+ reversal zones: they skip the A+ filter
+                // and the trend filter (the explosion IS the new trend)
+                if fam != 3 and aPlusOnly and not (z.tier1 or z.htfStar)
+                    continue
+                if fam != 3 and tradeTrend and ((z.isBull and biasNow < 0) or (not z.isBull and biasNow > 0))
+                    continue
+                float sc = na
+                float bonus = fam == 3 ? 10000.0 + z.score * 10.0 : (z.tier1 ? 1000.0 : 0.0) + (z.htfStar ? 500.0 : 0.0)
+                if z.isBull and z.top < close
+                    sc := bonus - (close - z.top) / atrVal
+                else if not z.isBull and z.bot > close
+                    sc := bonus - (z.bot - close) / atrVal
+                if not na(sc) and sc > best
+                    best := sc
+                    fnd := true
+                    fBull := z.isBull
+                    fTop := z.top
+                    fBot := z.bot
+                    fT1 := z.tier1
+                    fStar := z.htfStar
+                    fName := nm
+                    fKind := z.kind
+    [fnd, fBull, fTop, fBot, fT1, fStar, fName, fKind]
+
+var int    tState   = 0
+var bool   tLong    = true
+var float  zATop    = na
+var float  zABot    = na
+var bool   zAT1     = false
+var bool   zAStar   = false
+var bool   zABomb   = false
+var string zAName   = ""
+var int    touchBar = na
+var float  tEntry   = na
+var float  tSL      = na
+var float  tTP1     = na
+var float  tTP2     = na
+var float  tLots    = na
+var bool   tp1Hit   = false
+var bool   tp2Hit   = false
+
+var line  eLn  = na
+var line  sLn  = na
+var line  t1Ln = na
+var line  t2Ln = na
+var label eLb  = na
+var box   rBox = na
+var box   wBox = na
+
+bool evtTouch   = false
+bool evtConfirm = false
+bool evtTp1     = false
+bool evtTp2     = false
+bool evtStop    = false
+
+if barstate.isconfirmed
+    // ── acquire / refresh the watched zone ───────────────────────────────────────
+    if tState <= 1
+        [fnd, fBull, fTop, fBot, fT1, fStar, fName, fKind] = f_scanZones(bias)
+        if fnd
+            tState := 1
+            tLong := fBull
+            zATop := fTop
+            zABot := fBot
+            zAT1 := fT1
+            zAStar := fStar
+            zABomb := fKind == 4
+            zAName := fName
+        else
+            tState := 0
+    // ── touch detection ──────────────────────────────────────────────────────────
+    if tState == 1
+        if tLong and close < zABot
+            tState := 0
+        else if not tLong and close > zATop
+            tState := 0
+        else if tLong and low <= zATop
+            tState := 2
+            touchBar := bar_index
+            evtTouch := true
+        else if not tLong and high >= zABot
+            tState := 2
+            touchBar := bar_index
+            evtTouch := true
+    // ── confirmation from the final zone edge ────────────────────────────────────
+    if tState == 2
+        bool confirmed = false
+        if tLong
+            if close < zABot
+                tState := 0
+            else if close > zATop and close > open
+                confirmed := true
+            else if bar_index - touchBar > confBars
+                tState := 0
+        else
+            if close > zATop
+                tState := 0
+            else if close < zABot and close < open
+                confirmed := true
+            else if bar_index - touchBar > confBars
+                tState := 0
+        if confirmed
+            evtConfirm := true
+            tEntry := close
+            tSL := tLong ? zABot - slBufAtr * atrVal : zATop + slBufAtr * atrVal
+            float rd = math.abs(tEntry - tSL)
+            float uR1 = zABomb ? bombRR1 : rr1
+            float uR2 = zABomb ? bombRR2 : rr2
+            tTP1 := tLong ? tEntry + uR1 * rd : tEntry - uR1 * rd
+            tTP2 := tLong ? tEntry + uR2 * rd : tEntry - uR2 * rd
+            tLots := f_lots(rd)
+            tp1Hit := false
+            tp2Hit := false
+            tState := 3
+            if showTrade
+                eLn := line.new(bar_index, tEntry, bar_index + 1, tEntry, color = color.new(cNeutral, 10), width = 2)
+                sLn := line.new(bar_index, tSL, bar_index + 1, tSL, color = color.new(cBear, 10), width = 2)
+                t1Ln := line.new(bar_index, tTP1, bar_index + 1, tTP1, color = color.new(cDiscount, 25), style = line.style_dashed)
+                t2Ln := line.new(bar_index, tTP2, bar_index + 1, tTP2, color = color.new(cDiscount, 10), width = 2)
+                eLb := label.new(bar_index, tEntry, (zABomb ? "💣 " : "") + (tLong ? "LONG " : "SHORT ") + str.tostring(tEntry, format.mintick) + " · " + str.tostring(tLots, "#.##") + " lot", style = tLong ? label.style_label_up : label.style_label_down, color = color.new(cNeutral, 75), textcolor = color.white, size = size.small)
+            if showRRBox
+                rBox := box.new(bar_index, math.max(tEntry, tSL), bar_index + 12, math.min(tEntry, tSL), border_color = color.new(cBear, 70), bgcolor = color.new(cBear, 88))
+                wBox := box.new(bar_index, math.max(tEntry, tTP2), bar_index + 12, math.min(tEntry, tTP2), border_color = color.new(cDiscount, 70), bgcolor = color.new(cDiscount, 88))
+    // ── active trade management ──────────────────────────────────────────────────
+    if tState == 3
+        if showTrade
+            line.set_x2(eLn, bar_index)
+            line.set_x2(sLn, bar_index)
+            line.set_x2(t1Ln, bar_index)
+            line.set_x2(t2Ln, bar_index)
+        bool stopped = tLong ? low <= tSL : high >= tSL
+        if stopped
+            evtStop := true
+            label.new(bar_index, tSL, "SL ✕", style = tLong ? label.style_label_up : label.style_label_down, color = color.new(color.black, 100), textcolor = cBear, size = size.small)
+            tState := 0
+        else
+            if not tp1Hit and (tLong ? high >= tTP1 : low <= tTP1)
+                tp1Hit := true
+                evtTp1 := true
+                label.new(bar_index, tTP1, "TP1 ✔ done", style = tLong ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = cDiscount, size = size.small)
+            if not tp2Hit and (tLong ? high >= tTP2 : low <= tTP2)
+                tp2Hit := true
+                evtTp2 := true
+                label.new(bar_index, tTP2, "TP2 ✔ done", style = tLong ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = cDiscount, size = size.small)
+                tState := 0
+
+// ── Decision Assistant: opposite setup while a trade is running ─────────────────
+bool oppositeNear = false
+if tState == 3
+    for fam = 0 to 1
+        array<Zone> arr = fam == 0 ? obs : fvgs
+        if arr.size() > 0
+            for z in arr
+                if z.isBull != tLong and (z.tier1 or z.htfStar)
+                    float dist = z.isBull ? close - z.top : z.bot - close
+                    if dist >= 0 and dist <= 2.0 * atrVal
+                        oppositeNear := true
+                        break
+
+// ═══════════════════════════ TRADE GUIDE PANEL ══════════════════════════════════
+panelPosE = switch panelPos
+    "Top Right"    => position.top_right
+    "Middle Right" => position.middle_right
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    "Top Left"     => position.top_left
+    => position.top_right
+
+panelTxtSz = switch panelSize
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.small
+
+var table pan = na
+if showPanel and barstate.islast
+    if na(pan)
+        pan := table.new(panelPosE, 2, 14, bgcolor = color.new(#131722, 15), border_width = 1, border_color = color.new(cNeutral, 80), frame_width = 1, frame_color = color.new(cNeutral, 60))
+    string biasTxt = bias == 1 ? "BULLISH ▲" : bias == -1 ? "BEARISH ▼" : "NEUTRAL —"
+    color  biasCol = bias == 1 ? cBull : bias == -1 ? cBear : cNeutral
+    string setupTxt = tState == 0 ? "—" : (tLong ? "Buy · " : "Sell · ") + zAName
+    string scoreTxt = tState == 0 ? "—" : zABomb ? "💣 BOMB A+" : (zAT1 ? "A+" : "Standard") + (zAStar ? " ★ HTF" : "")
+    float uRR1 = tState > 0 and zABomb ? bombRR1 : rr1
+    float uRR2 = tState > 0 and zABomb ? bombRR2 : rr2
+    string bombTxt = "—"
+    if bombs.size() > 0
+        float bestD = 1.0e10
+        for z in bombs
+            if not z.touched
+                float d = z.isBull ? close - z.top : z.bot - close
+                if d >= 0 and d < bestD
+                    bestD := d
+                    bombTxt := (z.isBull ? "Buy @ " : "Sell @ ") + str.tostring(z.isBull ? z.top : z.bot, format.mintick) + " · " + str.tostring(z.score, "#") + " pts"
+    string statusTxt = switch tState
+        0 => "Idle — scanning"
+        1 => "Watching zone"
+        2 => "Touched · awaiting confirmation"
+        3 => tp1Hit ? "Running · TP1 ✔" : "Running"
+        => "—"
+    string nextTxt = switch tState
+        0 => "Wait for a fresh A+ zone"
+        1 => "Wait for retest @ " + str.tostring(tLong ? zATop : zABot, format.mintick)
+        2 => "Wait for body close " + (tLong ? "above " + str.tostring(zATop, format.mintick) : "below " + str.tostring(zABot, format.mintick))
+        3 => "Manage — SL @ " + str.tostring(tSL, format.mintick)
+        => "—"
+    table.cell(pan, 0, 0, "SMC ELITE", text_color = color.new(cLiq, 0), text_size = panelTxtSz, text_halign = text.align_left, bgcolor = color.new(#131722, 0))
+    table.cell(pan, 1, 0, f_tfName(timeframe.period) + " · " + syminfo.ticker, text_color = color.new(cNeutral, 20), text_size = panelTxtSz, text_halign = text.align_right, bgcolor = color.new(#131722, 0))
+    table.cell(pan, 0, 1, "Bias", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 1, biasTxt, text_color = biasCol, text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 2, "Setup", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 2, setupTxt, text_color = tState == 0 ? color.new(cNeutral, 40) : tLong ? cBull : cBear, text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 3, "Score", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 3, scoreTxt, text_color = color.new(cLiq, 15), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 4, "Status", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 4, statusTxt, text_color = color.new(color.white, 15), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 5, "Entry", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 5, tState == 3 ? str.tostring(tEntry, format.mintick) : "—", text_color = color.new(color.white, 25), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 6, "Stop Loss", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 6, tState == 3 ? str.tostring(tSL, format.mintick) : "—", text_color = cBear, text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 7, "TP1 (" + str.tostring(uRR1, "#.#") + "R)", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 7, tState == 3 ? str.tostring(tTP1, format.mintick) + (tp1Hit ? " ✔" : "") : "—", text_color = cDiscount, text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 8, "TP2 (" + str.tostring(uRR2, "#.#") + "R)", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 8, tState == 3 ? str.tostring(tTP2, format.mintick) + (tp2Hit ? " ✔" : "") : "—", text_color = cDiscount, text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 9, "Risk", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 9, "$" + str.tostring(riskMoney, "#.##") + " (" + str.tostring(riskPct, "#.##") + "%)", text_color = color.new(color.white, 25), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 10, "Lot Size", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 10, tState == 3 and not na(tLots) ? str.tostring(tLots, "#.##") : "—", text_color = color.new(cLiq, 10), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 11, "Next Step", text_color = color.new(cNeutral, 25), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 11, nextTxt, text_color = color.new(color.white, 20), text_size = panelTxtSz, text_halign = text.align_right)
+    table.cell(pan, 0, 12, "💣 Bomb Zone", text_color = color.new(cBombGold, 10), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 12, bombTxt, text_color = color.new(cBombGold, 10), text_size = panelTxtSz, text_halign = text.align_right)
+    string noteTxt = oppositeNear ? "⚠ Opposite A+ setup near — hold; switch only on a confirmed stronger signal" : ""
+    table.cell(pan, 0, 13, noteTxt == "" ? "" : "Decision", text_color = color.new(cLiq, 15), text_size = panelTxtSz, text_halign = text.align_left)
+    table.cell(pan, 1, 13, noteTxt, text_color = color.new(cLiq, 15), text_size = panelTxtSz, text_halign = text.align_right)
+
+// ═══════════════════════════════ ALERTS ═════════════════════════════════════════
+alertcondition(bosUp or bosDn, "Break of Structure (BOS)", "SMC Elite: Break of Structure detected")
+alertcondition(chochUp or chochDn, "Change of Character (CHoCH)", "SMC Elite: Change of Character detected")
+alertcondition(evtCisdBull or evtCisdBear, "CISD Trigger", "SMC Elite: Change In State of Delivery confirmed")
+alertcondition(evtSweep, "Liquidity Sweep", "SMC Elite: Liquidity pool swept")
+alertcondition(evtIfvgBull or evtIfvgBear, "IFVG Formed", "SMC Elite: FVG inversion zone created")
+alertcondition(evtBombNew, "💣 Bomb Zone Formed", "SMC Elite: 💣 New Bomb Zone printed — a liquidity raid extreme with an explosive reversal. Watch for the retest.")
+alertcondition(evtBombTouch, "💣 Bomb Zone Touched", "SMC Elite: 💣 Price is tapping a Bomb Zone — strongest entry area. Tight stop beyond the extreme.")
+alertcondition(explosionUp or explosionDn, "💥 Explosion Candle", "SMC Elite: 💥 Outsized displacement candle detected")
+alertcondition(evtTouch, "Zone Touched", "SMC Elite: Price tapped the watched zone — awaiting confirmation")
+alertcondition(evtConfirm, "Trade Confirmed", "SMC Elite: Setup confirmed — Entry / SL / TP plotted")
+alertcondition(evtTp1 or evtTp2, "Take Profit Hit", "SMC Elite: A take-profit target was reached")
+alertcondition(evtStop, "Stop Loss Hit", "SMC Elite: Trade invalidated at stop loss")
