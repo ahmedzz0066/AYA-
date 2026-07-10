@@ -1,77 +1,92 @@
-# AYA — Bomb Market Strategy (Reverse-Engineered)
+# AYA — Bomb Market (First-Principles Intraday Strategy)
 
-Pine Script v5 strategy: [`bomb_market.pine`](bomb_market.pine)
+**Main strategy:** [`bomb_market.pine`](bomb_market.pine) — Pine Script v5, limit-entry-only intraday liquidity provision.
 
-A reverse-engineered reconstruction of the "Bomb Market" class of premium
-strategies — the ones marketed with 1:15 to 1:50+ risk-to-reward ratios on
-XAUUSD, EURUSD, and equity indices across 15m / 1H / 4H / 1D.
+No lagging-indicator crossovers, no SMC pattern folklore. The strategy is derived
+from four measurable properties of intraday markets, and every parameter maps to
+one of them.
 
-## Where the massive R:R actually comes from
+## First principles
 
-These systems don't predict better — they **enter tighter**. The R:R is a
-product of entry mechanics, not signal quality:
+**1. Why limit orders make money at all.**
+Every trade has an aggressor (market order, pays the spread) and a provider
+(limit order, earns it). Aggressive flow is aggressive because it's *urgent* —
+stop cascades, liquidations, hedging — and urgent flow systematically overshoots
+fair value. The only durable intraday edge available without colocation is being
+the counterparty to forced flow. So: **entries are resting limit orders only**,
+placed where forced flow overshoots, never chasing.
 
-1. **Liquidity sweep** — price wicks through a swing high/low (a stop hunt /
-   raid on buy-side or sell-side liquidity) and closes back inside the range.
-2. **Displacement** — within a few bars, an impulsive candle (body ≥ 1.2×ATR)
-   drives away from the sweep, leaving a Fair Value Gap and breaking
-   short-term structure (CHoCH).
-3. **Limit entry at the origin extreme** — a resting **limit order** is placed
-   at the extreme of the order block (the last opposite candle before the
-   displacement). The stop hides a fraction of ATR beyond the sweep wick.
+**2. Fair value is volume-weighted.**
+The intraday benchmark institutions actually execute against is session VWAP.
+The script computes an anchored VWAP plus a **volume-weighted standard deviation
+(σ)**, so "how stretched is price" is measured in units the market itself defines.
+(On volume-less FX feeds it degrades gracefully to a TWAP.)
 
-Because the entry sits at the zone extreme and the stop is just past the hunt
-wick, the stop distance collapses to a handful of ticks/pips — so a fixed
-target of 15R–50R is a *normal-looking* distance on the chart. That is the
-entire trick.
+**3. Volatility clusters and scales.**
+Fixed pip/point thresholds are meaningless across XAUUSD, EURUSD, and indices, or
+across hours of the day. Every distance in this system — arm level, order
+placement, stop, target — is expressed in σ, so it self-scales across symbols
+and intraday timeframes with no re-tuning.
 
-**Entries are limit orders only.** No market orders. Unfilled orders are
-cancelled after N bars, or immediately if price closes through the stop zone
-or runs to target without a fill.
+**4. Mean reversion is a regime, not a law.**
+Fading extremes works when the price path is noise and dies when it's
+information. The regime gate is **Kaufman's Efficiency Ratio**
+(|net move| ÷ path length over N bars) — a direct signal-to-noise measurement.
+Low ER → choppy auction → fade enabled. High ER → information arriving → stand
+down. A **trend-day circuit breaker** additionally disables a side when price
+*camps* beyond the bands for several consecutive bars, until VWAP is re-touched.
 
-## Setup lifecycle (state machine)
+## The trade
 
 ```
-IDLE ──sweep──▶ HUNT (N-bar window) ──displacement──▶ LIMIT RESTING
-                     │ window expires                      │
-                     ▼                                     ├─ filled  → bracket exit (SL / fixed-R TP)
-                    IDLE                                   ├─ expired → cancel
-                                                           └─ setup invalidated → cancel
+price stretched > armσ (2.0) from VWAP, in a noise regime, in session
+   → rest a LIMIT order deeper at fillσ (2.5), re-quoted every bar as VWAP/σ move
+   → only an overshoot spike can fill it (you are the counterparty to the puke)
+   → target: reversion to VWAP (trailing — fair value keeps moving)
+   → stop:  frozen at (stopσ − fillσ) beyond entry  = 1.5σ risk by default
+   → time stop after N bars (reversion has a half-life) · flat at end of session
 ```
 
-## Suggested presets per timeframe
+Unfilled orders are cancel/replaced every bar while armed and cancelled the
+moment the setup lapses. No market orders for entry, ever.
 
-| Input                     | 15m  | 1H   | 4H   | 1D  |
-|---------------------------|------|------|------|-----|
-| Swing pivot length        | 5    | 5    | 4    | 3   |
-| Sweep → displacement window | 8  | 6    | 5    | 4   |
-| Min body (× ATR)          | 1.2  | 1.2  | 1.1  | 1.0 |
-| Limit expiry (bars)       | 20   | 15   | 10   | 7   |
-| Killzone filter           | ON   | ON   | OFF  | OFF |
-| R:R target                | 15–25| 15–25| 25–50| 25–50|
+## Expectancy, honestly
 
-Killzones default to London 07:00–10:00 and New York 13:30–16:00 (UTC) —
-recommended ON for 15m/1H on FX and gold.
+Default geometry: risk 1.5σ, reward ≈ 2.5σ back to VWAP → ~1.7R per winner with
+a **high win rate** — that is the mathematically coherent shape of a
+mean-reversion edge. Marketing that promises 1:15–1:50 R:R on every trade is
+selling the opposite of how liquidity provision pays. Expectancy per trade:
 
-## Risk sizing
+```
+E = p·(reward) − (1−p)·(risk) − costs
+```
 
-Position size = `(equity × risk%) / (stop distance × point value)`, so every
-trade risks the same fraction of equity regardless of how tight the stop is.
-Default risk is **0.5%** per trade.
+Costs matter enormously at intraday frequency — backtest with your real
+commission and spread (the script ships with 2 ticks of slippage on stop/market
+exits) before believing anything.
 
-## Honest caveats (what the sales page won't tell you)
+## Suggested presets
 
-- At 15R–50R targets the **win rate is structurally low** (often 5–15%).
-  Profitability rests on a small number of full-target winners; expect long
-  losing streaks and size accordingly.
-- Backtests of ultra-high-R:R systems are extremely sensitive to spread,
-  slippage on the stop, and whether the tight stop would have survived real
-  tick data. Test with realistic commission/spread settings and bar
-  magnifier before believing any equity curve.
-- The stop-loss leg of the bracket is a protective stop order (standard for
-  any bracket); the *entry* side is what's restricted to limit orders.
+| Input                | 1m   | 5m   | 15m  |
+|----------------------|------|------|------|
+| Warm-up bars         | 30   | 12   | 8    |
+| ER lookback          | 40   | 30   | 20   |
+| Arm band (σ)         | 2.0  | 2.0  | 1.8  |
+| Fill placement (σ)   | 2.6  | 2.5  | 2.2  |
+| Stop (σ)             | 4.0  | 4.0  | 3.5  |
+| Max hold (bars)      | 60   | 40   | 24   |
 
-## Alerts
+Session defaults to 07:00–20:00 UTC (London + New York liquidity); positions and
+orders are flattened outside it.
 
-Every placed order fires an `alert()` with ticker, limit price, SL, TP, and
-R:R — suitable for webhook/broker integration.
+## Risk
+
+Position size = `(equity × risk%) / (stop distance × point value)` — constant
+fractional risk per trade, default **0.5%**.
+
+## Repo layout
+
+- `bomb_market.pine` — the strategy (v2, first-principles).
+- `legacy/bomb_market_smc.pine` — the earlier SMC-style reconstruction
+  (sweep → displacement → order-block limit, fixed 15–50R targets), kept for
+  reference and comparison.

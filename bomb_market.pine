@@ -1,33 +1,48 @@
 //@version=5
 // ═══════════════════════════════════════════════════════════════════════════
-//  BOMB MARKET — Reverse-Engineered High-R:R Liquidity Strategy
+//  BOMB MARKET v2 — First-Principles Intraday Liquidity Provision
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  CORE THESIS
-//  Premium "1:15 – 1:50 R:R" systems do not predict better — they enter
-//  tighter. The engine is always the same three-step sequence:
+//  No order blocks. No FVG folklore. No lagging-indicator crossovers.
+//  Four measurable facts about intraday markets, and nothing else:
 //
-//    1. LIQUIDITY SWEEP   — price wicks through a swing high/low (stop hunt)
-//                           and closes back inside the range.
-//    2. DISPLACEMENT      — an impulsive candle away from the sweep, large
-//                           relative to ATR, ideally leaving a Fair Value Gap
-//                           and shifting short-term structure (CHoCH).
-//    3. LIMIT ENTRY       — a resting LIMIT order at the extreme of the
-//                           origin zone (Order Block / FVG midpoint). Stop
-//                           sits a fraction of ATR beyond the sweep wick.
+//  1. WHY LIMIT ORDERS PAY.  Aggressive (market-order) flow pays the spread
+//     because it is urgent — stop cascades, margin liquidations, hedging.
+//     Urgent flow systematically overshoots fair value. A resting limit
+//     order monetizes that overshoot. The entire edge of this strategy is
+//     being the counterparty to forced flow — never the initiator.
+//     ⇒ ENTRIES ARE LIMIT ORDERS ONLY, resting at statistical extremes.
 //
-//  Because the entry is at the zone EXTREME and the stop hides just past the
-//  hunt wick, the stop distance collapses to a handful of ticks — so a target
-//  at the opposing liquidity pool is mechanically 15R–50R away.
+//  2. FAIR VALUE IS VOLUME-WEIGHTED.  The intraday anchor institutions
+//     benchmark against is session VWAP. Deviation from VWAP, measured in
+//     volume-weighted standard deviations (σ), is the distance from fair
+//     value in units the market itself defines.
 //
-//  ENTRIES ARE LIMIT ORDERS ONLY. No market orders are ever sent for entry.
-//  Unfilled orders expire after N bars or when the setup invalidates.
+//  3. VOLATILITY CLUSTERS AND SCALES.  A fixed pip threshold is meaningless
+//     across XAUUSD / EURUSD / indices and across hours of the day. Every
+//     threshold here is expressed in σ, so the system self-scales across
+//     symbols and timeframes.
 //
-//  Works on 15m / 1H / 4H / 1D — all thresholds are ATR- and pivot-relative,
-//  so the logic self-scales across XAUUSD, EURUSD, and equity indices.
+//  4. MEAN REVERSION IS A REGIME, NOT A LAW.  Fading extremes only works
+//     when the price path is noise, not information. Kaufman's Efficiency
+//     Ratio (net displacement ÷ path length) is a direct signal-to-noise
+//     measurement: low ER = choppy auction = fade; high ER = information
+//     arriving = stand down. A trend-day circuit breaker force-disables a
+//     side when price camps beyond the bands.
+//
+//  THE TRADE
+//     price stretches > armσ from VWAP in a noise regime
+//       → rest a limit order deeper, at fillσ (re-quoted every bar)
+//       → filled only if an overshoot spike hits it
+//       → target: reversion to VWAP (trailing, since VWAP moves)
+//       → stop: (stopσ − fillσ) beyond entry · time stop · flat at EOD
+//
+//  Honest expectancy note: this is a HIGH win-rate / MODEST R-multiple
+//  profile (the mathematically coherent one for mean reversion). The
+//  "1:50 R:R" marketing profile is the fantasy this replaces.
 //
 // ═══════════════════════════════════════════════════════════════════════════
-strategy("Bomb Market [Reverse-Engineered]", shorttitle="Bomb Market",
+strategy("Bomb Market v2 [First Principles]", shorttitle="Bomb Market v2",
      overlay=true,
      initial_capital=10000,
      default_qty_type=strategy.fixed, default_qty_value=1,
@@ -35,151 +50,112 @@ strategy("Bomb Market [Reverse-Engineered]", shorttitle="Bomb Market",
      calc_on_every_tick=false,
      process_orders_on_close=false,
      commission_type=strategy.commission.percent, commission_value=0.0,
-     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+     slippage=2,
+     max_lines_count=500, max_labels_count=500)
 
 // ─────────────────────────────────────────────────────────────── INPUTS ────
-grpS  = "1 · Structure & Sweep"
-swingLen    = input.int(5,   "Swing pivot length", minval=2, group=grpS,
-     tooltip="Bars on each side of a pivot. 15m: 5 · 1H: 5 · 4H: 4 · 1D: 3")
-dispWindow  = input.int(8,   "Sweep → displacement window (bars)", minval=1, group=grpS,
-     tooltip="Displacement must appear within this many bars of the sweep.")
+grpFV = "1 · Fair value & volatility"
+warmupBars   = input.int(12, "Warm-up bars after session anchor", minval=1, group=grpFV,
+     tooltip="σ is unstable right after the daily anchor resets; no trading until this many bars have printed.")
+minSigmaTick = input.int(5, "Minimum σ (ticks)", minval=0, group=grpFV,
+     tooltip="Skip dead-market conditions where σ is too small to clear costs.")
 
-grpD  = "2 · Displacement"
-atrLen      = input.int(14,  "ATR length", minval=1, group=grpD)
-dispMult    = input.float(1.2, "Min body size (× ATR)", minval=0.1, step=0.1, group=grpD,
-     tooltip="Candle body must exceed ATR × this multiple to count as displacement.")
-requireFVG  = input.bool(true,  "Require Fair Value Gap", group=grpD,
-     tooltip="Displacement bar must leave a 3-candle imbalance.")
-requireShift= input.bool(true,  "Require structure shift (CHoCH proxy)", group=grpD)
-shiftLen    = input.int(10,  "Structure-shift lookback", minval=2, group=grpD)
+grpRG = "2 · Regime (noise vs information)"
+erLen        = input.int(30, "Efficiency Ratio lookback", minval=5, group=grpRG)
+erMax        = input.float(0.30, "Max ER to allow fading", minval=0.05, maxval=1.0, step=0.05, group=grpRG,
+     tooltip="ER = |net move| / path length. Below this the tape is noise → mean reversion is on.")
+trendGuard   = input.int(6, "Trend-day circuit breaker (bars beyond arm band)", minval=2, group=grpRG,
+     tooltip="If price closes beyond the arm band this many consecutive bars, that side is disabled until price re-touches VWAP.")
 
-grpE  = "3 · Limit Entry / Exit"
-entryMode   = input.string("OB Extreme", "Limit entry level", group=grpE,
-     options=["OB Extreme", "OB Midpoint", "FVG Midpoint"],
-     tooltip="OB Extreme = deepest price of the origin candle → tightest stop → highest R:R.")
-obLookback  = input.int(6,   "Order-block search lookback", minval=1, group=grpE)
-slBufAtr    = input.float(0.15, "Stop buffer beyond sweep wick (× ATR)", minval=0.0, step=0.05, group=grpE)
-rrTarget    = input.float(15.0, "Risk-to-Reward target (R)", minval=1.0, step=0.5, group=grpE,
-     tooltip="Fixed-R target. The 'Bomb' presets: 15 / 25 / 50.")
-expiryBars  = input.int(20,  "Cancel unfilled limit after (bars)", minval=1, group=grpE,
-     tooltip="15m: 20 · 1H: 15 · 4H: 10 · 1D: 7")
-replaceNew  = input.bool(true, "Newer setup replaces pending order", group=grpE)
+grpEN = "3 · Limit entry / exit (all distances in σ)"
+armZ         = input.float(2.0, "Arm band (σ)", minval=0.5, step=0.1, group=grpEN,
+     tooltip="Price must be stretched at least this far from VWAP before we quote.")
+fillZ        = input.float(2.5, "Limit order placement (σ)", minval=0.5, step=0.1, group=grpEN,
+     tooltip="Where the resting limit sits. Must exceed the arm band — you only get filled on the overshoot spike.")
+stopZ        = input.float(4.0, "Stop (σ)", minval=1.0, step=0.1, group=grpEN,
+     tooltip="Risk per trade = (stop σ − fill σ). Default: 1.5σ risk for ~2.5σ reward to VWAP.")
+tpZ          = input.float(0.0, "Take-profit offset from VWAP (σ)", minval=0.0, step=0.1, group=grpEN,
+     tooltip="0 = exit exactly at VWAP. 0.5 = exit half a σ early (higher win rate, smaller R).")
+useTimeStop  = input.bool(true, "Time stop", group=grpEN)
+maxHold      = input.int(40, "Max holding period (bars)", minval=1, group=grpEN,
+     tooltip="Mean reversion decays fast; if the snap-back hasn't happened, the thesis is stale.")
 
-grpR  = "4 · Risk"
-useRiskPct  = input.bool(true,  "Position size by % equity risk", group=grpR)
-riskPct     = input.float(0.5, "Risk per trade (% of equity)", minval=0.01, step=0.1, group=grpR,
-     tooltip="At 15R–50R targets, win rate is LOW. Keep risk small.")
-fixedQty    = input.float(1.0, "Fixed qty (if % risk is off)", minval=0.0, group=grpR)
+grpSS = "4 · Session"
+useSession   = input.bool(true, "Restrict to trading session", group=grpSS)
+tradeSess    = input.session("0700-2000", "Session", group=grpSS)
+sessTZ       = input.string("UTC", "Session timezone", group=grpSS)
+flatEOD      = input.bool(true, "Flat at end of session (day trading)", group=grpSS)
 
-grpF  = "5 · Filters"
-useKZ       = input.bool(false, "Killzone session filter", group=grpF,
-     tooltip="Only accept sweeps inside the sessions below. Recommended ON for 15m/1H FX & metals.")
-kzTZ        = input.string("UTC", "Killzone timezone", group=grpF)
-kz1         = input.session("0700-1000", "Killzone 1 (London)", group=grpF)
-kz2         = input.session("1330-1600", "Killzone 2 (New York)", group=grpF)
-useBias     = input.bool(false, "Higher-timeframe EMA bias filter", group=grpF,
-     tooltip="Longs only above the HTF EMA, shorts only below.")
-biasTF      = input.timeframe("D", "Bias timeframe", group=grpF)
-biasLen     = input.int(50, "Bias EMA length", minval=1, group=grpF)
+grpRK = "5 · Risk"
+useRiskPct   = input.bool(true, "Position size by % equity risk", group=grpRK)
+riskPct      = input.float(0.5, "Risk per trade (% equity)", minval=0.01, step=0.1, group=grpRK)
+fixedQty     = input.float(1.0, "Fixed qty (if % risk off)", minval=0.0, group=grpRK)
 
-grpV  = "6 · Visuals"
-showZones   = input.bool(true, "Draw OB / FVG zones", group=grpV)
-showLines   = input.bool(true, "Draw entry / SL / TP lines", group=grpV)
-showStats   = input.bool(true, "Show performance panel", group=grpV)
+grpVS = "6 · Visuals"
+showBands    = input.bool(true, "Show VWAP + σ bands", group=grpVS)
+showRegime   = input.bool(true, "Shade fade-enabled regime", group=grpVS)
+showStats    = input.bool(true, "Show performance panel", group=grpVS)
 
-// ──────────────────────────────────────────────────────────── UTILITIES ────
-atr = ta.atr(atrLen)
+// ─────────────────────────────── FAIR VALUE: ANCHORED VWAP + σ BANDS ───────
+// Volume-weighted mean and variance, anchored to the trading day.
+// Feeds with no volume (some FX) degrade gracefully to a TWAP.
+newDay = ta.change(time("D")) != 0
 
-inKZ = not useKZ or not na(time(timeframe.period, kz1, kzTZ)) or not na(time(timeframe.period, kz2, kzTZ))
+var float cumPV  = 0.0
+var float cumP2V = 0.0
+var float cumV   = 0.0
+var int   barsInDay = 0
 
-htfEma = request.security(syminfo.tickerid, biasTF, ta.ema(close, biasLen)[1],
-     lookahead=barmerge.lookahead_on)
-biasLongOK  = not useBias or close > htfEma
-biasShortOK = not useBias or close < htfEma
+if newDay
+    cumPV  := 0.0
+    cumP2V := 0.0
+    cumV   := 0.0
+    barsInDay := 0
 
-// Last bullish / bearish candle before the displacement = the Order Block.
-f_lastBullOB(int lookback) =>
-    float top = na, float bot = na, int idx = na
-    for i = 1 to lookback
-        if close[i] > open[i]
-            top := high[i], bot := low[i], idx := i
-            break
-    [top, bot, idx]
+srcPx = hlc3
+vol   = nz(volume, 0) <= 0 ? 1.0 : volume
+cumPV  += srcPx * vol
+cumP2V += srcPx * srcPx * vol
+cumV   += vol
+barsInDay += 1
 
-f_lastBearOB(int lookback) =>
-    float top = na, float bot = na, int idx = na
-    for i = 1 to lookback
-        if close[i] < open[i]
-            top := high[i], bot := low[i], idx := i
-            break
-    [top, bot, idx]
+vwap  = cumPV / cumV
+sigma = math.sqrt(math.max(cumP2V / cumV - vwap * vwap, 0.0))
 
-// ─────────────────────────────────────────── 1 · SWING / SWEEP TRACKING ────
-ph = ta.pivothigh(high, swingLen, swingLen)
-pl = ta.pivotlow(low, swingLen, swingLen)
+minSigma = minSigmaTick * syminfo.mintick
+statsOK  = barsInDay >= warmupBars and sigma >= minSigma
 
-var float lastPH = na
-var float lastPL = na
-if not na(ph)
-    lastPH := ph
-if not na(pl)
-    lastPL := pl
+// ─────────────────────────────────── REGIME: SIGNAL-TO-NOISE OF THE PATH ───
+netMove = math.abs(close - close[erLen])
+pathLen = math.sum(math.abs(ta.change(close)), erLen)
+er      = pathLen > 0 ? netMove / pathLen : 1.0
+regimeOK = er < erMax
 
-// A confirmed CLOSE through the level is a breakout, not a hunt — retire it.
-if not na(lastPH) and close > lastPH
-    lastPH := na
-if not na(lastPL) and close < lastPL
-    lastPL := na
+// Trend-day circuit breaker: if price CAMPS beyond the arm band, the stretch
+// is information, not noise — disable that side until VWAP is re-touched.
+var int  dnExtCnt = 0
+var int  upExtCnt = 0
+var bool longBlocked  = false
+var bool shortBlocked = false
 
-// Sweep = wick through the pivot, close back inside.
-sweptHigh = not na(lastPH) and high > lastPH and close < lastPH and inKZ
-sweptLow  = not na(lastPL) and low  < lastPL and close > lastPL and inKZ
+dnExtCnt := statsOK and close < vwap - armZ * sigma ? dnExtCnt + 1 : 0
+upExtCnt := statsOK and close > vwap + armZ * sigma ? upExtCnt + 1 : 0
+if dnExtCnt >= trendGuard
+    longBlocked := true
+if upExtCnt >= trendGuard
+    shortBlocked := true
+if close >= vwap
+    longBlocked := false
+if close <= vwap
+    shortBlocked := false
+if newDay
+    longBlocked := false
+    shortBlocked := false
 
-// Hunt state: after a sweep we have `dispWindow` bars to see displacement.
-var int   shortHunt = 0
-var int   longHunt  = 0
-var float shortExtreme = na   // highest wick of the hunt (SL anchor for shorts)
-var float longExtreme  = na   // lowest  wick of the hunt (SL anchor for longs)
+// ───────────────────────────────────────────────────────────── SESSION ─────
+inSession = not useSession or not na(time(timeframe.period, tradeSess, sessTZ))
 
-if sweptHigh
-    shortHunt := dispWindow, shortExtreme := high, lastPH := na
-else if shortHunt > 0
-    shortHunt := shortHunt - 1, shortExtreme := math.max(shortExtreme, high)
-
-if sweptLow
-    longHunt := dispWindow, longExtreme := low, lastPL := na
-else if longHunt > 0
-    longHunt := longHunt - 1, longExtreme := math.min(longExtreme, low)
-
-if sweptHigh
-    label.new(bar_index, high, "💣 SSL raid", style=label.style_label_down,
-         color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
-if sweptLow
-    label.new(bar_index, low, "💣 BSL raid", style=label.style_label_up,
-         color=color.new(color.teal, 20), textcolor=color.white, size=size.tiny)
-
-// ───────────────────────────────────────────────── 2 · DISPLACEMENT ────────
-body     = math.abs(close - open)
-bigBody  = body >= dispMult * atr
-
-bearFVG  = high < low[2]                       // 3-candle gap down
-bullFVG  = low  > high[2]                      // 3-candle gap up
-
-bearShift = close < ta.lowest(low, shiftLen)[1]
-bullShift = close > ta.highest(high, shiftLen)[1]
-
-dispShort = shortHunt > 0 and close < open and bigBody and
-     (not requireFVG or bearFVG) and (not requireShift or bearShift) and biasShortOK
-dispLong  = longHunt > 0 and close > open and bigBody and
-     (not requireFVG or bullFVG) and (not requireShift or bullShift) and biasLongOK
-
-// ─────────────────────────────────── 3 · BUILD & PLACE THE LIMIT ORDER ─────
-var int   pendDir   = 0                        // 0 = none · 1 = long · -1 = short
-var float pendEntry = na
-var float pendSL    = na
-var float pendTP    = na
-var int   pendBar   = na
-
+// ──────────────────────────────────────────────────────────────── RISK ─────
 f_qty(float entryPx, float slPx) =>
     if useRiskPct
         riskCash    = strategy.equity * riskPct / 100.0
@@ -188,111 +164,112 @@ f_qty(float entryPx, float slPx) =>
     else
         fixedQty
 
-f_drawSetup(float entryPx, float slPx, float tpPx, float obT, float obB, int obIdx, bool isLong) =>
-    if showZones and not na(obT)
-        box.new(bar_index - obIdx, obT, bar_index + expiryBars, obB,
-             bgcolor=color.new(isLong ? color.teal : color.red, 82),
-             border_color=color.new(isLong ? color.teal : color.red, 40))
-    if showLines
-        line.new(bar_index, entryPx, bar_index + expiryBars, entryPx, color=color.blue,  width=2)
-        line.new(bar_index, slPx,    bar_index + expiryBars, slPx,    color=color.red,   width=1)
-        line.new(bar_index, tpPx,    bar_index + expiryBars, tpPx,    color=color.green, width=1)
-        label.new(bar_index + expiryBars, entryPx,
-             str.tostring(rrTarget, "#.#") + "R limit", style=label.style_label_left,
-             color=color.new(color.blue, 30), textcolor=color.white, size=size.tiny)
+// ─────────────────────────── LIMIT-ONLY ENTRIES (RE-QUOTED EVERY BAR) ──────
+// While armed, the limit order is cancel/replaced each bar as VWAP and σ
+// update — exactly how a liquidity provider re-quotes. It rests DEEPER than
+// the current extreme: only a forced-flow overshoot spike can fill it.
+flat     = strategy.position_size == 0
+readyCommon = inSession and statsOK and regimeOK and flat
 
-// ---- SHORT setup ----
-if dispShort and (strategy.position_size == 0) and (pendDir == 0 or replaceNew)
-    [obT, obB, obIdx] = f_lastBullOB(obLookback)
-    float fvgMid = bearFVG ? (low[2] + high) / 2.0 : na
-    float entryPx = switch entryMode
-        "OB Extreme"   => obT
-        "OB Midpoint"  => not na(obT) ? (obT + obB) / 2.0 : na
-        "FVG Midpoint" => not na(fvgMid) ? fvgMid : not na(obT) ? (obT + obB) / 2.0 : na
-    float slPx = shortExtreme + slBufAtr * atr
-    // Limit sell must rest ABOVE market and BELOW the stop.
-    if not na(entryPx) and entryPx > close and entryPx < slPx
-        risk = slPx - entryPx
-        tpPx = entryPx - rrTarget * risk
-        qty  = f_qty(entryPx, slPx)
-        if qty > 0
-            strategy.cancel("BM Long")
-            strategy.cancel("BM Short")
-            strategy.entry("BM Short", strategy.short, qty=qty, limit=entryPx)
-            strategy.exit("BM Short X", from_entry="BM Short", stop=slPx, limit=tpPx)
-            pendDir := -1, pendEntry := entryPx, pendSL := slPx, pendTP := tpPx, pendBar := bar_index
-            shortHunt := 0
-            f_drawSetup(entryPx, slPx, tpPx, obT, obB, obIdx, false)
-            alert("BOMB MARKET SHORT | " + syminfo.ticker +
-                 " | limit=" + str.tostring(entryPx) +
-                 " | sl="    + str.tostring(slPx) +
-                 " | tp="    + str.tostring(tpPx) +
-                 " | rr="    + str.tostring(rrTarget), alert.freq_once_per_bar_close)
+var float longStopPx  = na
+var float shortStopPx = na
 
-// ---- LONG setup ----
-if dispLong and (strategy.position_size == 0) and (pendDir == 0 or replaceNew)
-    [obT, obB, obIdx] = f_lastBearOB(obLookback)
-    float fvgMid = bullFVG ? (high[2] + low) / 2.0 : na
-    float entryPx = switch entryMode
-        "OB Extreme"   => obB
-        "OB Midpoint"  => not na(obT) ? (obT + obB) / 2.0 : na
-        "FVG Midpoint" => not na(fvgMid) ? fvgMid : not na(obT) ? (obT + obB) / 2.0 : na
-    float slPx = longExtreme - slBufAtr * atr
-    // Limit buy must rest BELOW market and ABOVE the stop.
-    if not na(entryPx) and entryPx < close and entryPx > slPx
-        risk = entryPx - slPx
-        tpPx = entryPx + rrTarget * risk
-        qty  = f_qty(entryPx, slPx)
-        if qty > 0
-            strategy.cancel("BM Long")
-            strategy.cancel("BM Short")
-            strategy.entry("BM Long", strategy.long, qty=qty, limit=entryPx)
-            strategy.exit("BM Long X", from_entry="BM Long", stop=slPx, limit=tpPx)
-            pendDir := 1, pendEntry := entryPx, pendSL := slPx, pendTP := tpPx, pendBar := bar_index
-            longHunt := 0
-            f_drawSetup(entryPx, slPx, tpPx, obT, obB, obIdx, true)
-            alert("BOMB MARKET LONG | " + syminfo.ticker +
-                 " | limit=" + str.tostring(entryPx) +
-                 " | sl="    + str.tostring(slPx) +
-                 " | tp="    + str.tostring(tpPx) +
-                 " | rr="    + str.tostring(rrTarget), alert.freq_once_per_bar_close)
+armedLong = readyCommon and close < vwap - armZ * sigma and not longBlocked
+if armedLong
+    limitPx = math.min(vwap - fillZ * sigma, close - 2 * syminfo.mintick)
+    stopPx  = limitPx - (stopZ - fillZ) * sigma
+    tpPx    = vwap - tpZ * sigma
+    qty     = f_qty(limitPx, stopPx)
+    if tpPx > limitPx + syminfo.mintick and qty > 0
+        longStopPx := stopPx
+        strategy.entry("BM2 L", strategy.long, qty=qty, limit=limitPx)
+        strategy.exit("BM2 L X", from_entry="BM2 L", stop=stopPx, limit=tpPx)
+else if flat
+    strategy.cancel("BM2 L")
 
-// ─────────────────────────────── PENDING-ORDER LIFECYCLE (limit only) ──────
-filled = strategy.position_size != 0
-if filled
-    pendDir := 0
+armedShort = readyCommon and close > vwap + armZ * sigma and not shortBlocked
+if armedShort
+    limitPx = math.max(vwap + fillZ * sigma, close + 2 * syminfo.mintick)
+    stopPx  = limitPx + (stopZ - fillZ) * sigma
+    tpPx    = vwap + tpZ * sigma
+    qty     = f_qty(limitPx, stopPx)
+    if tpPx < limitPx - syminfo.mintick and qty > 0
+        shortStopPx := stopPx
+        strategy.entry("BM2 S", strategy.short, qty=qty, limit=limitPx)
+        strategy.exit("BM2 S X", from_entry="BM2 S", stop=stopPx, limit=tpPx)
+else if flat
+    strategy.cancel("BM2 S")
 
-if pendDir != 0 and not filled
-    expired      = bar_index - pendBar >= expiryBars
-    // Setup death: price closed through the stop zone before filling us,
-    // or ran to target without us — stand down either way.
-    blownShort   = pendDir == -1 and (close > pendSL or low  <= pendTP)
-    blownLong    = pendDir ==  1 and (close < pendSL or high >= pendTP)
-    if expired or blownShort or blownLong
-        strategy.cancel("BM Short")
-        strategy.cancel("BM Long")
-        pendDir := 0
-        label.new(bar_index, close, "✕ cancelled", style=label.style_label_left,
-             color=color.new(color.gray, 40), textcolor=color.white, size=size.tiny)
+if armedLong and not armedLong[1]
+    alert("BOMB v2 LONG armed | " + syminfo.ticker +
+         " | limit=" + str.tostring(vwap - fillZ * sigma) +
+         " | vwap="  + str.tostring(vwap) +
+         " | sigma=" + str.tostring(sigma), alert.freq_once_per_bar_close)
+if armedShort and not armedShort[1]
+    alert("BOMB v2 SHORT armed | " + syminfo.ticker +
+         " | limit=" + str.tostring(vwap + fillZ * sigma) +
+         " | vwap="  + str.tostring(vwap) +
+         " | sigma=" + str.tostring(sigma), alert.freq_once_per_bar_close)
 
-// ───────────────────────────────────────────────── PERFORMANCE PANEL ───────
-var table stats = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 20),
+// ────────────────────────────── IN-TRADE MANAGEMENT (TRAILING MEAN TP) ─────
+// Stop is FROZEN at entry (risk is fixed); the profit target trails the
+// living mean — VWAP keeps moving, and so does fair value.
+if strategy.position_size > 0
+    strategy.exit("BM2 L X", from_entry="BM2 L", stop=longStopPx, limit=vwap - tpZ * sigma)
+if strategy.position_size < 0
+    strategy.exit("BM2 S X", from_entry="BM2 S", stop=shortStopPx, limit=vwap + tpZ * sigma)
+
+// Time stop: the reversion thesis has a half-life. If the snap-back hasn't
+// happened in maxHold bars, the information content is gone — scratch it.
+int entryBar = na
+if strategy.opentrades > 0
+    entryBar := strategy.opentrades.entry_bar_index(strategy.opentrades - 1)
+if useTimeStop and not na(entryBar) and bar_index - entryBar >= maxHold
+    strategy.close_all(comment="Time stop")
+
+// Day-trading discipline: nothing survives the session.
+if flatEOD and not inSession
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment="EOD flat")
+
+// ───────────────────────────────────────────────────────────── VISUALS ─────
+plotVal(float v) => showBands and statsOK ? v : na
+
+pVwap = plot(plotVal(vwap), "VWAP", color=color.new(color.orange, 0), linewidth=2)
+pArmU = plot(plotVal(vwap + armZ * sigma), "Arm +σ", color=color.new(color.red, 60))
+pFilU = plot(plotVal(vwap + fillZ * sigma), "Fill +σ", color=color.new(color.red, 30))
+pArmD = plot(plotVal(vwap - armZ * sigma), "Arm −σ", color=color.new(color.teal, 60))
+pFilD = plot(plotVal(vwap - fillZ * sigma), "Fill −σ", color=color.new(color.teal, 30))
+fill(pArmU, pFilU, color=color.new(color.red, 90))
+fill(pArmD, pFilD, color=color.new(color.teal, 90))
+plot(showBands and statsOK ? vwap + stopZ * sigma : na, "Stop +σ", color=color.new(color.gray, 70), style=plot.style_circles)
+plot(showBands and statsOK ? vwap - stopZ * sigma : na, "Stop −σ", color=color.new(color.gray, 70), style=plot.style_circles)
+
+bgcolor(showRegime and inSession and statsOK and regimeOK ? color.new(color.teal, 96) : na)
+bgcolor(longBlocked or shortBlocked ? color.new(color.red, 96) : na)
+
+// ─────────────────────────────────────────────────── PERFORMANCE PANEL ─────
+var table stats = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 20),
      border_color=color.new(color.gray, 60), border_width=1)
 if showStats and barstate.islast
-    wins   = strategy.wintrades
-    losses = strategy.losstrades
     total  = strategy.closedtrades
+    wins   = strategy.wintrades
     winPct = total > 0 ? 100.0 * wins / total : 0.0
-    avgW   = wins   > 0 ? strategy.grossprofit / wins  : 0.0
-    avgL   = losses > 0 ? strategy.grossloss  / losses : 0.0
-    rlzRR  = avgL > 0 ? avgW / avgL : 0.0
-    txt(c, r, s, hl) =>
-        table.cell(stats, c, r, s, text_color=hl ? color.yellow : color.white, text_size=size.small)
-    txt(0, 0, "💣 BOMB MARKET", true),            txt(1, 0, str.tostring(rrTarget, "#.#") + "R target", true)
-    txt(0, 1, "Trades", false),                   txt(1, 1, str.tostring(total), false)
-    txt(0, 2, "Win rate", false),                 txt(1, 2, str.tostring(winPct, "#.#") + "%", false)
-    txt(0, 3, "Realized R:R", false),             txt(1, 3, "1 : " + str.tostring(rlzRR, "#.#"), false)
-    txt(0, 4, "Net profit", false),               txt(1, 4, str.tostring(strategy.netprofit, "#.##"), false)
-    txt(0, 5, "Max drawdown", false),             txt(1, 5, str.tostring(strategy.max_drawdown, "#.##"), false)
-
-plot(useBias ? htfEma : na, "HTF bias EMA", color=color.new(color.orange, 40), linewidth=2)
+    pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    avgTrd = total > 0 ? strategy.netprofit / total : 0.0
+    table.cell(stats, 0, 0, "💣 BOMB v2", text_color=color.yellow, text_size=size.small)
+    table.cell(stats, 1, 0, "liquidity provision", text_color=color.yellow, text_size=size.small)
+    table.cell(stats, 0, 1, "Trades", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 1, str.tostring(total), text_color=color.white, text_size=size.small)
+    table.cell(stats, 0, 2, "Win rate", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 2, str.tostring(winPct, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(stats, 0, 3, "Profit factor", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 3, str.tostring(pf, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(stats, 0, 4, "Avg trade", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 4, str.tostring(avgTrd, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(stats, 0, 5, "Max drawdown", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 5, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(stats, 0, 6, "Regime now", text_color=color.white, text_size=size.small)
+    table.cell(stats, 1, 6, regimeOK ? "FADE ON (ER " + str.tostring(er, "#.##") + ")" : "STAND DOWN (ER " + str.tostring(er, "#.##") + ")",
+         text_color=regimeOK ? color.teal : color.red, text_size=size.small)
