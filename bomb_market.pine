@@ -1,0 +1,208 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  BOMB MARKET — Reverse-Engineered Strategy
+//
+//  Concept (inferred from published trade screenshots on XAUUSD, EURUSD,
+//  GBPUSD, USDJPY, GBPCHF across 1m → 1D):
+//
+//    1. Price sweeps a pool of liquidity (takes out a prior swing low/high
+//       with a wick) and immediately departs with an explosive, displaced
+//       impulse — the "bomb" going off.
+//    2. A narrow zone is drawn at the origin of that impulse:
+//       from the wick extreme (distal edge) to the candle body (proximal
+//       edge). This is the "BOMB MARKET" band seen on the charts.
+//    3. When price later returns into the band, a trade is taken in the
+//       direction of the original impulse (demand band → long,
+//       supply band → short).
+//    4. Stop loss sits a few ticks beyond the distal (wick) edge — this is
+//       what produces the extreme 1:15 … 1:50+ reward-to-risk ratios.
+//    5. Target is a fixed R-multiple (the screenshots show opposing
+//       structure/liquidity levels that equate to ~7R…50R).
+//
+//  NOTE: the marketing R/R numbers rely on razor-thin stops. On real spreads
+//  a 0.2-pip stop is untradeable — see docs/BOMB_MARKET_ANALYSIS.md.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("Bomb Market [Reverse-Engineered]",
+     shorttitle          = "Bomb Market 💣",
+     overlay             = true,
+     initial_capital     = 10000,
+     pyramiding          = 0,
+     calc_on_every_tick  = false,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0.0,
+     max_boxes_count     = 500,
+     max_labels_count    = 500,
+     max_lines_count     = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpZ = "💣 Bomb Zone Detection"
+swingLen    = input.int(5,     "Swing pivot length",                minval = 2,             group = grpZ, tooltip = "Bars on each side used to confirm the swing extreme where the bomb detonates.")
+liqLookback = input.int(20,    "Liquidity lookback (bars)",         minval = 5,             group = grpZ, tooltip = "The swing must SWEEP the lowest low / highest high of this many prior bars (stop-hunt wick).")
+dispMult    = input.float(1.5, "Displacement filter (× ATR)",       minval = 0.5, step=0.1, group = grpZ, tooltip = "By pivot confirmation, price must have exploded at least this many ATRs away from the swept extreme.")
+atrLen      = input.int(14,    "ATR length",                                                group = grpZ)
+zoneMode    = input.string("Wick", "Zone thickness", options = ["Wick", "Body", "Full candle"], group = grpZ, tooltip = "Wick = wick extreme → candle body (matches the thin bands in the screenshots). Body = full body added. Full candle = entire anchor candle.")
+maxZoneATR  = input.float(1.0, "Max zone height (× ATR, 0 = off)",  minval = 0.0, step=0.1, group = grpZ)
+zoneLife    = input.int(300,   "Zone expiry (bars)",                minval = 10,            group = grpZ)
+maxZones    = input.int(6,     "Max tracked zones",                 minval = 1, maxval = 20, group = grpZ)
+
+grpT = "Trade Management"
+tradeDir    = input.string("Both", "Direction", options = ["Both", "Long only", "Short only"], group = grpT)
+rrTarget    = input.float(15.0, "Target (R multiple)",       minval = 1.0,  step = 0.5,  group = grpT, tooltip = "Screenshots show ~7R on 2H, ~16R on 4H, ~50R on scalps.")
+slBufTicks  = input.float(2.0,  "Stop buffer beyond wick (ticks)", minval = 0.0,          group = grpT)
+riskPct     = input.float(1.0,  "Risk per trade (% equity)", minval = 0.05, step = 0.05, group = grpT)
+useTrend    = input.bool(false, "Filter by EMA trend",                                    group = grpT)
+trendLen    = input.int(200,    "Trend EMA length",          minval = 5,                  group = grpT)
+
+grpV = "Visuals"
+colDemand = input.color(color.new(#089981, 0), "Demand zone",  group = grpV)
+colSupply = input.color(color.new(#b22833, 0), "Supply zone",  group = grpV)
+colFilled = input.color(color.new(#e2b93b, 0), "Traded zone",  group = grpV)
+colDead   = input.color(color.new(#787b86, 0), "Dead zone",    group = grpV)
+showStats = input.bool(true, "Show stats table", group = grpV)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+atr  = ta.atr(atrLen)
+emaT = ta.ema(close, trendLen)
+
+pl = ta.pivotlow(low,  swingLen, swingLen)
+ph = ta.pivothigh(high, swingLen, swingLen)
+
+lowestBefore  = ta.lowest(low,   liqLookback)
+highestBefore = ta.highest(high, liqLookback)
+
+// Sweep: the pivot wick took out the liquidity resting under/over the prior window.
+sweptLow  = not na(pl) and pl < lowestBefore[swingLen + 1]
+sweptHigh = not na(ph) and ph > highestBefore[swingLen + 1]
+
+// Displacement: by confirmation the market has already exploded away from the extreme.
+newDemand = sweptLow  and (close - pl) >= dispMult * atr
+newSupply = sweptHigh and (ph - close) >= dispMult * atr
+
+// ── Zone object ──────────────────────────────────────────────────────────────
+type Zone
+    box    bx
+    float  distal      // wick extreme  → stop side
+    float  proximal    // entry edge
+    int    dir         // 1 = demand (long), -1 = supply (short)
+    int    born
+    string id
+    bool   filled
+
+var array<Zone> zones = array.new<Zone>()
+var Zone working = na   // the single zone that currently owns the resting limit order
+
+newZone(int dir, int o) =>
+    float distal   = dir == 1 ? low[o] : high[o]
+    float bodyNear = dir == 1 ? math.min(open[o], close[o]) : math.max(open[o], close[o])
+    float proximal = zoneMode == "Wick"  ? bodyNear :
+                     zoneMode == "Body"  ? (dir == 1 ? math.max(open[o], close[o]) : math.min(open[o], close[o])) :
+                     (dir == 1 ? high[o] : low[o])
+    if maxZoneATR > 0
+        proximal := dir == 1 ? math.min(proximal, distal + maxZoneATR * atr) : math.max(proximal, distal - maxZoneATR * atr)
+    float minH = 2 * syminfo.mintick
+    proximal := dir == 1 ? math.max(proximal, distal + minH) : math.min(proximal, distal - minH)
+    color zc = dir == 1 ? colDemand : colSupply
+    box bx = box.new(left = bar_index - o, top = dir == 1 ? proximal : distal, right = bar_index, bottom = dir == 1 ? distal : proximal, border_color = color.new(zc, 35), border_width = 1, bgcolor = color.new(zc, 72), text = "💣 BOMB MARKET 💣", text_color = color.new(color.white, 25), text_size = size.tiny, text_halign = text.align_center, text_valign = text.align_center)
+    Zone.new(bx, distal, proximal, dir, bar_index, (dir == 1 ? "BombL-" : "BombS-") + str.tostring(bar_index - o), false)
+
+deactivate(Zone z, color c) =>
+    z.bx.set_bgcolor(color.new(c, 85))
+    z.bx.set_border_color(color.new(c, 55))
+    z.bx.set_text_color(color.new(c, 45))
+    z.bx.set_right(bar_index)
+
+// Pick the nearest tradeable zone in front of price.
+pickBest() =>
+    Zone  best = na
+    float bestDist = na
+    for z in zones
+        bool dirOk   = (z.dir == 1 and tradeDir != "Short only") or (z.dir == -1 and tradeDir != "Long only")
+        bool trendOk = not useTrend or (z.dir == 1 ? close > emaT : close < emaT)
+        float dist   = z.dir == 1 ? close - z.proximal : z.proximal - close
+        if dirOk and trendOk and dist > 0 and (na(bestDist) or dist < bestDist)
+            best     := z
+            bestDist := dist
+    best
+
+// ── 1) Fill / same-bar-round-trip detection ─────────────────────────────────
+bool openedNow = strategy.position_size != 0 and strategy.position_size[1] == 0
+bool flashNow  = strategy.position_size == 0 and strategy.position_size[1] == 0 and strategy.closedtrades > strategy.closedtrades[1]
+if (openedNow or flashNow) and not na(working)
+    working.filled := true
+    working.bx.set_bgcolor(color.new(colFilled, 60))
+    working.bx.set_border_color(colFilled)
+    working.bx.set_right(bar_index)
+    int idx = -1
+    for [j, z] in zones
+        if z.id == working.id
+            idx := j
+    if idx >= 0
+        zones.remove(idx)
+    alert("💣 Bomb Market: limit filled on " + syminfo.ticker + " (" + working.id + ")", alert.freq_once_per_bar)
+    working := na
+
+// ── 2) Zone creation ─────────────────────────────────────────────────────────
+if newDemand
+    zones.push(newZone(1, swingLen))
+if newSupply
+    zones.push(newZone(-1, swingLen))
+while zones.size() > maxZones
+    Zone old = zones.shift()
+    deactivate(old, colDead)
+    if not na(working) and working.id == old.id
+        strategy.cancel(old.id)
+        working := na
+
+// ── 3) Expiry & violation ────────────────────────────────────────────────────
+int i = 0
+while i < zones.size()
+    Zone z = zones.get(i)
+    bool expired  = bar_index - z.born > zoneLife
+    bool violated = z.dir == 1 ? low < z.distal : high > z.distal
+    if expired or violated
+        deactivate(z, colDead)
+        if not na(working) and working.id == z.id
+            strategy.cancel(z.id)
+            working := na
+        zones.remove(i)
+    else
+        z.bx.set_right(bar_index)
+        i += 1
+
+// ── 4) Order management: one resting limit at the nearest valid zone ─────────
+if strategy.position_size == 0
+    Zone best = pickBest()
+    if not na(working) and (na(best) or best.id != working.id)
+        strategy.cancel(working.id)
+        working := na
+    if not na(best) and na(working)
+        float stopPx = best.dir == 1 ? best.distal - slBufTicks * syminfo.mintick : best.distal + slBufTicks * syminfo.mintick
+        float risk   = math.abs(best.proximal - stopPx)
+        float qty    = strategy.equity * (riskPct / 100.0) / (risk * syminfo.pointvalue)
+        if risk > 0 and qty > 0
+            float tpPx = best.dir == 1 ? best.proximal + rrTarget * risk : best.proximal - rrTarget * risk
+            strategy.entry(best.id, best.dir == 1 ? strategy.long : strategy.short, qty = qty, limit = best.proximal)
+            strategy.exit("x-" + best.id, from_entry = best.id, stop = stopPx, limit = tpPx)
+            working := best
+
+// ── Visual extras ────────────────────────────────────────────────────────────
+plot(useTrend ? emaT : na, "Trend EMA", color = color.new(color.orange, 30))
+
+if showStats and barstate.islast
+    var table t = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
+    winRate = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+    pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    t.cell(0, 0, "💣 Bomb Market", text_color = color.yellow, text_size = size.small)
+    t.cell(1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.white, text_size = size.small)
+    t.cell(0, 1, "Closed trades",  text_color = color.white,  text_size = size.small)
+    t.cell(1, 1, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.small)
+    t.cell(0, 2, "Win rate",       text_color = color.white,  text_size = size.small)
+    t.cell(1, 2, na(winRate) ? "—" : str.tostring(winRate, "#.#") + " %", text_color = color.white, text_size = size.small)
+    t.cell(0, 3, "Profit factor",  text_color = color.white,  text_size = size.small)
+    t.cell(1, 3, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = color.white, text_size = size.small)
+    t.cell(0, 4, "Net profit",     text_color = color.white,  text_size = size.small)
+    t.cell(1, 4, str.tostring(strategy.netprofit, "#.##"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(newDemand, "New Demand Bomb Zone", "💣 Bullish Bomb zone printed — watch for the retest")
+alertcondition(newSupply, "New Supply Bomb Zone", "💣 Bearish Bomb zone printed — watch for the retest")
