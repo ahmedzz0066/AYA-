@@ -401,7 +401,7 @@ obIndex(bool bull) =>
         if (bull and bearCandle) or (not bull and not bearCandle)
             idx := i
             break
-    idx
+    [idx >= 0, math.max(idx, 2)]        // flag + always-safe offset (never negative)
 
 obValid(int i, bool bull) =>
     float r  = math.max(high[i] - low[i], syminfo.mintick)
@@ -411,14 +411,30 @@ obValid(int i, bool bull) =>
     bool volOk = not obUseVolRank or not hasVol or nz(volRank[i], 100) >= obVolRank
     bd / r >= obFloor and volOk and oppWick / r <= obOppWickMax and totWick / r <= obTotWickMax and r >= 0.5 * atr
 
+obGeometry(int i) =>
+    [obUseWicks ? high[i] : math.max(open[i], close[i]),
+     obUseWicks ? low[i] : math.min(open[i], close[i]),
+     nz(volRank[i], 100)]
+
+// History-dependent lookups are evaluated on EVERY bar, for both directions,
+// so their internal series stay consistent (no conditional-execution drift).
+[obFoundBull, obIdxBull] = obIndex(true)
+[obFoundBear, obIdxBear] = obIndex(false)
+obOkBull = obValid(obIdxBull, true)
+obOkBear = obValid(obIdxBear, false)
+[obTopBull, obBotBull, obVolBull] = obGeometry(obIdxBull)
+[obTopBear, obBotBear, obVolBear] = obGeometry(obIdxBear)
+
 if obEnable and confirmed and (newBullFVG or newBearFVG)
-    bull = newBullFVG
-    i = obIndex(bull)
-    if i >= 0 and obValid(i, bull)
-        float zt = obUseWicks ? high[i] : math.max(open[i], close[i])
-        float zb = obUseWicks ? low[i] : math.min(open[i], close[i])
+    bull  = newBullFVG
+    found = bull ? obFoundBull : obFoundBear
+    ok    = bull ? obOkBull : obOkBear
+    if found and ok
+        i = bull ? obIdxBull : obIdxBear
+        float zt = bull ? obTopBull : obTopBear
+        float zb = bull ? obBotBull : obBotBear
         sweepOk = bull ? bar_index - lastSweepLoBar <= obSweepLookbk : bar_index - lastSweepHiBar <= obSweepLookbk
-        volT1 = obUseVolRank and hasVol and nz(volRank[i], 100) >= obVolRankT1
+        volT1 = obUseVolRank and hasVol and (bull ? obVolBull : obVolBear) >= obVolRankT1
         Zone z = Zone.new()
         z.kind    := "OB"
         z.bull    := bull
@@ -490,18 +506,22 @@ originLevel(bool bullSetup) =>
             break
     cisdOriginMode ? open[idx] : bullSetup ? high : low
 
+// evaluated every bar for both directions ⇒ consistent history inside the walk-back
+originBull = originLevel(true)
+originBear = originLevel(false)
+
 if cisdEnable and confirmed
     if sweptLow
         raidBar := bar_index
         raidDir := 1
         raidExtrm := low
-        cisdOrig := originLevel(true)
+        cisdOrig := originBull
         cisdArmed := true
     else if sweptHigh
         raidBar := bar_index
         raidDir := -1
         raidExtrm := high
-        cisdOrig := originLevel(false)
+        cisdOrig := originBear
         cisdArmed := true
 
     if cisdArmed and bar_index - raidBar > cisdWindow
