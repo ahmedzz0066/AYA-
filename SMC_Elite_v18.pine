@@ -1,0 +1,1007 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  SMC ELITE v18 — ELITE LOGIC ENGINE 2.0
+//  Quality over quantity: institutional-grade filtering of OB / FVG / IFVG /
+//  CISD driven by ONE synchronized structure state machine.
+//
+//  NON-REPAINT CONTRACT
+//    • every state transition is gated on barstate.isconfirmed
+//    • all HTF data uses lookahead_off and [1]+ offsets (closed HTF bars only)
+//    • drawings are re-synced from state; state is never rewritten backwards
+// ════════════════════════════════════════════════════════════════════════════
+indicator("SMC Elite v18 — Elite Logic Engine 2.0", "SMC Elite v18", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+
+// ═══════════════════════════ ① GENERAL ═══════════════════════════
+gGen       = "① General"
+themeSel   = input.string("Royal", "Color Theme", options = ["Royal", "Default", "Neon"], group = gGen)
+maxVisible = input.int(6, "Zone Display Limit (nearest to price)", minval = 1, maxval = 30, group = gGen,
+     tooltip = "Only the N zones closest to price are drawn. Hidden zones keep full logic state.")
+zoneExtend = input.int(5, "Zone Projection (bars)", minval = 0, maxval = 100, group = gGen)
+showPanel  = input.bool(true, "Show Trade Guide Panel", group = gGen)
+panelPos   = input.string("Top Right", "Panel Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group = gGen)
+panelSize  = input.string("Small", "Panel Text Size", options = ["Tiny", "Small", "Normal"], group = gGen)
+showPlan   = input.bool(true, "Show Entry / SL / TP Lines", group = gGen)
+showRRBox  = input.bool(false, "Show Risk / Reward Box", group = gGen)
+
+// ═══════════════════════════ ② STRUCTURE ═══════════════════════════
+gStr          = "② Structure"
+showStruct    = input.bool(true, "Show BOS / CHoCH", group = gStr)
+swingLen      = input.int(10, "Swing Length", minval = 2, maxval = 50, group = gStr)
+useAdaptSwing = input.bool(true, "Adaptive ATR Swing Filter", group = gStr,
+     tooltip = "Base 0.4*ATR — tightened x1.25 in high volatility, relaxed x0.75 in low volatility.")
+swingAtrMult  = input.float(0.4, "Swing ATR Filter (base)", minval = 0.0, maxval = 2.0, step = 0.05, group = gStr)
+showLiqLines  = input.bool(true, "Show Swept Structure Levels", group = gStr)
+
+// ═══════════════════════════ ③ ORDER BLOCKS ═══════════════════════════
+gOB           = "③ Order Blocks"
+obEnable      = input.bool(true, "Enable Order Blocks", group = gOB)
+obUseWicks    = input.bool(true, "Zone From Wicks (off = body only)", group = gOB)
+obBodyFloor   = input.float(0.65, "Body / Range Floor", minval = 0.3, maxval = 0.95, step = 0.01, group = gOB)
+obBodyFloorHV = input.float(0.70, "Body / Range Floor (high volatility)", minval = 0.3, maxval = 0.95, step = 0.01, group = gOB)
+obUseVolRank  = input.bool(true, "Relative Volume Ranking Filter", group = gOB)
+obVolRank     = input.float(70, "Volume Percentile — candidate", minval = 0, maxval = 100, step = 5, group = gOB)
+obVolRankT1   = input.float(85, "Volume Percentile — Tier 1", minval = 0, maxval = 100, step = 5, group = gOB)
+obOppWickMax  = input.float(0.25, "Opposing Wick Max (% of range)", minval = 0.05, maxval = 0.9, step = 0.05, group = gOB)
+obTotWickMax  = input.float(0.35, "Total Wick Max (% of range)", minval = 0.05, maxval = 0.9, step = 0.05, group = gOB)
+obActivateATR = input.float(0.75, "Activation Buffer (ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = gOB,
+     tooltip = "A zone must displace this far away before a retest counts. Immediate tests kill the zone.")
+obKillBars    = input.int(3, "Immediate-Test Kill Window (bars)", minval = 0, maxval = 20, group = gOB)
+obStaleBars   = input.int(100, "Stale Age → wick-touch mitigation", minval = 10, maxval = 1000, group = gOB)
+obExpireBars  = input.int(250, "Hard Expiry (bars)", minval = 20, maxval = 2000, group = gOB)
+obBosLookback = input.int(20, "Tier 1 — BOS window (bars)", minval = 1, maxval = 100, group = gOB)
+obSweepLookbk = input.int(15, "Tier 1 — Sweep window (bars)", minval = 1, maxval = 100, group = gOB)
+obReqHtfAPlus = input.bool(true, "Tier 1 requires HTF alignment", group = gOB)
+obMinScoreT1  = input.int(85, "Tier 1 — minimum score", minval = 0, maxval = 100, group = gOB)
+
+// ═══════════════════════════ ④ FVG / IFVG ═══════════════════════════
+gFVG          = "④ FVG / IFVG"
+fvgEnable     = input.bool(true, "Enable Fair Value Gaps", group = gFVG)
+fvgAtrMult    = input.float(0.5, "Min Gap Size (ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = gFVG)
+fvgBodyRatio  = input.float(0.75, "Displacement Body Ratio", minval = 0.3, maxval = 0.95, step = 0.01, group = gFVG)
+fvgUseVolRank = input.bool(true, "Displacement Volume Filter", group = gFVG)
+fvgVolRank    = input.float(60, "Displacement Volume Percentile", minval = 0, maxval = 100, step = 5, group = gFVG)
+fvgHalfMode   = input.bool(true, "50% Zone Mode (Entry → CE)", group = gFVG)
+ifvgEnable    = input.bool(false, "Enable Inverted FVG (IFVG)", group = gFVG)
+ifvgMinScore  = input.int(60, "IFVG — minimum score", minval = 0, maxval = 100, group = gFVG)
+ifvgSweepBars = input.int(10, "IFVG — sweep confluence window", minval = 1, maxval = 50, group = gFVG)
+ifvgExtend    = input.int(5, "IFVG projection (bars)", minval = 0, maxval = 50, group = gFVG)
+
+// ═══════════════════════════ ⑤ LIQUIDITY ═══════════════════════════
+gLiq         = "⑤ Liquidity"
+liqEnable    = input.bool(true, "Enable Liquidity Engine", group = gLiq)
+liqPostSweep = input.bool(true, "Show levels only AFTER a sweep", group = gLiq)
+showIDM      = input.bool(true, "Show Inducement (IDM) sweeps", group = gLiq)
+mergeOBFVG   = input.bool(true, "Merge overlapping OB + FVG", group = gLiq)
+mergeMinOvl  = input.float(0.5, "Merge overlap threshold", minval = 0.1, maxval = 1.0, step = 0.05, group = gLiq)
+
+// ═══════════════════════════ ⑥ CISD ═══════════════════════════
+gCISD          = "⑥ CISD"
+cisdEnable     = input.bool(true, "Enable CISD", group = gCISD)
+cisdOriginMode = input.bool(true, "Origin Break Mode (impulse origin)", group = gCISD)
+cisdTrendFilt  = input.bool(true, "HTF Trend Filter (suppress counter-bias)", group = gCISD)
+cisdBodyFloor  = input.float(0.55, "Trigger Candle Body Ratio", minval = 0.3, maxval = 0.95, step = 0.01, group = gCISD)
+cisdPullbkATR  = input.float(0.25, "Anti-early Pullback (ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = gCISD)
+cisdWindow     = input.int(20, "Max bars from raid to trigger", minval = 2, maxval = 100, group = gCISD)
+cisdDiamond    = input.bool(true, "Diamond FVG (A+) after CISD", group = gCISD)
+
+// ═══════════════════════════ ⑦ CONFIRMATION ═══════════════════════════
+gConf        = "⑦ Confirmation"
+confEnable   = input.bool(true, "Enable Confirmation Engine", group = gConf)
+confTouchATR = input.float(0.10, "Touch tolerance at final edge (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = gConf)
+confRejBody  = input.float(0.50, "Rejection candle body ratio", minval = 0.2, maxval = 0.95, step = 0.05, group = gConf)
+entryBandATR = input.float(0.35, "Direct-entry band (ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = gConf)
+pendingBars  = input.int(20, "Pending entry / stale touch expiry (bars)", minval = 1, maxval = 200, group = gConf)
+switchMargin = input.int(15, "Decision Assistant — switch margin", minval = 0, maxval = 60, group = gConf,
+     tooltip = "A new setup must be CONFIRMED and this many points stronger before the panel says SWITCH.")
+
+// ═══════════════════════════ ⑧ HTF CONFLUENCE ═══════════════════════════
+gHTF       = "⑧ HTF"
+htfEnable  = input.bool(true, "Enable HTF Confluence", group = gHTF)
+htfAuto    = input.bool(true, "Auto HTF selection", group = gHTF)
+htf1Manual = input.timeframe("60", "HTF 1", group = gHTF)
+htf2Manual = input.timeframe("240", "HTF 2", group = gHTF)
+htfOverlap = input.float(0.60, "Overlap required for ★ upgrade", minval = 0.1, maxval = 1.0, step = 0.05, group = gHTF)
+htfDraw    = input.bool(true, "Draw HTF POI zones", group = gHTF)
+
+// ═══════════════════════════ ⑨ RISK ═══════════════════════════
+gRisk       = "⑨ Risk & Money Management"
+riskEnable  = input.bool(true, "Enable Risk Engine", group = gRisk)
+acctSize    = input.float(10000, "Account Size", minval = 1, group = gRisk)
+riskPct     = input.float(1.0, "Risk per trade (%)", minval = 0.01, maxval = 100, step = 0.1, group = gRisk)
+slBufferATR = input.float(0.15, "SL buffer beyond zone (ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = gRisk)
+tp1R        = input.float(2.0, "TP1 (R multiple)", minval = 0.5, maxval = 20, step = 0.5, group = gRisk)
+tp2R        = input.float(3.0, "TP2 (R multiple)", minval = 0.5, maxval = 20, step = 0.5, group = gRisk)
+lotStep     = input.float(0.01, "Lot Step", minval = 0.0001, step = 0.01, group = gRisk)
+minLot      = input.float(0.01, "Min Lot", minval = 0.0, step = 0.01, group = gRisk)
+maxLot      = input.float(100.0, "Max Lot", minval = 0.01, group = gRisk)
+vppOverride = input.float(0.0, "Value per point per lot (0 = auto)", minval = 0, group = gRisk)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THEME ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+cBullOB = switch themeSel
+    "Royal" => #8A8F9A
+    "Neon"  => #00E5FF
+    => #9598A1
+cBearOB = switch themeSel
+    "Royal" => #B03A48
+    "Neon"  => #FF2E63
+    => #D9534F
+cBullFVG = switch themeSel
+    "Royal" => #C8A96A
+    "Neon"  => #39FF14
+    => #2E7D32
+cBearFVG = switch themeSel
+    "Royal" => #5A6E8C
+    "Neon"  => #FF00E5
+    => #C62828
+cBullStr = switch themeSel
+    "Royal" => #5A6E8C
+    "Neon"  => #00E5FF
+    => #2962FF
+cBearStr = switch themeSel
+    "Royal" => #B03A48
+    "Neon"  => #FF2E63
+    => #E91E63
+cIfvgBull = #FF9800
+cIfvgBear = #9C27B0
+cCisd     = #8A8F9A
+cText     = #D1D4DC
+
+panelPosition = switch panelPos
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    => position.bottom_left
+panelTxtSize = switch panelSize
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CORE SERIES
+// ════════════════════════════════════════════════════════════════════════════
+atr       = ta.atr(14)
+rng       = math.max(high - low, syminfo.mintick)
+bodyRat   = math.abs(close - open) / rng
+volRank   = nz(ta.percentrank(nz(volume, 0), 50), 100)
+atrRank   = nz(ta.percentrank(atr, 200), 50)
+hasVol    = not na(volume) and volume > 0
+confirmed = barstate.isconfirmed
+
+obFloor  = atrRank > 70 ? obBodyFloorHV : obBodyFloor
+swingAdj = useAdaptSwing ? (atrRank > 70 ? swingAtrMult * 1.25 : atrRank < 30 ? swingAtrMult * 0.75 : swingAtrMult) : swingAtrMult
+swingMin = swingAdj * atr
+
+// ════════════════════════════════════════════════════════════════════════════
+//  HTF DATA — closed bars only ⇒ non-repainting
+// ════════════════════════════════════════════════════════════════════════════
+tfSec    = timeframe.in_seconds(timeframe.period)
+autoHtf1 = tfSec <= 60 ? "15" : tfSec <= 300 ? "60" : tfSec <= 900 ? "240" : tfSec <= 3600 ? "D" : tfSec <= 14400 ? "D" : "W"
+autoHtf2 = tfSec <= 60 ? "60" : tfSec <= 300 ? "240" : tfSec <= 900 ? "D" : tfSec <= 3600 ? "W" : tfSec <= 14400 ? "W" : "M"
+htf1     = htfAuto ? autoHtf1 : htf1Manual
+htf2     = htfAuto ? autoHtf2 : htf2Manual
+
+[h1hi1, h1lo1, h1hi3, h1lo3, h1cl1, h1ema] = request.security(syminfo.tickerid, htf1,
+     [high[1], low[1], high[3], low[3], close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_off)
+[h2hi1, h2lo1, h2hi3, h2lo3, h2cl1, h2ema] = request.security(syminfo.tickerid, htf2,
+     [high[1], low[1], high[3], low[3], close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_off)
+
+htfBias = 0
+if htfEnable
+    b1 = na(h1cl1) or na(h1ema) ? 0 : h1cl1 > h1ema ? 1 : -1
+    b2 = na(h2cl1) or na(h2ema) ? 0 : h2cl1 > h2ema ? 1 : -1
+    htfBias := b1 + b2 > 0 ? 1 : b1 + b2 < 0 ? -1 : 0
+
+var float h1Top = na
+var float h1Bot = na
+var int   h1Dir = 0
+var float h2Top = na
+var float h2Bot = na
+var int   h2Dir = 0
+if htfEnable and confirmed
+    if not na(h1lo1) and not na(h1hi3)
+        if h1lo1 > h1hi3
+            h1Top := h1lo1
+            h1Bot := h1hi3
+            h1Dir := 1
+        else if h1hi1 < h1lo3
+            h1Top := h1lo3
+            h1Bot := h1hi1
+            h1Dir := -1
+    if not na(h2lo1) and not na(h2hi3)
+        if h2lo1 > h2hi3
+            h2Top := h2lo1
+            h2Bot := h2hi3
+            h2Dir := 1
+        else if h2hi1 < h2lo3
+            h2Top := h2lo3
+            h2Bot := h2hi1
+            h2Dir := -1
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TYPES
+// ════════════════════════════════════════════════════════════════════════════
+type Zone
+    string kind      = "OB"
+    bool   bull      = true
+    float  top       = na
+    float  bot       = na
+    float  prox      = na   // edge price touches first
+    float  dist      = na   // far edge
+    float  invalid   = na   // body close beyond this kills the zone
+    int    birth     = 0
+    int    score     = 0
+    bool   tier1     = false
+    bool   aplus     = false
+    bool   sweepOk   = false
+    bool   displOk   = false
+    bool   bosOk     = false
+    bool   htf       = false
+    string htfTag    = ""
+    bool   activated = false
+    bool   dead      = false
+    int    state     = 0    // 0 ACTIVE · 1 LEFT · 2 TOUCHED · 3 CONFIRMED
+    int    touchBar  = 0
+    bool   vis       = false
+    box    bx        = na
+    label  lb        = na
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PURE HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+overlapRatio(float aTop, float aBot, float bTop, float bBot) =>
+    float r = 0.0
+    if not na(aTop) and not na(bTop) and not na(aBot) and not na(bBot)
+        float inter = math.min(aTop, bTop) - math.max(aBot, bBot)
+        float small = math.min(aTop - aBot, bTop - bBot)
+        r := inter > 0 and small > 0 ? inter / small : 0.0
+    r
+
+bodyRatioAt(int i) =>
+    math.abs(close[i] - open[i]) / math.max(high[i] - low[i], syminfo.mintick)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ① STRUCTURE ENGINE — the single source of truth for every other module
+// ════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float swHigh = na
+var float swLow = na
+var int   swHighBar = 0
+var int   swLowBar = 0
+var bool  swHighBroken = false
+var bool  swLowBroken = false
+var int   trend = 0
+var int   lastBosBar = 0
+var int   lastBosDir = 0
+var int   lastSweepHiBar = -100000
+var int   lastSweepLoBar = -100000
+var float lastSweepHi = na
+var float lastSweepLo = na
+
+bosBull = false
+bosBear = false
+chochBull = false
+chochBear = false
+sweptHigh = false
+sweptLow = false
+
+if confirmed
+    // ── sweeps are measured against the CURRENT structural levels ──
+    if not na(swHigh) and not swHighBroken and high > swHigh and close < swHigh
+        sweptHigh := true
+        lastSweepHiBar := bar_index
+        lastSweepHi := swHigh
+    if not na(swLow) and not swLowBroken and low < swLow and close > swLow
+        sweptLow := true
+        lastSweepLoBar := bar_index
+        lastSweepLo := swLow
+
+    // ── structural breaks require a BODY close ──
+    if not na(swHigh) and not swHighBroken and close > swHigh
+        if trend >= 0
+            bosBull := true
+        else
+            chochBull := true
+        trend := 1
+        swHighBroken := true
+        lastBosBar := bar_index
+        lastBosDir := 1
+    if not na(swLow) and not swLowBroken and close < swLow
+        if trend <= 0
+            bosBear := true
+        else
+            chochBear := true
+        trend := -1
+        swLowBroken := true
+        lastBosBar := bar_index
+        lastBosDir := -1
+
+    // ── register new swings (ATR-validated; survival guaranteed by pivot delay) ──
+    if not na(ph) and math.abs(close - ph) >= swingMin
+        swHigh := ph
+        swHighBar := bar_index - swingLen
+        swHighBroken := false
+    if not na(pl) and math.abs(close - pl) >= swingMin
+        swLow := pl
+        swLowBar := bar_index - swingLen
+        swLowBroken := false
+
+// ── structure visuals ──
+if showStruct and (bosBull or bosBear or chochBull or chochBear)
+    isBull = bosBull or chochBull
+    lvl = isBull ? swHigh : swLow
+    line.new(isBull ? swHighBar : swLowBar, lvl, bar_index, lvl, xloc = xloc.bar_index,
+         color = isBull ? cBullStr : cBearStr, style = line.style_dashed, width = 1)
+    label.new(bar_index, lvl, chochBull or chochBear ? "CHoCH" : "BOS", xloc = xloc.bar_index,
+         style = isBull ? label.style_label_down : label.style_label_up,
+         color = color.new(isBull ? cBullStr : cBearStr, 20), textcolor = color.white, size = size.tiny)
+
+if showIDM and (sweptHigh or sweptLow)
+    label.new(bar_index, sweptHigh ? high : low, "IDM", xloc = xloc.bar_index,
+         style = sweptHigh ? label.style_label_down : label.style_label_up,
+         color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+
+if liqEnable and showLiqLines and (sweptHigh or sweptLow or not liqPostSweep)
+    if sweptHigh
+        line.new(swHighBar, lastSweepHi, bar_index, lastSweepHi, xloc = xloc.bar_index,
+             color = color.new(cBearStr, 40), style = line.style_dotted)
+    if sweptLow
+        line.new(swLowBar, lastSweepLo, bar_index, lastSweepLo, xloc = xloc.bar_index,
+             color = color.new(cBullStr, 40), style = line.style_dotted)
+
+// ── dealing range → premium / discount ──
+dealTop    = nz(swHigh, ta.highest(high, 50))
+dealBot    = nz(swLow, ta.lowest(low, 50))
+dealEq     = (dealTop + dealBot) / 2
+inPremium  = close > dealEq
+inDiscount = close < dealEq
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ZONE STORE
+// ════════════════════════════════════════════════════════════════════════════
+var array<Zone> zones = array.new<Zone>()
+
+addZone(Zone z) =>
+    array.push(zones, z)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ② FVG DETECTION — 0.5 ATR · 75% body · volume percentile
+// ════════════════════════════════════════════════════════════════════════════
+midBody  = bodyRatioAt(1)
+midVolOk = not fvgUseVolRank or not hasVol or nz(volRank[1], 100) >= fvgVolRank
+
+newBullFVG = false
+newBearFVG = false
+float fvgTop = na
+float fvgBot = na
+
+if fvgEnable and confirmed
+    if low > high[2] and (low - high[2]) >= fvgAtrMult * atr and midBody >= fvgBodyRatio and midVolOk
+        newBullFVG := true
+        fvgTop := low
+        fvgBot := high[2]
+    else if high < low[2] and (low[2] - high) >= fvgAtrMult * atr and midBody >= fvgBodyRatio and midVolOk
+        newBearFVG := true
+        fvgTop := low[2]
+        fvgBot := high
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ③ ORDER BLOCK DETECTION — Scorecard 2.0, anchored to the displacement leg
+//     (the OB is the last opposite candle ≤3 bars before the FVG ⇒ the
+//      "FVG within 2 candles" displacement gate is satisfied by construction)
+// ════════════════════════════════════════════════════════════════════════════
+obIndex(bool bull) =>
+    int idx = -1
+    for i = 2 to 4
+        bearCandle = close[i] < open[i]
+        if (bull and bearCandle) or (not bull and not bearCandle)
+            idx := i
+            break
+    idx
+
+obValid(int i, bool bull) =>
+    float r  = math.max(high[i] - low[i], syminfo.mintick)
+    float bd = math.abs(close[i] - open[i])
+    float oppWick = bull ? high[i] - math.max(open[i], close[i]) : math.min(open[i], close[i]) - low[i]
+    float totWick = r - bd
+    bool volOk = not obUseVolRank or not hasVol or nz(volRank[i], 100) >= obVolRank
+    bd / r >= obFloor and volOk and oppWick / r <= obOppWickMax and totWick / r <= obTotWickMax and r >= 0.5 * atr
+
+if obEnable and confirmed and (newBullFVG or newBearFVG)
+    bull = newBullFVG
+    i = obIndex(bull)
+    if i >= 0 and obValid(i, bull)
+        float zt = obUseWicks ? high[i] : math.max(open[i], close[i])
+        float zb = obUseWicks ? low[i] : math.min(open[i], close[i])
+        sweepOk = bull ? bar_index - lastSweepLoBar <= obSweepLookbk : bar_index - lastSweepHiBar <= obSweepLookbk
+        volT1 = obUseVolRank and hasVol and nz(volRank[i], 100) >= obVolRankT1
+        Zone z = Zone.new()
+        z.kind    := "OB"
+        z.bull    := bull
+        z.top     := zt
+        z.bot     := zb
+        z.prox    := bull ? zt : zb
+        z.dist    := bull ? zb : zt
+        z.invalid := bull ? zb : zt
+        z.birth   := bar_index - i
+        z.sweepOk := sweepOk
+        z.displOk := true
+        z.score   := (sweepOk ? 30 : 0) + 30 + (volT1 ? 15 : 0)
+        addZone(z)
+
+// ── register the FVG itself (after the OB so the merge pass can find it) ──
+if (newBullFVG or newBearFVG) and not na(fvgTop)
+    bull = newBullFVG
+    float ce = (fvgTop + fvgBot) / 2
+    float zt = fvgHalfMode ? (bull ? fvgTop : ce) : fvgTop
+    float zb = fvgHalfMode ? (bull ? ce : fvgBot) : fvgBot
+    merged = false
+    if mergeOBFVG
+        for zz in zones
+            if not zz.dead and zz.kind == "OB" and zz.bull == bull and bar_index - zz.birth <= 5
+                if overlapRatio(zz.top, zz.bot, zt, zb) >= mergeMinOvl
+                    zz.top   := math.max(zz.top, zt)
+                    zz.bot   := math.min(zz.bot, zb)
+                    zz.prox  := bull ? zz.top : zz.bot
+                    zz.dist  := bull ? zz.bot : zz.top
+                    zz.kind  := "OB+FVG"
+                    zz.score := math.min(100, zz.score + 10)
+                    merged   := true
+                    break
+    if not merged
+        sweepOk = bull ? bar_index - lastSweepLoBar <= obSweepLookbk : bar_index - lastSweepHiBar <= obSweepLookbk
+        Zone z = Zone.new()
+        z.kind    := "FVG"
+        z.bull    := bull
+        z.top     := zt
+        z.bot     := zb
+        z.prox    := bull ? zt : zb
+        z.dist    := bull ? zb : zt
+        z.invalid := ce
+        z.birth   := bar_index - 2
+        z.sweepOk := sweepOk
+        z.displOk := true
+        z.score   := 30 + (sweepOk ? 20 : 0)
+        addZone(z)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ④ CISD — Origin Break + HTF gate + anti-early rule
+// ════════════════════════════════════════════════════════════════════════════
+var int   raidBar   = -100000
+var int   raidDir   = 0
+var float cisdOrig  = na
+var float raidExtrm = na
+var bool  cisdArmed = false
+var int   cisdBar   = -100000
+var int   cisdDir   = 0
+
+originLevel(bool bullSetup) =>
+    // walk back over the contiguous same-direction leg that performed the raid
+    int idx = 0
+    for i = 0 to 10
+        sameDir = bullSetup ? close[i] < open[i] : close[i] > open[i]
+        if sameDir
+            idx := i
+        else
+            break
+    cisdOriginMode ? open[idx] : bullSetup ? high : low
+
+if cisdEnable and confirmed
+    if sweptLow
+        raidBar := bar_index
+        raidDir := 1
+        raidExtrm := low
+        cisdOrig := originLevel(true)
+        cisdArmed := true
+    else if sweptHigh
+        raidBar := bar_index
+        raidDir := -1
+        raidExtrm := high
+        cisdOrig := originLevel(false)
+        cisdArmed := true
+
+    if cisdArmed and bar_index - raidBar > cisdWindow
+        cisdArmed := false
+
+    if cisdArmed and bar_index > raidBar and not na(cisdOrig)
+        broke  = raidDir == 1 ? close > cisdOrig : close < cisdOrig
+        bodyOk = bodyRat >= cisdBodyFloor
+        pullOk = bar_index - raidBar >= 2 or (raidDir == 1 ? high - raidExtrm : raidExtrm - low) >= cisdPullbkATR * atr
+        htfOk  = not cisdTrendFilt or htfBias == 0 or htfBias == raidDir
+        if broke and bodyOk and pullOk and htfOk
+            Zone z = Zone.new()
+            z.kind    := "CISD"
+            z.bull    := raidDir == 1
+            z.top     := raidDir == 1 ? cisdOrig : raidExtrm
+            z.bot     := raidDir == 1 ? raidExtrm : cisdOrig
+            z.prox    := cisdOrig
+            z.dist    := raidExtrm
+            z.invalid := raidExtrm
+            z.birth   := raidBar
+            z.sweepOk := true
+            z.displOk := true
+            z.score   := 55
+            addZone(z)
+            cisdBar := bar_index
+            cisdDir := raidDir
+            cisdArmed := false
+            alert("SMC Elite: CISD " + (raidDir == 1 ? "Bullish" : "Bearish"), alert.freq_once_per_bar_close)
+
+// ── Diamond FVG: an A+ imbalance created immediately after a CISD trigger ──
+if cisdDiamond and confirmed and (newBullFVG or newBearFVG) and bar_index - cisdBar <= 2
+    if (newBullFVG and cisdDir == 1) or (newBearFVG and cisdDir == -1)
+        if zones.size() > 0
+            Zone last = zones.get(zones.size() - 1)
+            if last.kind == "FVG" or last.kind == "OB+FVG"
+                last.aplus := true
+                last.score := math.min(100, last.score + 20)
+        label.new(bar_index, newBullFVG ? fvgBot : fvgTop, "◆", xloc = xloc.bar_index,
+             style = newBullFVG ? label.style_label_up : label.style_label_down,
+             color = color.new(newBullFVG ? cBullFVG : cBearFVG, 10), textcolor = color.white, size = size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑤ ZONE LIFECYCLE — activation, mitigation, expiry, Tier-1, IFVG flip
+// ════════════════════════════════════════════════════════════════════════════
+newIfvg = false
+newIfvgBull = false
+float newIfvgTop = na
+float newIfvgBot = na
+
+if confirmed
+    for z in zones
+        if not z.dead
+            age = bar_index - z.birth
+            dToProx = z.bull ? close - z.prox : z.prox - close
+
+            // ── activation: a zone must EARN its retest by displacing away ──
+            if not z.activated
+                touched = low <= z.top and high >= z.bot
+                if age > 0 and age <= obKillBars and touched
+                    z.dead := true                 // immediate-test kill ⇒ no ghost zones
+                else if dToProx >= obActivateATR * atr
+                    z.activated := true
+                    z.state := 1                   // LEFT
+
+            // ── Tier-1 promotion (late-binding BOS, forward-only) ──
+            if not z.tier1 and z.activated and z.state < 2 and (z.kind == "OB" or z.kind == "OB+FVG")
+                if lastBosDir == (z.bull ? 1 : -1) and lastBosBar >= z.birth and lastBosBar - z.birth <= obBosLookback
+                    z.bosOk := true
+                htfOk = not obReqHtfAPlus or z.htf or htfBias == (z.bull ? 1 : -1)
+                sc = z.score + (z.bosOk ? 25 : 0)
+                if z.sweepOk and z.displOk and z.bosOk and htfOk and sc >= obMinScoreT1
+                    z.tier1 := true
+                    z.score := math.min(100, sc)
+
+            // ── mitigation / invalidation ──
+            if z.activated
+                wickTouch = low <= z.top and high >= z.bot
+                bodyPast  = z.bull ? close < z.invalid : close > z.invalid
+                stale     = age > obStaleBars
+                if bodyPast
+                    if ifvgEnable and (z.kind == "FVG" or z.kind == "OB+FVG")
+                        // ── IFVG flip: displacement + location + sweep confluence ──
+                        dispOk = bodyRat >= 0.65 and math.abs(close - open) >= 0.5 * atr
+                        locOk  = z.bull ? inPremium : inDiscount     // the flipped direction
+                        swpOk  = z.bull ? bar_index - lastSweepLoBar <= ifvgSweepBars : bar_index - lastSweepHiBar <= ifvgSweepBars
+                        isc    = (dispOk ? 40 : 0) + (locOk ? 30 : 0) + (swpOk ? 30 : 0)
+                        if isc >= ifvgMinScore
+                            newIfvg := true
+                            newIfvgBull := not z.bull
+                            newIfvgTop := z.top
+                            newIfvgBot := z.bot
+                    z.dead := true
+                else if stale and wickTouch
+                    z.dead := true
+                if age > obExpireBars
+                    z.dead := true
+
+if newIfvg
+    Zone z = Zone.new()
+    z.kind    := "IFVG"
+    z.bull    := newIfvgBull
+    z.top     := newIfvgTop
+    z.bot     := newIfvgBot
+    z.prox    := newIfvgBull ? newIfvgTop : newIfvgBot
+    z.dist    := newIfvgBull ? newIfvgBot : newIfvgTop
+    z.invalid := newIfvgBull ? newIfvgBot : newIfvgTop
+    z.birth   := bar_index
+    z.score   := 55
+    addZone(z)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑥ DYNAMIC HTF UPGRADE — ★ when a later HTF POI covers the LTF zone
+// ════════════════════════════════════════════════════════════════════════════
+if htfEnable and confirmed
+    for z in zones
+        if not z.dead and not z.htf
+            if not na(h1Top) and h1Dir == (z.bull ? 1 : -1) and overlapRatio(z.top, z.bot, h1Top, h1Bot) >= htfOverlap
+                z.htf := true
+                z.htfTag := htf1
+                z.score := math.min(100, z.score + 15)
+            else if not na(h2Top) and h2Dir == (z.bull ? 1 : -1) and overlapRatio(z.top, z.bot, h2Top, h2Bot) >= htfOverlap
+                z.htf := true
+                z.htfTag := htf2
+                z.score := math.min(100, z.score + 15)
+
+var box h1Box = na
+var box h2Box = na
+if htfEnable and htfDraw and barstate.islast
+    if not na(h1Top)
+        if na(h1Box)
+            h1Box := box.new(bar_index - 1, h1Top, bar_index + zoneExtend, h1Bot, xloc = xloc.bar_index,
+                 border_color = color.new(h1Dir == 1 ? cBullFVG : cBearFVG, 60),
+                 bgcolor = color.new(h1Dir == 1 ? cBullFVG : cBearFVG, 94))
+        else
+            box.set_top(h1Box, h1Top)
+            box.set_bottom(h1Box, h1Bot)
+            box.set_right(h1Box, bar_index + zoneExtend)
+    if not na(h2Top)
+        if na(h2Box)
+            h2Box := box.new(bar_index - 1, h2Top, bar_index + zoneExtend, h2Bot, xloc = xloc.bar_index,
+                 border_color = color.new(h2Dir == 1 ? cBullFVG : cBearFVG, 60),
+                 bgcolor = color.new(h2Dir == 1 ? cBullFVG : cBearFVG, 96))
+        else
+            box.set_top(h2Box, h2Top)
+            box.set_bottom(h2Box, h2Bot)
+            box.set_right(h2Box, bar_index + zoneExtend)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑦ CONFIRMATION ENGINE — retest of the FINAL zone edge only
+// ════════════════════════════════════════════════════════════════════════════
+var int    planDir   = 0
+var float  planEnt   = na
+var float  planSL    = na
+var float  planTP1   = na
+var float  planTP2   = na
+var int    planBar   = 0
+var bool   planPend  = false
+var bool   tp1Done   = false
+var bool   tp2Done   = false
+var int    planScore = 0
+var string planKind  = ""
+var string planTag   = ""
+
+setupScore(Zone z) =>
+    int s = (z.tier1 ? 30 : 15) + (z.htf ? 20 : 0) + (z.state >= 2 ? 7 : 15) +
+         (z.sweepOk ? 10 : 0) + (z.state == 3 ? 10 : 0) + (z.aplus ? 10 : 0)
+    math.min(100, s)
+
+bestBullScore = 0
+bestBearScore = 0
+bestBullState = -1
+bestBearState = -1
+bestBullKind = ""
+bestBearKind = ""
+
+if confEnable and confirmed
+    for z in zones
+        if not z.dead and z.activated
+            tol = confTouchATR * atr
+            atEdge = z.bull ? low <= z.prox + tol and low >= z.dist - tol : high >= z.prox - tol and high <= z.dist + tol
+
+            if z.state == 1 and atEdge
+                z.state := 2
+                z.touchBar := bar_index
+            else if z.state == 2
+                // the rejection is read from the final zone edge — never from a new FVG candle
+                dirClose  = z.bull ? close > open : close < open
+                bodyOk    = bodyRat >= confRejBody
+                beyondMid = z.bull ? close > (high[1] + low[1]) / 2 : close < (high[1] + low[1]) / 2
+                if dirClose and bodyOk and beyondMid
+                    z.state := 3
+                else if bar_index - z.touchBar > pendingBars
+                    z.state := 1                     // stale touch ⇒ require a fresh departure
+
+            sc = setupScore(z)
+            if z.bull and sc > bestBullScore
+                bestBullScore := sc
+                bestBullKind := z.kind
+                bestBullState := z.state
+            if not z.bull and sc > bestBearScore
+                bestBearScore := sc
+                bestBearKind := z.kind
+                bestBearState := z.state
+
+            // ── promote a CONFIRMED zone into the live trade plan ──
+            if z.state == 3
+                takeover = planDir == 0 or sc >= planScore + switchMargin
+                if takeover
+                    float slRaw = z.bull ? z.dist - slBufferATR * atr : z.dist + slBufferATR * atr
+                    direct = math.abs(close - z.prox) <= entryBandATR * atr
+                    float ent = direct ? close : z.prox
+                    float risk = math.abs(ent - slRaw)
+                    if risk > 0
+                        planDir   := z.bull ? 1 : -1
+                        planEnt   := ent
+                        planSL    := slRaw
+                        planTP1   := z.bull ? ent + tp1R * risk : ent - tp1R * risk
+                        planTP2   := z.bull ? ent + tp2R * risk : ent - tp2R * risk
+                        planBar   := bar_index
+                        planPend  := not direct
+                        planScore := sc
+                        planKind  := z.kind
+                        planTag   := (z.tier1 ? "Tier 1" : "Tier 2") + (z.htf ? " ★" : "") + (z.aplus ? " A+" : "")
+                        tp1Done   := false
+                        tp2Done   := false
+                        alert("SMC Elite: " + (z.bull ? "BUY" : "SELL") + " confirmed @ " + z.kind, alert.freq_once_per_bar_close)
+
+// ── trade management ──
+if confirmed and planDir != 0
+    if planPend
+        filled = planDir == 1 ? low <= planEnt : high >= planEnt
+        if filled
+            planPend := false
+        else if bar_index - planBar > pendingBars
+            planDir := 0
+    if planDir != 0 and not planPend
+        if planDir == 1
+            if not tp1Done and high >= planTP1
+                tp1Done := true
+            if not tp2Done and high >= planTP2
+                tp2Done := true
+                planDir := 0
+            else if low <= planSL
+                planDir := 0
+        else
+            if not tp1Done and low <= planTP1
+                tp1Done := true
+            if not tp2Done and low <= planTP2
+                tp2Done := true
+                planDir := 0
+            else if high >= planSL
+                planDir := 0
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑧ RISK ENGINE — contract-spec aware, rounds DOWN so risk never overshoots
+// ════════════════════════════════════════════════════════════════════════════
+valuePerPoint() =>
+    float v = vppOverride > 0 ? vppOverride :
+         syminfo.type == "forex" ? 100000.0 :
+         str.contains(syminfo.ticker, "XAU") ? 100.0 :
+         str.contains(syminfo.ticker, "XAG") ? 5000.0 :
+         nz(syminfo.pointvalue, 1.0)
+    v
+
+lotsFor(float entry, float sl) =>
+    float lots = na
+    if riskEnable and not na(entry) and not na(sl)
+        float dist = math.abs(entry - sl)
+        float vpp = valuePerPoint()
+        if dist > 0 and vpp > 0
+            float raw = acctSize * riskPct / 100.0 / (dist * vpp)
+            raw := math.floor(raw / lotStep) * lotStep
+            lots := math.max(minLot, math.min(maxLot, raw))
+    lots
+
+planLots = lotsFor(planEnt, planSL)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑨ DISPLAY PASS — nearest-to-price priority, bounded drawing objects
+// ════════════════════════════════════════════════════════════════════════════
+zoneColor(Zone z) =>
+    switch z.kind
+        "CISD" => cCisd
+        "IFVG" => z.bull ? cIfvgBull : cIfvgBear
+        "FVG"  => z.bull ? cBullFVG : cBearFVG
+        => z.bull ? cBullOB : cBearOB
+
+if barstate.islast or confirmed
+    dists = array.new<float>()
+    for z in zones
+        if not z.dead
+            array.push(dists, math.abs(close - z.prox))
+    float thr = 1e12
+    if dists.size() > 0
+        sorted = array.copy(dists)
+        array.sort(sorted, order.ascending)
+        thr := array.get(sorted, math.min(maxVisible - 1, sorted.size() - 1))
+
+    int shown = 0
+    for z in zones
+        d = math.abs(close - z.prox)
+        want = not z.dead and d <= thr and shown < maxVisible
+        if want
+            shown += 1
+        z.vis := want
+
+        if not want
+            if not na(z.bx)
+                box.delete(z.bx)
+                z.bx := na
+            if not na(z.lb)
+                label.delete(z.lb)
+                z.lb := na
+        else
+            base  = zoneColor(z)
+            fillT = z.kind == "CISD" ? 96 : z.tier1 ? 70 : 82
+            bordT = z.kind == "CISD" ? 75 : z.tier1 or z.htf ? 25 : 55
+            bw    = z.tier1 or z.htf ? 2 : 1
+            ext   = z.kind == "IFVG" ? ifvgExtend : zoneExtend
+            arrow = z.kind == "IFVG" ? (z.bull ? " ▲" : " ▼") : ""
+            txt = z.kind + arrow + (z.tier1 ? " ⬥" : "") + (z.htf ? " ★ [" + z.htfTag + "]" : "") +
+                 (z.aplus ? " A+" : "") + "  " + str.tostring(z.score) + (z.state == 3 ? " ✓" : "")
+            if na(z.bx)
+                z.bx := box.new(z.birth, z.top, bar_index + ext, z.bot, xloc = xloc.bar_index,
+                     border_color = color.new(base, bordT), border_width = bw, bgcolor = color.new(base, fillT))
+            else
+                box.set_right(z.bx, bar_index + ext)
+                box.set_top(z.bx, z.top)
+                box.set_bottom(z.bx, z.bot)
+                box.set_bgcolor(z.bx, color.new(base, fillT))
+                box.set_border_color(z.bx, color.new(base, bordT))
+                box.set_border_width(z.bx, bw)
+            if na(z.lb)
+                z.lb := label.new(bar_index + ext, z.prox, txt, xloc = xloc.bar_index,
+                     style = label.style_label_left, color = color.new(color.black, 100),
+                     textcolor = base, size = size.tiny)
+            else
+                label.set_xy(z.lb, bar_index + ext, z.prox)
+                label.set_text(z.lb, txt)
+                label.set_textcolor(z.lb, base)
+
+// ── compact the store: dead zones release their drawings and leave the array ──
+if confirmed and zones.size() > 0
+    for i = zones.size() - 1 to 0
+        Zone z = zones.get(i)
+        if z.dead
+            if not na(z.bx)
+                box.delete(z.bx)
+            if not na(z.lb)
+                label.delete(z.lb)
+            array.remove(zones, i)
+    while zones.size() > 120
+        Zone z0 = array.shift(zones)
+        if not na(z0.bx)
+            box.delete(z0.bx)
+        if not na(z0.lb)
+            label.delete(z0.lb)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑩ TRADE PLAN VISUALS
+// ════════════════════════════════════════════════════════════════════════════
+var line lnE = na
+var line lnS = na
+var line lnT1 = na
+var line lnT2 = na
+var label lbE = na
+var label lbS = na
+var label lbT1 = na
+var label lbT2 = na
+var box rrBoxP = na
+var box rrBoxL = na
+
+if barstate.islast
+    if not na(lnE)
+        line.delete(lnE)
+        lnE := na
+    if not na(lnS)
+        line.delete(lnS)
+        lnS := na
+    if not na(lnT1)
+        line.delete(lnT1)
+        lnT1 := na
+    if not na(lnT2)
+        line.delete(lnT2)
+        lnT2 := na
+    if not na(lbE)
+        label.delete(lbE)
+        lbE := na
+    if not na(lbS)
+        label.delete(lbS)
+        lbS := na
+    if not na(lbT1)
+        label.delete(lbT1)
+        lbT1 := na
+    if not na(lbT2)
+        label.delete(lbT2)
+        lbT2 := na
+    if not na(rrBoxP)
+        box.delete(rrBoxP)
+        rrBoxP := na
+    if not na(rrBoxL)
+        box.delete(rrBoxL)
+        rrBoxL := na
+
+    if showPlan and planDir != 0
+        rightX = bar_index + 20
+        lnE  := line.new(planBar, planEnt, rightX, planEnt, xloc = xloc.bar_index, color = color.new(#9598A1, 0), style = line.style_solid)
+        lnS  := line.new(planBar, planSL, rightX, planSL, xloc = xloc.bar_index, color = cBearStr, style = line.style_dashed)
+        lnT1 := line.new(planBar, planTP1, rightX, planTP1, xloc = xloc.bar_index, color = cBullFVG, style = line.style_dashed)
+        lnT2 := line.new(planBar, planTP2, rightX, planTP2, xloc = xloc.bar_index, color = color.new(cBullFVG, 30), style = line.style_dashed)
+
+        entTxt = (planPend ? "PENDING " : "ENTRY ") + str.tostring(math.round_to_mintick(planEnt)) +
+             (riskEnable and not na(planLots) ? "  |  " + str.tostring(planLots) + " lots" : "")
+        lbE  := label.new(rightX, planEnt, entTxt, xloc = xloc.bar_index, style = label.style_label_left,
+             color = color.new(color.black, 100), textcolor = cText, size = size.tiny)
+        lbS  := label.new(rightX, planSL, "SL " + str.tostring(math.round_to_mintick(planSL)), xloc = xloc.bar_index,
+             style = label.style_label_left, color = color.new(color.black, 100), textcolor = cBearStr, size = size.tiny)
+        lbT1 := label.new(rightX, planTP1, "TP1 " + str.tostring(math.round_to_mintick(planTP1)) + (tp1Done ? "  ✔ done" : ""),
+             xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = cBullFVG, size = size.tiny)
+        lbT2 := label.new(rightX, planTP2, "TP2 " + str.tostring(math.round_to_mintick(planTP2)) + (tp2Done ? "  ✔ done" : ""),
+             xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = cBullFVG, size = size.tiny)
+
+        if showRRBox
+            rrBoxP := box.new(planBar, planTP2, rightX, planEnt, xloc = xloc.bar_index,
+                 border_color = color.new(cBullFVG, 60), bgcolor = color.new(cBullFVG, 90))
+            rrBoxL := box.new(planBar, planEnt, rightX, planSL, xloc = xloc.bar_index,
+                 border_color = color.new(cBearStr, 60), bgcolor = color.new(cBearStr, 90))
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑪ TRADE GUIDE PANEL + DECISION ASSISTANT
+// ════════════════════════════════════════════════════════════════════════════
+var table panel = table.new(panelPosition, 2, 12, bgcolor = color.new(#0E1116, 12),
+     border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 70))
+
+row(int r, string k, string v, color vc) =>
+    table.cell(panel, 0, r, k, text_color = color.new(color.gray, 20), text_size = panelTxtSize, text_halign = text.align_left)
+    table.cell(panel, 1, r, v, text_color = vc, text_size = panelTxtSize, text_halign = text.align_right)
+
+decision() =>
+    string d = "—"
+    if planDir == 0
+        d := bestBullScore > bestBearScore ? "WATCH BUY setup" : bestBearScore > bestBullScore ? "WATCH SELL setup" : "No setup"
+    else
+        oppScore = planDir == 1 ? bestBearScore : bestBullScore
+        oppState = planDir == 1 ? bestBearState : bestBullState
+        if oppState == 3 and oppScore >= planScore + switchMargin
+            d := "SWITCH → " + (planDir == 1 ? "SELL" : "BUY") + "  (" + str.tostring(oppScore) + " vs " + str.tostring(planScore) + ")"
+        else if oppScore > planScore
+            d := "WATCH opposite (" + str.tostring(oppScore) + ") — not confirmed"
+        else
+            d := "HOLD current " + (planDir == 1 ? "BUY" : "SELL")
+    d
+
+nextStep() =>
+    string s = "Wait for a valid zone"
+    if planDir != 0
+        s := planPend ? "Pending limit @ " + str.tostring(math.round_to_mintick(planEnt)) :
+             tp2Done ? "Trade complete" :
+             tp1Done ? "TP1 hit — manage to TP2" : "In trade — SL " + str.tostring(math.round_to_mintick(planSL))
+    else
+        st = bestBullScore >= bestBearScore ? bestBullState : bestBearState
+        s := switch st
+            0 => "Zone forming — wait for displacement away"
+            1 => "Wait for retest of the final edge"
+            2 => "Touched — wait for the rejection close"
+            3 => "Confirmed — awaiting entry"
+            => "Wait for a valid zone"
+    s
+
+if showPanel and barstate.islast
+    bias  = trend == 1 ? "BULLISH" : trend == -1 ? "BEARISH" : "NEUTRAL"
+    biasC = trend == 1 ? cBullStr : trend == -1 ? cBearStr : color.gray
+    htfTxt = htfBias == 1 ? "HTF Bull" : htfBias == -1 ? "HTF Bear" : "HTF Flat"
+    setup = planDir == 1 ? "BUY " + planKind :
+         planDir == -1 ? "SELL " + planKind :
+         bestBullScore == 0 and bestBearScore == 0 ? "—" :
+         bestBullScore >= bestBearScore ? "BUY " + bestBullKind : "SELL " + bestBearKind
+    sScore = planDir != 0 ? planScore : math.max(bestBullScore, bestBearScore)
+
+    table.cell(panel, 0, 0, "SMC ELITE v18", text_color = cText, text_size = panelTxtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 0, timeframe.period + " · " + htfTxt, text_color = color.new(color.gray, 20), text_size = panelTxtSize, text_halign = text.align_right)
+    row(1, "Bias", bias, biasC)
+    row(2, "Setup", setup, planDir == 1 ? cBullStr : planDir == -1 ? cBearStr : cText)
+    row(3, "Quality", planDir == 0 or planTag == "" ? "—" : planTag, cText)
+    row(4, "Score", str.tostring(sScore) + " / 100", sScore >= 80 ? cBullFVG : sScore >= 60 ? cText : color.gray)
+    row(5, "Status", planDir == 0 ? "Scanning" : planPend ? "Pending entry" : "Active", cText)
+    row(6, "Entry", planDir == 0 ? "—" : str.tostring(math.round_to_mintick(planEnt)), cText)
+    row(7, "SL", planDir == 0 ? "—" : str.tostring(math.round_to_mintick(planSL)), cBearStr)
+    row(8, "TP1 / TP2", planDir == 0 ? "—" :
+         str.tostring(math.round_to_mintick(planTP1)) + (tp1Done ? " ✔" : "") + " / " +
+         str.tostring(math.round_to_mintick(planTP2)) + (tp2Done ? " ✔" : ""), cBullFVG)
+    row(9, "Lot Size", riskEnable and planDir != 0 and not na(planLots) ? str.tostring(planLots) : "—", cText)
+    row(10, "Next Step", nextStep(), cText)
+    row(11, "Decision", decision(), cText)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ⑫ ALERTS
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(bosBull or chochBull, "Bullish Structure Break", "SMC Elite: bullish BOS / CHoCH")
+alertcondition(bosBear or chochBear, "Bearish Structure Break", "SMC Elite: bearish BOS / CHoCH")
+alertcondition(sweptHigh or sweptLow, "Liquidity Sweep", "SMC Elite: liquidity sweep (IDM)")
