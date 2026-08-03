@@ -1,0 +1,60 @@
+//@version=6
+// KÖNIG — Kinetic Coherence
+// Core logic only. No drawings, no zones, no panels.
+//
+//   König's theorem:   K_total = K_bulk + K_thermal
+//   Coherence:         C = sqrt(neff) * vbar / u  ==  D / ell   ~  N(0,1) under a martingale null
+//   Bulk fraction:     phi = C^2 / neff  in [0,1]   (Cauchy-Schwarz)
+//
+// Causal and non-repainting: every value at bar t is a function of closed bars <= t.
+
+indicator("KÖNIG — Kinetic Coherence", overlay = true)
+
+n     = input.int(20,     "Window n",   minval = 5,   tooltip = "Bars of lookback. 20 is ample; neff must stay >= ~10 for the N(0,1) null.")
+kappa = input.float(2.58, "Ignition κ", minval = 1.0, step = 0.01, tooltip = "Significance threshold on |C|. 1.96 ~ p<.05, 2.58 ~ p<.01, 3.29 ~ p<.001.")
+
+// ---------------------------------------------------------------- observables
+d = close - close[1]                        // displacement  δ
+m = volume > 0 ? volume : 1.0               // mass; degrades to the unit-mass closed form
+
+// ------------------------------------------------- four accumulators, O(1) each
+W  = math.sum(m,         n)                 // Σ m
+W2 = math.sum(m * m,     n)                 // Σ m²
+S  = math.sum(m * d,     n)                 // Σ mδ    — bulk momentum
+Q  = math.sum(m * d * d, n)                 // Σ mδ²   — total kinetic energy
+
+// ---------------------------------------------------------------------- state
+neff = W2 > 0 ? W * W / W2 : 0.0            // effective sample size (Kish)
+vbar = W  > 0 ? S / W : 0.0                 // bulk (centre-of-mass) velocity
+u    = W  > 0 ? math.sqrt(Q / W) : 0.0      // thermal speed
+C    = u  > 0 ? math.sqrt(neff) * vbar / u : 0.0   // coherence
+phi  = neff > 0 ? C * C / neff : 0.0        // bulk energy fraction
+ell  = math.sqrt(neff) * u                  // diffusive scale — the risk unit
+
+// ---------------------------------------------------------------------- rules
+ignite = math.abs(C) >= kappa and math.abs(C[1]) < kappa   // 1: ignition (transition, taken once)
+align  = math.sign(d) == math.sign(C)                      // 2: ignition bar flows with the bulk
+long   = ignite and align and C > 0
+short  = ignite and align and C < 0
+
+// --------------------------------------------------- geometry frozen at ignition
+var int   dir    = 0
+var float entry  = na
+var float stop   = na
+var float target = na
+
+if (long or short) and barstate.isconfirmed
+    dir    := long ? 1 : -1
+    entry  := close                         // live execution: fill at the next bar's open
+    stop   := entry - dir * ell             // 1 diffusive σ against
+    target := entry + dir * C * ell         // inertial projection; R:R = |C|
+
+// --------------------------------------------------------------------- outputs
+plot(C,      "C",   display = display.data_window)
+plot(phi,    "phi", display = display.data_window)
+plot(ell,    "ell", display = display.data_window)
+plot(stop,   "stop",   display = display.data_window)
+plot(target, "target", display = display.data_window)
+
+alertcondition(long,  "KÖNIG long",  "Coherent flow up: C crossed +κ")
+alertcondition(short, "KÖNIG short", "Coherent flow down: C crossed -κ")
