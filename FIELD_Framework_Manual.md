@@ -411,7 +411,8 @@ A: Lower the Pivot Length (3–4) on lower timeframes (1m–15m). Keep at 5–7 
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.0 | 2026-04-08 | Initial release — full FIELD Framework |
+| 2.0 | 2026-08-05 | Upgraded to Pine Script v6: `array.new<type>()` generic syntax, method calls on arrays and drawing objects (`arr.get()`, `bx.set_lefttop()` etc.), `const string` group names, explicit type annotations on all variables, `not na(phv)` pivot guard, explicit `by -1` on removal loops |
+| 1.0 | 2026-04-08 | Initial release — Pine Script v5 |
 
 ---
 

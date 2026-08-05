@@ -1,7 +1,7 @@
 // =============================================================================
 // FIELD Framework — Fluid Energetics of Institutional Liquidity Displacement
 // =============================================================================
-// Version    : 1.0
+// Version    : 2.0  (Pine Script v6)
 // Author     : AYA Research
 // License    : CC BY-NC-SA 4.0  https://creativecommons.org/licenses/by-nc-sa/4.0/
 //
@@ -14,23 +14,21 @@
 // Core Physics Analogy:
 //   • Compression  → Potential Energy  (P.E. = mgh)  → price coils in a tight range
 //   • Expansion    → Kinetic Energy    (K.E. = ½mv²) → price displaces aggressively
-//   • Absorption   → Pressure-loss     (energy is absorbed by hidden institutional
-//                                        counter-orders, slowing velocity)
-//   • Aggression   → Impulse force     (F = Δp/Δt)   → directional institutional
-//                                        commitment visible as large efficient candles
+//   • Absorption   → Pressure-loss     (energy absorbed by hidden counter-orders)
+//   • Aggression   → Impulse force     (F = Δp/Δt)   → large, efficient candles
 //
 // Five-layer scoring system:
 //   A. Liquidity Pressure Index  (LPI)  — distance-weighted pull to liquidity pools
 //   B. Energy Compression Score  (ECS)  — volatility contraction proxy
 //   C. Volume Intelligence Layer (VIL)  — absorption vs. aggression detection
 //   D. Institutional Footprint   (IFS)  — efficiency-weighted volume signature
-//   E. Probabilistic Edge Score  (PES)  — composite probability gate (0-1)
+//   E. Probabilistic Edge Score  (PES)  — composite probability gate (0–1)
 //
 // Signals fire only when PES ≥ user threshold (default 0.60 = 60% edge confidence)
 // Target minimum 1:5 Risk-to-Reward. Quality >>> Quantity.
 // =============================================================================
 
-//@version=5
+//@version=6
 indicator("FIELD Framework [AYA]"
   , overlay          = true
   , max_boxes_count  = 500
@@ -41,368 +39,331 @@ indicator("FIELD Framework [AYA]"
 // INPUTS
 // =============================================================================
 
+const string GRP_ZD = "Zone Detection"
+const string GRP_EN = "Energy Model"
+const string GRP_PB = "Probability Gate"
+const string GRP_DI = "Display"
+
 // --- Zone Detection ----------------------------------------------------------
-var GRP_ZD = "Zone Detection"
-i_pivot_len  = input.int   (5,     "Volume Pivot Length",    minval=1,   group=GRP_ZD)
-i_atr_len    = input.int   (14,    "ATR Length",             minval=1,   group=GRP_ZD)
-i_mitigation = input.string("Wick","Mitigation Method",      options=["Wick","Close"], group=GRP_ZD)
+int    i_pivot_len  = input.int   (5,      "Volume Pivot Length",  minval = 1,                        group = GRP_ZD)
+int    i_atr_len    = input.int   (14,     "ATR Length",           minval = 1,                        group = GRP_ZD)
+string i_mitigation = input.string("Wick", "Mitigation Method",    options = ["Wick", "Close"],       group = GRP_ZD)
 
 // --- Energy Model ------------------------------------------------------------
-var GRP_EN = "Energy Model"
-i_compress_thresh = input.float(0.50, "Compression Threshold (ECS)",  minval=0.10, maxval=1.00, step=0.05, group=GRP_EN,
-  tooltip="ECS below this value → price is coiling (potential energy). Lower = stricter filter.")
-i_expand_thresh   = input.float(1.50, "Expansion Threshold  (ECS)",  minval=1.00, maxval=4.00, step=0.10, group=GRP_EN,
-  tooltip="ECS above this value → explosive expansion underway.")
-i_vol_ma_len      = input.int  (20,   "Volume MA Length",              minval=5,   group=GRP_EN)
+float i_compress_thresh = input.float(0.50, "Compression Threshold (ECS)", minval = 0.10, maxval = 1.00, step = 0.05, group = GRP_EN,
+  tooltip = "ECS below this → price is coiling (potential energy). Lower = stricter filter.")
+float i_expand_thresh   = input.float(1.50, "Expansion Threshold  (ECS)", minval = 1.00, maxval = 4.00,  step = 0.10, group = GRP_EN,
+  tooltip = "ECS above this → explosive expansion underway.")
+int   i_vol_ma_len      = input.int  (20,   "Volume MA Length",   minval = 5,                           group = GRP_EN)
 
 // --- Probability Gate --------------------------------------------------------
-var GRP_PB = "Probability Gate"
-i_min_pes       = input.float(0.60, "Min Edge Score (PES)", minval=0.10, maxval=0.99, step=0.01, group=GRP_PB,
-  tooltip="Only show zones / fire signals when the composite edge score exceeds this value.")
-i_use_prob_gate = input.bool (true,  "Enable Probability Gate",   group=GRP_PB)
+float i_min_pes       = input.float(0.60, "Min Edge Score (PES)", minval = 0.10, maxval = 0.99, step = 0.01, group = GRP_PB,
+  tooltip = "Zones and signals only appear when the composite edge score exceeds this value.")
+bool  i_use_prob_gate = input.bool (true,  "Enable Probability Gate", group = GRP_PB)
 
 // --- Display -----------------------------------------------------------------
-var GRP_DI = "Display"
-i_bull_max    = input.int  (3, "Max Bull Zones", minval=1, group=GRP_DI, inline="bull")
-i_bg_bull     = input.color(color.new(#00bcd4, 87), "", group=GRP_DI, inline="bull")
-i_bull_css    = input.color(#00bcd4, "",              group=GRP_DI, inline="bull")
+int   i_bull_max   = input.int  (3, "Max Bull Zones", minval = 1,                          group = GRP_DI, inline = "bull")
+color i_bg_bull    = input.color(color.new(#00bcd4, 87), "",                                group = GRP_DI, inline = "bull")
+color i_bull_css   = input.color(#00bcd4, "",                                               group = GRP_DI, inline = "bull")
 
-i_bear_max    = input.int  (3, "Max Bear Zones", minval=1, group=GRP_DI, inline="bear")
-i_bg_bear     = input.color(color.new(#ff5722, 87), "", group=GRP_DI, inline="bear")
-i_bear_css    = input.color(#ff5722, "",              group=GRP_DI, inline="bear")
+int   i_bear_max   = input.int  (3, "Max Bear Zones", minval = 1,                          group = GRP_DI, inline = "bear")
+color i_bg_bear    = input.color(color.new(#ff5722, 87), "",                                group = GRP_DI, inline = "bear")
+color i_bear_css   = input.color(#ff5722, "",                                               group = GRP_DI, inline = "bear")
 
-i_show_energy  = input.bool(true,  "Show Compression Background",  group=GRP_DI)
-i_show_signals = input.bool(true,  "Show Entry Signals",            group=GRP_DI)
-i_show_rr      = input.bool(true,  "Show TP / SL Projection",       group=GRP_DI)
-i_rr_ratio     = input.float(5.0,  "Target RR Ratio",  minval=1.0, step=0.5, group=GRP_DI,
-  tooltip="Sets the take-profit at Entry ± Risk × RR. Default 5 = minimum 1:5 RR.")
+bool  i_show_energy  = input.bool (true, "Show Compression Background", group = GRP_DI)
+bool  i_show_signals = input.bool (true, "Show Entry Signals",           group = GRP_DI)
+bool  i_show_rr      = input.bool (true, "Show TP / SL Projection",      group = GRP_DI)
+float i_rr_ratio     = input.float(5.0,  "Target RR Ratio", minval = 1.0, step = 0.5,      group = GRP_DI,
+  tooltip = "Take-profit = Entry ± Risk × RR. Default 5 = minimum 1:5 RR.")
 
 // =============================================================================
 // A. VOLATILITY & BASE CALCULATIONS
 // =============================================================================
 
-atr       = ta.atr(i_atr_len)
-atr_short = ta.atr(5)
-atr_long  = ta.atr(20)
+float atr       = ta.atr(i_atr_len)
+float atr_short = ta.atr(5)
+float atr_long  = ta.atr(20)
 
-body      = math.abs(close - open)
-rng       = math.max(high - low, 0.0001)          // candle range, protected from zero
-body_pct  = body / rng                             // candle efficiency 0→1
+float body     = math.abs(close - open)
+float rng      = math.max(high - low, 0.0001)    // protected from zero division
+float body_pct = body / rng                       // candle efficiency 0→1
 
-vol_ma    = ta.sma(volume, i_vol_ma_len)
-vol_ratio = volume / math.max(vol_ma, 1)           // normalised volume (1 = average)
+float vol_ma    = ta.sma(volume, i_vol_ma_len)
+float vol_ratio = volume / math.max(vol_ma, 1)   // normalised (1.0 = average)
 
 // =============================================================================
 // B. VOLUME INTELLIGENCE LAYER (VIL)
 // =============================================================================
-// Approximate delta (directional volume) using body position within range.
-// Formula:  buy_frac = (close - low) / range  →  bullish close = high buy fraction
-//           sell_frac = 1 - buy_frac
+// Approximate delta using body position inside the candle range.
+// buy_frac = (close - low) / range → bullish close = high buy fraction.
 
-buy_frac  = (close - low) / rng
-sell_frac = 1.0 - buy_frac
+float buy_frac  = (close - low) / rng
+float sell_frac = 1.0 - buy_frac
 
-buy_vol   = volume * buy_frac
-sell_vol  = volume * sell_frac
-vol_delta = buy_vol - sell_vol                    // positive = net buying
-vol_delta_ma = ta.sma(vol_delta, i_vol_ma_len)
+float buy_vol   = volume * buy_frac
+float sell_vol  = volume * sell_frac
+float vol_delta = buy_vol - sell_vol              // positive = net buying
 
-// --- Absorption ---
-// High volume + small range + opposing close to direction = hidden counter-orders
-// Absorption into a zone is BULLISH when selling is absorbed (price stays up)
-absorption_bull = (vol_ratio > 1.5) and (rng < atr * 0.55) and (buy_frac > 0.4)
-absorption_bear = (vol_ratio > 1.5) and (rng < atr * 0.55) and (sell_frac > 0.4)
+// --- Absorption: high volume + small range = hidden counter-orders -----------
+bool absorption_bull = (vol_ratio > 1.5) and (rng < atr * 0.55) and (buy_frac  > 0.4)
+bool absorption_bear = (vol_ratio > 1.5) and (rng < atr * 0.55) and (sell_frac > 0.4)
 
-// --- Aggression ---
-// High volume + large range + efficient body = directional institutional commitment
-aggression_bull = (vol_ratio > 1.5) and (rng > atr * 0.80) and (close > open)
-aggression_bear = (vol_ratio > 1.5) and (rng > atr * 0.80) and (close < open)
+// --- Aggression: high volume + large efficient candle = directional intent ---
+bool aggression_bull = (vol_ratio > 1.5) and (rng > atr * 0.80) and (close > open)
+bool aggression_bear = (vol_ratio > 1.5) and (rng > atr * 0.80) and (close < open)
 
 // =============================================================================
 // C. ENERGY COMPRESSION SCORE (ECS)
 // =============================================================================
-// Physics: Potential Energy E_p = m · g · h
-// Analogy: ECS = (short-term ATR / long-term ATR) × Vol_ratio
-//
-// When price is coiling (spring compressed):
-//   → Short ATR shrinks relative to long ATR → ECS < 1
-//   → Combined with below-average volume     → ECS < threshold
-//
-// Interpretation:
-//   ECS < i_compress_thresh → high potential energy → release imminent
-//   ECS > i_expand_thresh   → kinetic phase active   → ride the wave
+// ECS = (ATR_short / ATR_long) × Vol_ratio
+// Low ECS → spring loaded → high potential energy → release imminent.
+// High ECS → kinetic phase → ride the wave.
 
-ecs          = (atr_short / math.max(atr_long, 0.0001)) * vol_ratio
-is_compressing = ecs < i_compress_thresh
-is_expanding   = ecs > i_expand_thresh
+float ecs           = (atr_short / math.max(atr_long, 0.0001)) * vol_ratio
+bool is_compressing = ecs < i_compress_thresh
+bool is_expanding   = ecs > i_expand_thresh
 
 // =============================================================================
 // D. LIQUIDITY PRESSURE INDEX (LPI)
 // =============================================================================
-// Physics: Pascal / Hydraulic Pressure  P = F / A
-// Price is drawn toward unswept liquidity pools (equal highs/lows, prior swings).
-// The closer price is to a pool AND the higher the volume ratio, the greater the
-// magnetic pull. Inverse distance ensures pull → ∞ as price approaches.
-//
-// LPI_bull = vol_ratio / (dist_to_swing_low / ATR + ε)
-// LPI_bear = vol_ratio / (dist_to_swing_high / ATR + ε)
+// LPI = vol_ratio / (ATR-normalised distance to swing pool + ε)
+// Inverse distance: the closer price is to an unswept pool, the higher the pull.
 
-swing_high = ta.highest(high, i_pivot_len * 3)
-swing_low  = ta.lowest (low,  i_pivot_len * 3)
+float swing_high = ta.highest(high, i_pivot_len * 3)
+float swing_low  = ta.lowest (low,  i_pivot_len * 3)
 
-dist_to_high = (swing_high - close) / math.max(atr, 0.0001)
-dist_to_low  = (close - swing_low)  / math.max(atr, 0.0001)
+float dist_to_high = (swing_high - close) / math.max(atr, 0.0001)
+float dist_to_low  = (close - swing_low)  / math.max(atr, 0.0001)
 
-// Clamp to avoid division explosion beyond useful range
-lpi_bull = dist_to_low  < 3.0 ? vol_ratio / (dist_to_low  + 0.1) : 0.0
-lpi_bear = dist_to_high < 3.0 ? vol_ratio / (dist_to_high + 0.1) : 0.0
-
-lpi_bull_norm = math.min(lpi_bull / 10.0, 1.0)
-lpi_bear_norm = math.min(lpi_bear / 10.0, 1.0)
+float lpi_bull      = dist_to_low  < 3.0 ? vol_ratio / (dist_to_low  + 0.1) : 0.0
+float lpi_bear      = dist_to_high < 3.0 ? vol_ratio / (dist_to_high + 0.1) : 0.0
+float lpi_bull_norm = math.min(lpi_bull / 10.0, 1.0)
+float lpi_bear_norm = math.min(lpi_bear / 10.0, 1.0)
 
 // =============================================================================
 // E. INSTITUTIONAL FOOTPRINT SCORE (IFS)
 // =============================================================================
-// Smart money leaves an imprint: large directional candles on abnormal volume with
-// minimal wick (high body efficiency). This differs from retail breakouts, which
-// often have large wicks and poor follow-through.
-//
 // IFS = body_efficiency × vol_ratio × aggression_bonus
+// Large efficient candle + above-average volume = directional institutional print.
 
-ifs_bull = body_pct * vol_ratio * (aggression_bull ? 1.4 : 1.0)
-ifs_bear = body_pct * vol_ratio * (aggression_bear ? 1.4 : 1.0)
-
-ifs_bull_norm = math.min(ifs_bull / 3.0, 1.0)
-ifs_bear_norm = math.min(ifs_bear / 3.0, 1.0)
+float ifs_bull      = body_pct * vol_ratio * (aggression_bull ? 1.4 : 1.0)
+float ifs_bear      = body_pct * vol_ratio * (aggression_bear ? 1.4 : 1.0)
+float ifs_bull_norm = math.min(ifs_bull / 3.0, 1.0)
+float ifs_bear_norm = math.min(ifs_bear / 3.0, 1.0)
 
 // =============================================================================
 // F. PROBABILISTIC EDGE SCORE (PES)
 // =============================================================================
-// PES = weighted sum of normalised sub-scores.
-// Weights are tuned so no single factor dominates.
-//
-// PES ∈ [0, 1].   1 = maximum edge alignment.
-//
-// Weight rationale:
-//   Energy (ECS)  35% — compression is the primary prerequisite
-//   Volume (VIL)  35% — institutional volume confirmation
-//   Footprint(IFS)30% — directional efficiency confirms intent
-//
-// Absorption bonus multiplies PES by 1.15 (absorption = stealth accumulation/dist.)
+// PES = 0.35×ECS_score + 0.35×Vol_score + 0.30×IFS_score  ∈ [0, 1]
+// Absorption bonus ×1.15: stealth accumulation/distribution fingerprint.
 
-W_ECS = 0.35
-W_VIL = 0.35
-W_IFS = 0.30
+const float W_ECS = 0.35
+const float W_VIL = 0.35
+const float W_IFS = 0.30
 
-// Invert ECS for scoring: low ECS (compression) = high score
-ecs_score    = math.min(1.0 / (ecs + 0.001), 1.0)
-vol_score    = math.min(vol_ratio / 3.0, 1.0)
+float ecs_score    = math.min(1.0 / (ecs + 0.001), 1.0)   // inverted: low ECS = high score
+float vol_score    = math.min(vol_ratio / 3.0, 1.0)
 
-pes_bull_raw = W_ECS * ecs_score + W_VIL * vol_score + W_IFS * ifs_bull_norm
-pes_bear_raw = W_ECS * ecs_score + W_VIL * vol_score + W_IFS * ifs_bear_norm
+float pes_bull_raw = W_ECS * ecs_score + W_VIL * vol_score + W_IFS * ifs_bull_norm
+float pes_bear_raw = W_ECS * ecs_score + W_VIL * vol_score + W_IFS * ifs_bear_norm
 
-pes_bull = math.min(pes_bull_raw * (absorption_bull ? 1.15 : 1.0), 1.0)
-pes_bear = math.min(pes_bear_raw * (absorption_bear ? 1.15 : 1.0), 1.0)
+float pes_bull = math.min(pes_bull_raw * (absorption_bull ? 1.15 : 1.0), 1.0)
+float pes_bear = math.min(pes_bear_raw * (absorption_bear ? 1.15 : 1.0), 1.0)
 
 // =============================================================================
-// G. ORDER BLOCK DETECTION (FIELD ZONES)
+// G. FIELD ZONE DETECTION
 // =============================================================================
-// A FIELD Zone (FZ) forms when:
-//   1. A volume pivot high occurs (strong volume at that bar)
+// A FIELD Zone forms when:
+//   1. Volume pivot high is confirmed (strong volume bar)
 //   2. Market structure confirms directional bias (OS model)
-//   3. PES at formation time ≥ user threshold (quality gate)
-//
-// Unlike standard OBs, FIELD Zones carry their edge score at birth —
-// a fading score (implemented via mitigation) removes weak zones faster.
+//   3. PES at formation bar ≥ user threshold
 
 var int   os          = 0
-var float target_bull = 0.
-var float target_bear = 0.
+var float target_bull = 0.0
+var float target_bear = 0.0
 
-upper = ta.highest(i_pivot_len)
-lower = ta.lowest (i_pivot_len)
+float upper = ta.highest(i_pivot_len)
+float lower = ta.lowest (i_pivot_len)
 
 target_bull := i_mitigation == "Close" ? ta.lowest (close, i_pivot_len) : lower
 target_bear := i_mitigation == "Close" ? ta.highest(close, i_pivot_len) : upper
 
-// Structure: 0 = bearish (downtrend), 1 = bullish (uptrend)
+// Structure: 0 = bearish context, 1 = bullish context
 os := high[i_pivot_len] > upper ? 0 : low[i_pivot_len] < lower ? 1 : os[1]
 
-phv = ta.pivothigh(volume, i_pivot_len, i_pivot_len)
+float phv = ta.pivothigh(volume, i_pivot_len, i_pivot_len)   // na = not a pivot
 
-// Snapshot PES at zone-formation bar (look back by pivot_len)
-snap_pes_bull = pes_bull[i_pivot_len]
-snap_pes_bear = pes_bear[i_pivot_len]
+// Snapshot PES at formation bar (look back by pivot_len)
+float snap_pes_bull = pes_bull[i_pivot_len]
+float snap_pes_bear = pes_bear[i_pivot_len]
 
-pass_gate_bull = not i_use_prob_gate or snap_pes_bull >= i_min_pes
-pass_gate_bear = not i_use_prob_gate or snap_pes_bear >= i_min_pes
+bool pass_gate_bull = not i_use_prob_gate or snap_pes_bull >= i_min_pes
+bool pass_gate_bear = not i_use_prob_gate or snap_pes_bear >= i_min_pes
 
-bull_fz_formed = phv and os == 1 and pass_gate_bull
-bear_fz_formed = phv and os == 0 and pass_gate_bear
+bool bull_fz_formed = not na(phv) and os == 1 and pass_gate_bull
+bool bear_fz_formed = not na(phv) and os == 0 and pass_gate_bear
 
-// --- Zone coordinate arrays (parallel arrays = O(1) indexed access) ---------
-var bull_top     = array.new_float(0)
-var bull_btm     = array.new_float(0)
-var bull_avg     = array.new_float(0)
-var bull_t_left  = array.new_int  (0)
-var bull_score   = array.new_float(0)
+// --- Parallel arrays (O(1) indexed access) -----------------------------------
+var array<float> bull_top    = array.new<float>()
+var array<float> bull_btm    = array.new<float>()
+var array<float> bull_avg    = array.new<float>()
+var array<int>   bull_t_left = array.new<int>()
+var array<float> bull_score  = array.new<float>()
 
-var bear_top     = array.new_float(0)
-var bear_btm     = array.new_float(0)
-var bear_avg     = array.new_float(0)
-var bear_t_left  = array.new_int  (0)
-var bear_score   = array.new_float(0)
+var array<float> bear_top    = array.new<float>()
+var array<float> bear_btm    = array.new<float>()
+var array<float> bear_avg    = array.new<float>()
+var array<int>   bear_t_left = array.new<int>()
+var array<float> bear_score  = array.new<float>()
 
 var float bull_ob = na
 var float bear_ob = na
 
-// --- Add new zones -----------------------------------------------------------
+// --- Append new zones --------------------------------------------------------
 if bull_fz_formed
-    t_top = hl2[i_pivot_len]
-    t_btm = low[i_pivot_len]
-    array.unshift(bull_top,    t_top)
-    array.unshift(bull_btm,    t_btm)
-    array.unshift(bull_avg,    math.avg(t_top, t_btm))
-    array.unshift(bull_t_left, time[i_pivot_len])
-    array.unshift(bull_score,  snap_pes_bull)
+    float t_top = hl2[i_pivot_len]
+    float t_btm = low[i_pivot_len]
+    bull_top   .unshift(t_top)
+    bull_btm   .unshift(t_btm)
+    bull_avg   .unshift((t_top + t_btm) / 2.0)
+    bull_t_left.unshift(time[i_pivot_len])
+    bull_score .unshift(snap_pes_bull)
     bull_ob := t_btm
 
 if bear_fz_formed
-    t_top = high[i_pivot_len]
-    t_btm = hl2[i_pivot_len]
-    array.unshift(bear_top,    t_top)
-    array.unshift(bear_btm,    t_btm)
-    array.unshift(bear_avg,    math.avg(t_top, t_btm))
-    array.unshift(bear_t_left, time[i_pivot_len])
-    array.unshift(bear_score,  snap_pes_bear)
+    float t_top = high[i_pivot_len]
+    float t_btm = hl2[i_pivot_len]
+    bear_top   .unshift(t_top)
+    bear_btm   .unshift(t_btm)
+    bear_avg   .unshift((t_top + t_btm) / 2.0)
+    bear_t_left.unshift(time[i_pivot_len])
+    bear_score .unshift(snap_pes_bear)
     bear_ob := t_top
 
-// --- Remove mitigated zones (iterate BACKWARD to preserve indices) -----------
+// --- Remove mitigated zones (backward iteration preserves indices) -----------
 var bool mitigated_bull = false
 var bool mitigated_bear = false
 mitigated_bull := false
 mitigated_bear := false
 
-if array.size(bull_btm) > 0
-    for i = array.size(bull_btm) - 1 to 0
-        if target_bull < array.get(bull_btm, i)
-            array.remove(bull_top,    i)
-            array.remove(bull_btm,    i)
-            array.remove(bull_avg,    i)
-            array.remove(bull_t_left, i)
-            array.remove(bull_score,  i)
+if bull_btm.size() > 0
+    for i = bull_btm.size() - 1 to 0 by -1
+        if target_bull < bull_btm.get(i)
+            bull_top   .remove(i)
+            bull_btm   .remove(i)
+            bull_avg   .remove(i)
+            bull_t_left.remove(i)
+            bull_score .remove(i)
             mitigated_bull := true
 
-if array.size(bear_top) > 0
-    for i = array.size(bear_top) - 1 to 0
-        if target_bear > array.get(bear_top, i)
-            array.remove(bear_top,    i)
-            array.remove(bear_btm,    i)
-            array.remove(bear_avg,    i)
-            array.remove(bear_t_left, i)
-            array.remove(bear_score,  i)
+if bear_top.size() > 0
+    for i = bear_top.size() - 1 to 0 by -1
+        if target_bear > bear_top.get(i)
+            bear_top   .remove(i)
+            bear_btm   .remove(i)
+            bear_avg   .remove(i)
+            bear_t_left.remove(i)
+            bear_score .remove(i)
             mitigated_bear := true
 
 // =============================================================================
 // H. RENDERING — FIELD ZONES
 // =============================================================================
-var bull_boxes = array.new_box (0)
-var bull_lines = array.new_line(0)
-var bear_boxes = array.new_box (0)
-var bear_lines = array.new_line(0)
+var array<box>  bull_boxes = array.new<box>()
+var array<line> bull_lines = array.new<line>()
+var array<box>  bear_boxes = array.new<box>()
+var array<line> bear_lines = array.new<line>()
 
-// Pre-allocate drawing objects once (avoid barstate.islast recreation)
+// Pre-allocate drawing objects once at bar 0 — no recreation overhead
 if barstate.isfirst
     for i = 0 to i_bull_max - 1
-        array.push(bull_boxes,
-          box.new(na, na, na, na
-            , xloc         = xloc.bar_time
-            , extend       = extend.right
-            , bgcolor      = i_bg_bull
-            , border_color = color.new(i_bull_css, 50)))
-        array.push(bull_lines,
-          line.new(na, na, na, na
-            , xloc   = xloc.bar_time
-            , extend = extend.right
-            , color  = color.new(i_bull_css, 20)
-            , style  = line.style_dashed
-            , width  = 1))
+        bull_boxes.push(box.new(na, na, na, na
+          , xloc         = xloc.bar_time
+          , extend       = extend.right
+          , bgcolor      = i_bg_bull
+          , border_color = color.new(i_bull_css, 50)))
+        bull_lines.push(line.new(na, na, na, na
+          , xloc   = xloc.bar_time
+          , extend = extend.right
+          , color  = color.new(i_bull_css, 20)
+          , style  = line.style_dashed
+          , width  = 1))
     for i = 0 to i_bear_max - 1
-        array.push(bear_boxes,
-          box.new(na, na, na, na
-            , xloc         = xloc.bar_time
-            , extend       = extend.right
-            , bgcolor      = i_bg_bear
-            , border_color = color.new(i_bear_css, 50)))
-        array.push(bear_lines,
-          line.new(na, na, na, na
-            , xloc   = xloc.bar_time
-            , extend = extend.right
-            , color  = color.new(i_bear_css, 20)
-            , style  = line.style_dashed
-            , width  = 1))
+        bear_boxes.push(box.new(na, na, na, na
+          , xloc         = xloc.bar_time
+          , extend       = extend.right
+          , bgcolor      = i_bg_bear
+          , border_color = color.new(i_bear_css, 50)))
+        bear_lines.push(line.new(na, na, na, na
+          , xloc   = xloc.bar_time
+          , extend = extend.right
+          , color  = color.new(i_bear_css, 20)
+          , style  = line.style_dashed
+          , width  = 1))
 
-// Update geometry on each new bar (islast = live + historical replay)
 if barstate.islast
-    for i = 0 to math.min(i_bull_max - 1, array.size(bull_top) - 1)
-        bx = array.get(bull_boxes, i)
-        ln = array.get(bull_lines, i)
-        box.set_lefttop    (bx, array.get(bull_t_left, i), array.get(bull_top, i))
-        box.set_rightbottom(bx, array.get(bull_t_left, i), array.get(bull_btm, i))
-        line.set_xy1(ln, array.get(bull_t_left, i),     array.get(bull_avg, i))
-        line.set_xy2(ln, array.get(bull_t_left, i) + 1, array.get(bull_avg, i))
-    for i = 0 to math.min(i_bear_max - 1, array.size(bear_top) - 1)
-        bx = array.get(bear_boxes, i)
-        ln = array.get(bear_lines, i)
-        box.set_lefttop    (bx, array.get(bear_t_left, i), array.get(bear_top, i))
-        box.set_rightbottom(bx, array.get(bear_t_left, i), array.get(bear_btm, i))
-        line.set_xy1(ln, array.get(bear_t_left, i),     array.get(bear_avg, i))
-        line.set_xy2(ln, array.get(bear_t_left, i) + 1, array.get(bear_avg, i))
+    int bull_count = math.min(i_bull_max - 1, bull_top.size() - 1)
+    if bull_count >= 0
+        for i = 0 to bull_count
+            box  bx = bull_boxes.get(i)
+            line ln = bull_lines.get(i)
+            bx.set_lefttop    (bull_t_left.get(i), bull_top.get(i))
+            bx.set_rightbottom(bull_t_left.get(i), bull_btm.get(i))
+            ln.set_xy1(bull_t_left.get(i),     bull_avg.get(i))
+            ln.set_xy2(bull_t_left.get(i) + 1, bull_avg.get(i))
+
+    int bear_count = math.min(i_bear_max - 1, bear_top.size() - 1)
+    if bear_count >= 0
+        for i = 0 to bear_count
+            box  bx = bear_boxes.get(i)
+            line ln = bear_lines.get(i)
+            bx.set_lefttop    (bear_t_left.get(i), bear_top.get(i))
+            bx.set_rightbottom(bear_t_left.get(i), bear_btm.get(i))
+            ln.set_xy1(bear_t_left.get(i),     bear_avg.get(i))
+            ln.set_xy2(bear_t_left.get(i) + 1, bear_avg.get(i))
 
 // =============================================================================
 // I. EXECUTION LAYER — Entry Signals
 // =============================================================================
-// Entry logic (cause → effect chain):
-//   1. Price RETURNS to a FIELD Zone (FZ)        ← price action
-//   2. ECS confirms COMPRESSION at re-test       ← energy state
-//   3. Candle closes IN the direction of the FZ  ← confirmation candle
-//   4. Volume ≥ 80% of average                   ← not dead volume
+// Entry cause → effect chain:
+//   1. Price RETURNS to a FIELD Zone            ← price action
+//   2. ECS confirms COMPRESSION on the re-test  ← energy state
+//   3. Candle closes in the direction of the FZ ← confirmation candle
+//   4. Volume ≥ 80 % of average                 ← not dead volume
 //
-// Stop Loss: zone extreme ± 0.2 × ATR buffer
-// Take Profit: Entry ± Risk × RR (default 1:5)
+// Stop Loss  : zone extreme ± 0.2 × ATR buffer
+// Take Profit: Entry ± Risk × RR  (default 1:5)
 
-in_bull_fz = false
-in_bear_fz = false
+bool in_bull_fz = false
+bool in_bear_fz = false
 
-if array.size(bull_top) > 0
-    for i = 0 to array.size(bull_top) - 1
-        if low <= array.get(bull_top, i) and close >= array.get(bull_btm, i)
+if bull_top.size() > 0
+    for i = 0 to bull_top.size() - 1
+        if low <= bull_top.get(i) and close >= bull_btm.get(i)
             in_bull_fz := true
 
-if array.size(bear_top) > 0
-    for i = 0 to array.size(bear_top) - 1
-        if high >= array.get(bear_btm, i) and close <= array.get(bear_top, i)
+if bear_top.size() > 0
+    for i = 0 to bear_top.size() - 1
+        if high >= bear_btm.get(i) and close <= bear_top.get(i)
             in_bear_fz := true
 
-// Final entry conditions
-bull_entry = in_bull_fz and is_compressing and close > open and vol_ratio >= 0.80
-bear_entry = in_bear_fz and is_compressing and close < open and vol_ratio >= 0.80
+bool bull_entry = in_bull_fz and is_compressing and close > open and vol_ratio >= 0.80
+bool bear_entry = in_bear_fz and is_compressing and close < open and vol_ratio >= 0.80
 
-// SL / TP levels
 float bull_sl = na
 float bull_tp = na
 float bear_sl = na
 float bear_tp = na
 
-if bull_entry and array.size(bull_btm) > 0
-    bull_sl := array.get(bull_btm, 0) - atr * 0.20
-    bull_risk = close - bull_sl
-    bull_tp   := close + bull_risk * i_rr_ratio
+if bull_entry and bull_btm.size() > 0
+    bull_sl := bull_btm.get(0) - atr * 0.20
+    float bull_risk = close - bull_sl
+    bull_tp := close + bull_risk * i_rr_ratio
 
-if bear_entry and array.size(bear_top) > 0
-    bear_sl := array.get(bear_top, 0) + atr * 0.20
-    bear_risk = bear_sl - close
-    bear_tp   := close - bear_risk * i_rr_ratio
+if bear_entry and bear_top.size() > 0
+    bear_sl := bear_top.get(0) + atr * 0.20
+    float bear_risk = bear_sl - close
+    bear_tp := close - bear_risk * i_rr_ratio
 
 // =============================================================================
 // J. LABELS & PROJECTIONS
@@ -417,10 +378,10 @@ if i_show_signals
           , style     = label.style_label_up
           , size      = size.small)
         if i_show_rr and not na(bull_tp)
-            line.new(bar_index, close, bar_index + 15, bull_tp,
-              color=color.new(i_bull_css, 20), style=line.style_dotted, width=2)
-            line.new(bar_index, close, bar_index + 15, bull_sl,
-              color=color.new(color.red, 20), style=line.style_dotted, width=2)
+            line.new(bar_index, close, bar_index + 15, bull_tp
+              , color = color.new(i_bull_css, 20), style = line.style_dotted, width = 2)
+            line.new(bar_index, close, bar_index + 15, bull_sl
+              , color = color.new(color.red, 20),  style = line.style_dotted, width = 2)
 
     if bear_entry
         label.new(bar_index, high + atr * 0.35
@@ -430,48 +391,43 @@ if i_show_signals
           , style     = label.style_label_down
           , size      = size.small)
         if i_show_rr and not na(bear_tp)
-            line.new(bar_index, close, bar_index + 15, bear_tp,
-              color=color.new(i_bear_css, 20), style=line.style_dotted, width=2)
-            line.new(bar_index, close, bar_index + 15, bear_sl,
-              color=color.new(color.red, 20), style=line.style_dotted, width=2)
+            line.new(bar_index, close, bar_index + 15, bear_tp
+              , color = color.new(i_bear_css, 20), style = line.style_dotted, width = 2)
+            line.new(bar_index, close, bar_index + 15, bear_sl
+              , color = color.new(color.red, 20),  style = line.style_dotted, width = 2)
 
-// Energy state background
-bgcolor(i_show_energy and is_compressing ? color.new(color.yellow, 94) : na,
-  title="Compression Phase")
-bgcolor(i_show_energy and is_expanding   ? color.new(#2962ff,     94) : na,
-  title="Expansion Phase")
+bgcolor(i_show_energy and is_compressing ? color.new(color.yellow, 94) : na, title = "Compression Phase")
+bgcolor(i_show_energy and is_expanding   ? color.new(#2962ff,     94) : na, title = "Expansion Phase")
 
 // =============================================================================
-// K. PLOTS (for external scripts / strategy bridging)
+// K. PLOTS (sub-pane diagnostics + external script bridging)
 // =============================================================================
 
 plot(bull_ob, "Bull FIELD Zone", i_bull_css, 2,
-  plot.style_linebr, offset=-i_pivot_len, display=display.none)
+  plot.style_linebr, offset = -i_pivot_len, display = display.none)
 
 plot(bear_ob, "Bear FIELD Zone", i_bear_css, 2,
-  plot.style_linebr, offset=-i_pivot_len, display=display.none)
+  plot.style_linebr, offset = -i_pivot_len, display = display.none)
 
-plot(pes_bull, "PES Bull", color.new(i_bull_css, 60), display=display.pane)
-plot(pes_bear, "PES Bear", color.new(i_bear_css, 60), display=display.pane)
-plot(ecs,      "ECS",      color.new(color.yellow, 40), display=display.pane)
-hline(i_compress_thresh, "Compress Line", color.new(color.yellow, 40),
-  linestyle=hline.style_dashed, linewidth=1)
-hline(i_min_pes,          "PES Gate",     color.new(color.white,  60),
-  linestyle=hline.style_dotted, linewidth=1)
+plot(pes_bull, "PES Bull", color.new(i_bull_css,   60), display = display.pane)
+plot(pes_bear, "PES Bear", color.new(i_bear_css,   60), display = display.pane)
+plot(ecs,      "ECS",      color.new(color.yellow, 40), display = display.pane)
+hline(i_compress_thresh, "Compress Line", color.new(color.yellow, 40), linestyle = hline.style_dashed, linewidth = 1)
+hline(i_min_pes,         "PES Gate",      color.new(color.white,  60), linestyle = hline.style_dotted, linewidth = 1)
 
 // =============================================================================
 // L. ALERTS
 // =============================================================================
 
-alertcondition(bull_fz_formed,  "FIELD Bull Zone Formed",  "Bullish FIELD Zone detected — HTF bias UP")
-alertcondition(bear_fz_formed,  "FIELD Bear Zone Formed",  "Bearish FIELD Zone detected — HTF bias DOWN")
-alertcondition(bull_entry,      "FIELD Long Entry",         "Long entry signal fired inside Bull FIELD Zone")
-alertcondition(bear_entry,      "FIELD Short Entry",        "Short entry signal fired inside Bear FIELD Zone")
-alertcondition(mitigated_bull,  "Bull FIELD Zone Broken",   "Bullish FIELD Zone has been mitigated")
-alertcondition(mitigated_bear,  "Bear FIELD Zone Broken",   "Bearish FIELD Zone has been mitigated")
-alertcondition(is_compressing,  "Compression Phase Active", "Market entering compression — watch for FIELD zone re-tests")
-alertcondition(is_expanding,    "Expansion Phase Active",   "Market entering expansion — momentum in play")
+alertcondition(bull_fz_formed, "FIELD Bull Zone Formed",  "Bullish FIELD Zone detected — HTF bias UP")
+alertcondition(bear_fz_formed, "FIELD Bear Zone Formed",  "Bearish FIELD Zone detected — HTF bias DOWN")
+alertcondition(bull_entry,     "FIELD Long Entry",         "Long entry signal fired inside Bull FIELD Zone")
+alertcondition(bear_entry,     "FIELD Short Entry",        "Short entry signal fired inside Bear FIELD Zone")
+alertcondition(mitigated_bull, "Bull FIELD Zone Broken",   "Bullish FIELD Zone has been mitigated")
+alertcondition(mitigated_bear, "Bear FIELD Zone Broken",   "Bearish FIELD Zone has been mitigated")
+alertcondition(is_compressing, "Compression Phase Active", "Market entering compression — watch for FIELD zone re-tests")
+alertcondition(is_expanding,   "Expansion Phase Active",   "Market entering expansion — momentum in play")
 
 // =============================================================================
-// END OF FIELD FRAMEWORK v1.0
+// END OF FIELD FRAMEWORK v2.0
 // =============================================================================
