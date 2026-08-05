@@ -1,0 +1,1661 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AXIOM · Adaptive eXecution & Institutional Order-flow Mapping
+//  Non-repainting institutional price-action framework
+//
+//  IIDE  Institutional Intent Detection ..... replaces Order Blocks
+//  AIE   Adaptive Imbalance ................. replaces FVG / IFVG
+//  MSE   Macro Structure .................... replaces BOS / CHoCH
+//  SSE   State-Shift Trigger ................ replaces CISD
+//  CDE   Confirmation & Decision ............ retest + entry mode + arbitrator
+//  MTC   Multi-Timeframe Confluence ......... auto HTF ladder + zone upgrade
+//  LCC   Liquidity & Clutter Control ........ sweep-gated liquidity + merging
+//  RMD   Risk & Trade Desk .................. sizing + management + panel
+//
+//  Non-repainting contract:
+//    · all classification runs under barstate.isconfirmed
+//    · HTF access uses [1]-offset series with lookahead_off only
+//    · no varip, no lower-timeframe requests
+//    · object states are monotone; death is terminal
+//    · display may update intrabar, logic may not
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("AXIOM · Institutional Price Action", "AXIOM", overlay = true, max_boxes_count = 200, max_lines_count = 200, max_labels_count = 200, max_bars_back = 700)
+
+// ══════════════════════════════ 1 · INPUTS ════════════════════════════════════
+G0 = "◆ Core"
+G1 = "◆ Institutional Intent · IIDE"
+G2 = "◆ Adaptive Imbalance · AIE"
+G3 = "◆ Macro Structure · MSE"
+G4 = "◆ State Shift · SSE"
+G5 = "◆ Confirmation & Decision · CDE"
+G6 = "◆ Multi-Timeframe · MTC"
+G7 = "◆ Liquidity & Clutter · LCC"
+G8 = "◆ Risk Desk · RMD"
+G9 = "◆ Regime & Adaptation"
+GV = "◆ Visuals"
+
+i_dirMode   = input.string("Both", "Direction bias", options = ["Both", "Long only", "Short only"], group = G0)
+i_zoneLimit = input.int(4, "Zone display limit (per side)", minval = 1, maxval = 10, group = G0)
+i_minTrade  = input.int(70, "Min trade score", minval = 50, maxval = 95, group = G0)
+i_maxSig    = input.int(2, "Max signals / 100 bars", minval = 1, maxval = 6, group = G0)
+i_atrLen    = input.int(14, "ATR length", minval = 5, maxval = 50, group = G0)
+i_rankW     = input.int(200, "Rank window (bars)", minval = 50, maxval = 500, group = G0)
+
+i_iideOn    = input.bool(true, "Enable Intent Nodes", group = G1)
+i_t1        = input.int(78, "Tier-1 score", minval = 55, maxval = 95, group = G1)
+i_t2        = input.int(62, "Tier-2 score", minval = 40, maxval = 90, group = G1)
+i_gPart     = input.bool(true, "Gate · participation rank ≥", group = G1, inline = "g1")
+i_partMin   = input.float(0.80, "", minval = 0.0, maxval = 1.0, step = 0.05, group = G1, inline = "g1")
+i_gCor      = input.bool(true, "Gate · Cost-of-Reversal pct ≥", group = G1, inline = "g2")
+i_corMin    = input.float(0.75, "", minval = 0.0, maxval = 1.0, step = 0.05, group = G1, inline = "g2")
+i_gAbs      = input.bool(true, "Gate · absorption score ≥", group = G1, inline = "g3")
+i_absMin    = input.int(55, "", minval = 0, maxval = 100, group = G1, inline = "g3")
+i_gStruct   = input.bool(true, "Gate · structure agreement", group = G1)
+i_gHtf      = input.bool(true, "Gate · HTF agreement", group = G1)
+i_gImb      = input.bool(true, "Gate · imbalance confluence", group = G1)
+i_gOpp      = input.bool(true, "Gate · no opposing overlap", group = G1)
+i_clMax     = input.int(4, "Origin cluster max bars", minval = 2, maxval = 8, group = G1)
+i_clRng     = input.float(0.90, "Origin cluster max bar range (ATR)", minval = 0.3, maxval = 2.0, step = 0.05, group = G1)
+i_maxW      = input.float(1.80, "Max zone width (ATR)", minval = 0.5, maxval = 4.0, step = 0.1, group = G1)
+i_minW      = input.float(0.10, "Min zone width (ATR)", minval = 0.02, maxval = 0.60, step = 0.01, group = G1)
+i_killBuf   = input.float(0.15, "Kill-line buffer (ATR)", minval = 0.0, maxval = 0.60, step = 0.01, group = G1)
+i_oneShot   = input.bool(true, "One-shot test rule (2nd touch kills)", group = G1)
+i_maxDepth  = input.float(0.75, "Max test penetration (frac)", minval = 0.30, maxval = 1.0, step = 0.05, group = G1)
+i_reactWin  = input.int(3, "Reaction window (bars)", minval = 1, maxval = 10, group = G1)
+i_reactMin  = input.float(0.55, "Min reaction (ATR)", minval = 0.10, maxval = 2.0, step = 0.05, group = G1)
+i_expTravel = input.float(12.0, "Travel expiry (ATR)", minval = 3.0, maxval = 40.0, step = 0.5, group = G1)
+i_bodyAbs   = input.float(0.68, "Body ratio floor", minval = 0.40, maxval = 0.95, step = 0.01, group = G1)
+i_bodyPct   = input.float(0.80, "Body ratio percentile", minval = 0.30, maxval = 0.99, step = 0.01, group = G1)
+i_maxNodes  = input.int(24, "Max tracked nodes", minval = 6, maxval = 40, group = G1)
+
+i_aieOn     = input.bool(true, "Enable Imbalance Channels", group = G2)
+i_gapAbs    = input.float(0.30, "Min gap size (ATR)", minval = 0.05, maxval = 1.50, step = 0.01, group = G2)
+i_gapPct    = input.float(0.70, "Min gap size percentile", minval = 0.30, maxval = 0.99, step = 0.01, group = G2)
+i_gradeA    = input.int(76, "Grade A threshold", minval = 60, maxval = 95, group = G2)
+i_gradeB    = input.int(58, "Grade B threshold", minval = 35, maxval = 85, group = G2)
+i_showC     = input.bool(false, "Show grade C", group = G2)
+i_render    = input.string("50% (CE)", "Render mode", options = ["Full", "50% (CE)", "Remaining"], group = G2)
+i_ceKill    = input.bool(true, "Death on CE close-through", group = G2)
+i_invOn     = input.bool(true, "Enable inversions (IFVG)", group = G2)
+i_invDisp   = input.bool(true, "Inversion · require displacement", group = G2)
+i_invLiq    = input.bool(true, "Inversion · require swept liquidity", group = G2)
+i_invStr    = input.bool(true, "Inversion · require structure flip", group = G2)
+i_invDepth  = input.float(0.45, "Inversion · min close depth (ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G2)
+i_maxImbs   = input.int(24, "Max tracked channels", minval = 6, maxval = 40, group = G2)
+
+i_swRetATR  = input.float(1.20, "Swing retracement (ATR)", minval = 0.30, maxval = 4.0, step = 0.05, group = G3)
+i_swRetFrac = input.float(0.33, "Swing retracement (frac of leg)", minval = 0.10, maxval = 0.90, step = 0.01, group = G3)
+i_swAmpATR  = input.float(1.50, "Min swing amplitude (ATR)", minval = 0.30, maxval = 5.0, step = 0.05, group = G3)
+i_minSep    = input.int(3, "Min pivot separation (bars)", minval = 1, maxval = 20, group = G3)
+i_rightBars = input.int(2, "Pivot confirmation bars", minval = 1, maxval = 10, group = G3)
+i_brkBuf    = input.float(0.10, "Break buffer (ATR)", minval = 0.0, maxval = 0.50, step = 0.01, group = G3)
+i_brkDisp   = input.bool(true, "Require displacement on break", group = G3)
+i_revStrict = input.bool(true, "Reversal · stricter burden of proof", group = G3)
+i_revDisp   = input.float(2.00, "Reversal · min displacement (ATR)", minval = 1.0, maxval = 5.0, step = 0.1, group = G3)
+i_balWin    = input.int(30, "Balance window (bars)", minval = 10, maxval = 120, group = G3)
+i_contWin   = input.int(8, "Expansion window (bars)", minval = 2, maxval = 30, group = G3)
+i_structShow= input.string("Minimal", "Structure display", options = ["Off", "Minimal", "Full"], group = G3)
+i_dispAbs   = input.float(1.60, "Displacement floor (ATR)", minval = 0.50, maxval = 5.0, step = 0.05, group = G3)
+i_dispPct   = input.float(0.75, "Displacement percentile", minval = 0.30, maxval = 0.99, step = 0.01, group = G3)
+i_legEff    = input.float(0.55, "Leg path efficiency min", minval = 0.20, maxval = 0.95, step = 0.05, group = G3)
+i_purity    = input.float(0.66, "Directional purity min", minval = 0.30, maxval = 1.0, step = 0.02, group = G3)
+i_legVol    = input.float(0.60, "Leg participation rank min", minval = 0.0, maxval = 1.0, step = 0.05, group = G3)
+i_maxLeg    = input.int(5, "Max leg bars", minval = 2, maxval = 10, group = G3)
+
+i_sseOn     = input.bool(true, "Enable state-shift trigger", group = G4)
+i_anchorLB  = input.int(6, "Anchor lookback (bars)", minval = 2, maxval = 20, group = G4)
+i_shiftBuf  = input.float(0.08, "Shift buffer (ATR)", minval = 0.0, maxval = 0.50, step = 0.01, group = G4)
+i_shiftWin  = input.int(8, "Shift window (bars)", minval = 2, maxval = 30, group = G4)
+i_sseHtf    = input.bool(true, "Mandatory HTF alignment", group = G4)
+i_sseOpac   = input.int(92, "Shift zone opacity", minval = 70, maxval = 100, group = G4)
+
+i_retestTol = input.float(0.12, "Retest tolerance (ATR)", minval = 0.0, maxval = 0.60, step = 0.01, group = G5)
+i_retestWin = input.int(10, "Retest window (bars)", minval = 2, maxval = 40, group = G5)
+i_overshoot = input.float(0.35, "Max retest overshoot (ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G5)
+i_mktProx   = input.float(0.30, "Market proximity (ATR)", minval = 0.05, maxval = 1.5, step = 0.05, group = G5)
+i_pendMax   = input.float(1.20, "Pending max distance (ATR)", minval = 0.20, maxval = 4.0, step = 0.05, group = G5)
+i_pendLife  = input.int(8, "Pending life (bars)", minval = 1, maxval = 40, group = G5)
+i_spreadBuf = input.float(0.05, "Pending offset (ATR)", minval = 0.0, maxval = 0.50, step = 0.01, group = G5)
+i_slBuf     = input.float(0.20, "SL buffer beyond distal (ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = G5)
+i_minStop   = input.float(0.45, "Min stop (ATR)", minval = 0.10, maxval = 2.0, step = 0.05, group = G5)
+i_maxStop   = input.float(2.50, "Max stop (ATR)", minval = 0.50, maxval = 6.0, step = 0.1, group = G5)
+i_minRR     = input.float(1.20, "Min R:R to TP1", minval = 0.50, maxval = 5.0, step = 0.1, group = G5)
+i_arbOn     = input.bool(true, "Opposing-setup arbitrator", group = G5)
+i_switchMrg = input.float(12.0, "Switch margin (score pts)", minval = 0.0, maxval = 40.0, step = 1.0, group = G5)
+i_switchCd  = input.int(12, "Switch cooldown (bars)", minval = 0, maxval = 60, group = G5)
+i_standDown = input.bool(true, "Stand down on two-sided conflict", group = G5)
+i_decayTau  = input.int(40, "Score decay tau (bars)", minval = 5, maxval = 200, group = G5)
+
+i_htfMode   = input.string("Auto", "HTF mode", options = ["Auto", "Manual"], group = G6)
+i_htfManual = input.timeframe("240", "Manual HTF", group = G6)
+i_allowNeut = input.bool(true, "Allow neutral HTF bias", group = G6)
+i_upgradeOn = input.bool(true, "Dynamic zone upgrade (★)", group = G6)
+i_htfOvl    = input.float(0.35, "HTF overlap minimum", minval = 0.05, maxval = 1.0, step = 0.05, group = G6)
+i_htfBonus  = input.float(6.0, "HTF score bonus", minval = 0.0, maxval = 20.0, step = 1.0, group = G6)
+i_showHtf   = input.bool(false, "Show HTF POI outline", group = G6)
+
+i_liqMode   = input.string("Post-sweep only", "Liquidity display", options = ["Post-sweep only", "All", "Off"], group = G7)
+i_eqTol     = input.float(0.15, "Equal-level tolerance (ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = G7)
+i_swPierce  = input.float(0.10, "Sweep pierce minimum (ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = G7)
+i_swReclaim = input.int(2, "Sweep reclaim window (bars)", minval = 1, maxval = 6, group = G7)
+i_mergeOn   = input.bool(true, "Merge overlapping zones", group = G7)
+i_mergeGap  = input.float(0.35, "Merge gap (ATR)", minval = 0.0, maxval = 1.5, step = 0.05, group = G7)
+i_maxLiq    = input.int(12, "Max tracked liquidity levels", minval = 4, maxval = 30, group = G7)
+
+i_equity    = input.float(10000.0, "Account equity", minval = 1.0, group = G8)
+i_acctCur   = input.string("USD", "Account currency", options = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"], group = G8)
+i_riskPct   = input.float(1.0, "Risk %", minval = 0.05, maxval = 10.0, step = 0.05, group = G8)
+i_assetMode = input.string("Auto", "Asset class", options = ["Auto", "Forex", "Metals", "Index", "Crypto"], group = G8)
+i_manualVal = input.float(0.0, "Manual value per point per unit (0 = auto)", minval = 0.0, group = G8)
+i_tp1Frac   = input.int(50, "TP1 fraction %", minval = 10, maxval = 90, group = G8)
+i_beOn      = input.bool(true, "Breakeven+ after TP1", group = G8)
+i_beBuf     = input.float(0.10, "Breakeven buffer (ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = G8)
+i_trailOn   = input.bool(true, "ATR trail after TP1", group = G8)
+i_trailLen  = input.int(10, "Trail lookback", minval = 3, maxval = 50, group = G8)
+i_trailMult = input.float(2.0, "Trail ATR multiple", minval = 0.5, maxval = 6.0, step = 0.1, group = G8)
+i_rrBox     = input.bool(true, "Show R:R box", group = G8)
+i_panelOn   = input.bool(true, "Show Trade Guide Panel", group = G8)
+i_panelPos  = input.string("Top right", "Panel position", options = ["Top right", "Bottom right", "Top left", "Bottom left", "Middle right"], group = G8)
+i_panelSize = input.string("Small", "Panel size", options = ["Tiny", "Small", "Normal"], group = G8)
+i_levBase   = input.float(1.0, "Crypto: contract size (base units)", minval = 0.00000001, group = G8)
+
+i_regimeOn  = input.bool(true, "Enable regime adaptation", group = G9)
+i_effLb     = input.int(20, "Efficiency lookback", minval = 5, maxval = 100, group = G9)
+i_deadVeto  = input.bool(true, "Dead-tape veto", group = G9)
+i_sessOn    = input.bool(false, "Session filter", group = G9)
+i_sess      = input.session("0800-1700", "Allowed session", group = G9)
+
+i_theme     = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = GV)
+i_zoneOpac  = input.int(88, "Zone opacity", minval = 60, maxval = 100, group = GV)
+i_showScore = input.bool(true, "Show scores on labels", group = GV)
+i_extend    = input.int(12, "Zone extension (bars)", minval = 0, maxval = 60, group = GV)
+i_diag      = input.bool(false, "Diagnostics (show Tier-3)", group = GV)
+
+// ══════════════════════════════ 2 · TYPES ═════════════════════════════════════
+type Node
+    int   id      = 0
+    int   birth   = 0
+    int   dir     = 0
+    float prox    = 0.0
+    float dist    = 0.0
+    float kill    = 0.0
+    float score   = 0.0
+    int   tier    = 3
+    int   st      = 1
+    int   testBar = -1
+    float depth   = 0.0
+    bool  reacted = false
+    bool  htfB    = false
+    float travel  = 0.0
+    float corP    = 0.0
+    int   absS    = 0
+    float partB   = 0.0
+    bool  bodyG   = false
+    float baseSc  = 0.0
+    box   bx      = na
+    label lb      = na
+
+type Imb
+    int   id     = 0
+    int   birth  = 0
+    int   dir    = 0
+    float top    = 0.0
+    float bot    = 0.0
+    float top0   = 0.0
+    float bot0   = 0.0
+    float ce     = 0.0
+    float wid    = 0.0
+    int   grade  = 3
+    int   st     = 1
+    float fill   = 0.0
+    box   bx     = na
+
+type Liq
+    float px       = 0.0
+    int   side     = 0
+    int   members  = 0
+    bool  swept    = false
+    int   sweptBar = -1
+    line  ln       = na
+    label lb       = na
+
+type Setup
+    int   dir      = 0
+    int   stage    = 0
+    int   stageBar = 0
+    int   nodeId   = -1
+    int   imbId    = -1
+    float anchor   = 0.0
+    int   shiftBar = -1
+    int   touchBar = -1
+    float edge     = 0.0
+    float entry    = 0.0
+    float sl       = 0.0
+    float tp1      = 0.0
+    float tp2      = 0.0
+    float score    = 0.0
+    int   mode      = 0
+    int   st        = 0
+    int   fillBar   = -1
+    bool  tp1Done   = false
+    bool  beSet     = false
+    float mfe       = 0.0
+    float mae       = 0.0
+    float risk0     = 0.0
+
+// ══════════════════════════════ 3 · STATE ═════════════════════════════════════
+var array<Node>  nodes    = array.new<Node>()
+var array<Imb>   imbs     = array.new<Imb>()
+var array<Liq>   liqs     = array.new<Liq>()
+var array<float> ringNet  = array.new<float>()
+var array<float> ringCoR  = array.new<float>()
+var array<float> ringGap  = array.new<float>()
+var array<float> ringAmp  = array.new<float>()
+var array<int>   sigBars  = array.new<int>()
+
+var Setup su = Setup.new(dir = 1)
+var Setup sd = Setup.new(dir = -1)
+
+var int   regime       = 2      // 1 trend · 2 balance · 3 expansion · 4 contraction
+var int   pendReg      = 0
+var int   pendCnt      = 0
+var int   pivType      = 0      // 1 last confirmed pivot was a HIGH, -1 a LOW
+var float pivPrice     = na
+var int   pivBar        = na
+var float provHi        = na
+var int   provHiBar     = na
+var float provLo        = na
+var int   provLoBar     = na
+var float swHi          = na
+var int   swHiBar       = na
+var float swLo          = na
+var int   swLoBar       = na
+var int   mseDir        = 0
+var int   mseState      = 0     // ±1 expansion · ±2 retrace · 0 balance
+var int   lastBreakBar  = na
+var int   liveDir       = 0
+var int   lastSwitchBar = -1000
+var string verdict      = "—"
+var float lastPoiTop    = na
+var float lastPoiBot    = na
+
+// ═══════════════════════ 4 · LAYER 0 · MEASUREMENT SUBSTRATE ══════════════════
+atr0  = ta.atr(i_atrLen)
+rng   = math.max(high - low, syminfo.mintick)
+atrS  = nz(atr0, rng)
+atrS  := math.max(atrS, syminfo.mintick)
+bdy   = math.abs(close - open)
+bodyR = bdy / rng
+upW   = high - math.max(close, open)
+dnW   = math.min(close, open) - low
+clLoc = (close - low) / rng
+rngN  = rng / atrS
+volEf = volume / math.max(rngN, 0.01)
+
+// volume-feed usability: never rank synthetic volume silently
+volPos = ta.sma(volume > 0 ? 1.0 : 0.0, 200)
+volAvg = ta.sma(volume, 200)
+volCv  = ta.stdev(volume, 200) / math.max(volAvg, 1.0)
+volOk  = bar_index < 210 ? volume > 0 : nz(volPos) > 0.95 and nz(volCv) > 0.05
+
+prVol  = ta.percentrank(volume, i_rankW) / 100.0
+prRngN = ta.percentrank(rngN, i_rankW) / 100.0
+prBody = ta.percentrank(bodyR, i_rankW) / 100.0
+prEff  = ta.percentrank(volEf, i_rankW) / 100.0
+prAtr  = ta.percentrank(atrS, 200) / 100.0
+prSurr = ta.percentrank(rngN * (1.0 + bodyR), i_rankW) / 100.0
+
+// participation rank · surrogate when the feed has no usable volume
+partR = volOk ? nz(prVol, 0.5) : nz(prSurr, 0.5)
+
+// Volume-Weighted Intent Delta · OHLCV-derived signed-flow proxy (not tick delta)
+geoD  = (2.0 * clLoc - 1.0) * (0.5 + 0.5 * bodyR)
+bdSel = volOk ? volume * geoD : geoD
+wSel  = volOk ? volume : 1.0
+vwid3 = math.sum(bdSel, 3) / math.max(math.sum(wSel, 3), 0.000001)
+vwid4 = math.sum(bdSel, 4) / math.max(math.sum(wSel, 4), 0.000001)
+vwid5 = math.sum(bdSel, 5) / math.max(math.sum(wSel, 5), 0.000001)
+vwid8 = math.sum(bdSel, 8) / math.max(math.sum(wSel, 8), 0.000001)
+
+hh10  = ta.highest(high, i_trailLen)
+ll10  = ta.lowest(low, i_trailLen)
+hh50  = ta.highest(high, 50)
+ll50  = ta.lowest(low, 50)
+
+inSess = not i_sessOn or not na(time(timeframe.period, i_sess))
+
+// ── regime classifier with hysteresis ─────────────────────────────────────────
+netMv  = math.abs(close - close[i_effLb])
+pathLn = math.sum(rng, i_effLb)
+effR   = netMv / math.max(pathLn, syminfo.mintick)
+atrRef = math.max(atrS[i_effLb], syminfo.mintick)
+atrSlp = (atrS - atrRef) / atrRef
+
+rawReg = effR >= 0.34 and nz(prAtr) >= 0.45 ? 1 : effR < 0.18 and nz(prAtr) < 0.55 ? 2 : atrSlp >= 0.25 and nz(prAtr) >= 0.70 ? 3 : atrSlp <= -0.20 and nz(prAtr) < 0.40 ? 4 : 0
+
+if barstate.isconfirmed
+    if rawReg == 0 or rawReg == regime
+        pendReg := 0
+        pendCnt := 0
+    else
+        if rawReg == pendReg
+            pendCnt += 1
+        else
+            pendReg := rawReg
+            pendCnt := 1
+        if pendCnt >= 3
+            regime := rawReg
+            pendReg := 0
+            pendCnt := 0
+
+deadTape = i_deadVeto and regime == 4 and nz(prAtr, 1.0) < 0.20
+
+// ── regime-adaptive effective parameters ─────────────────────────────────────
+mDisp = not i_regimeOn ? 1.0 : regime == 1 ? 1.00 : regime == 2 ? 0.85 : regime == 3 ? 1.35 : 0.75
+mGap  = not i_regimeOn ? 1.0 : regime == 1 ? 1.00 : regime == 2 ? 0.85 : regime == 3 ? 1.30 : 0.80
+mSwg  = not i_regimeOn ? 1.0 : regime == 1 ? 1.10 : regime == 2 ? 0.85 : regime == 3 ? 1.30 : 0.80
+mRet  = not i_regimeOn ? 1.0 : regime == 1 ? 1.20 : regime == 2 ? 0.80 : regime == 3 ? 1.00 : 0.70
+mRR   = not i_regimeOn ? 1.0 : regime == 1 ? 1.00 : regime == 2 ? 1.25 : regime == 3 ? 1.10 : 1.40
+mStop = not i_regimeOn ? 1.0 : regime == 1 ? 1.00 : regime == 2 ? 0.85 : regime == 3 ? 1.30 : 0.80
+aT1   = not i_regimeOn ? 0 : regime == 1 ? -2 : regime == 2 ? 4 : regime == 3 ? 0 : 8
+
+dispAbsE = i_dispAbs * mDisp
+gapAbsE  = i_gapAbs * mGap
+swRetE   = i_swRetATR * mSwg
+swAmpE   = i_swAmpATR * mSwg
+retWinE  = math.max(2, math.round(i_retestWin * mRet))
+minRRE   = i_minRR * mRR
+maxStopE = i_maxStop * mStop
+t1E      = i_t1 + aT1
+maxSigE  = not i_regimeOn ? i_maxSig : regime == 1 ? math.max(i_maxSig, 3) : regime == 4 ? 1 : i_maxSig
+allowCtr = not i_regimeOn or regime == 2      // counter-trend permitted in balance only
+
+// ══════════════════════════ 5 · MTC · HTF DATA ════════════════════════════════
+tfSec  = timeframe.in_seconds(timeframe.period)
+tfMin  = tfSec / 60
+htfAut = tfMin <= 1 ? "15" : tfMin <= 5 ? "60" : tfMin <= 15 ? "240" : tfMin <= 60 ? "1D" : tfMin <= 240 ? "1W" : tfMin <= 1440 ? "1W" : "1M"
+htfTf  = i_htfMode == "Manual" ? i_htfManual : htfAut
+
+f_htfPack() =>
+    a  = ta.atr(14)
+    rg = math.max(high - low, syminfo.mintick)
+    br = math.abs(close - open) / rg
+    dp = br >= 0.60 and rg >= a
+    dr = close > open ? 1 : -1
+    e  = ta.ema(close, 21)
+    pt = dp ? math.max(open, close) : na
+    pb = dp ? math.min(open, close) : na
+    pd = dp ? dr : 0
+    [close[1], e[1], e[2], pt[1], pb[1], pd[1]]
+
+[hC, hE, hEp, hPoiT, hPoiB, hPoiD] = request.security(syminfo.tickerid, htfTf, f_htfPack(), lookahead = barmerge.lookahead_off)
+
+htfBias = na(hC) or na(hE) or na(hEp) ? 0 : hC > hE and hE >= hEp ? 1 : hC < hE and hE <= hEp ? -1 : 0
+newPoi  = not na(hPoiT) and not na(hPoiB) and (na(lastPoiTop) or hPoiT != lastPoiTop or hPoiB != lastPoiBot)
+
+// ══════════════════════════ 6 · HELPER FUNCTIONS ══════════════════════════════
+f_ringPush(array<float> a, float v, int cap) =>
+    if not na(v)
+        array.push(a, v)
+        if array.size(a) > cap
+            array.shift(a)
+    array.size(a)
+
+// percentile of v within a's stored distribution · neutral 0.5 until seeded
+f_rank(array<float> a, float v) =>
+    n = array.size(a)
+    r = 0.5
+    if n >= 20 and not na(v)
+        c = 0
+        for k = 0 to n - 1
+            if array.get(a, k) <= v
+                c += 1
+        r := c * 1.0 / n
+    r
+
+f_clamp01(float v) =>
+    na(v) ? 0.0 : math.max(0.0, math.min(1.0, v))
+
+// overlap fraction of two price intervals, relative to the narrower one
+f_ovl(float a1, float a2, float b1, float b2) =>
+    aTop = math.max(a1, a2)
+    aBot = math.min(a1, a2)
+    bTop = math.max(b1, b2)
+    bBot = math.min(b1, b2)
+    ov   = math.min(aTop, bTop) - math.max(aBot, bBot)
+    w    = math.max(math.min(aTop - aBot, bTop - bBot), syminfo.mintick)
+    math.max(0.0, ov) / w
+
+// ── shared displacement definition · IIDE · AIE inversion · MSE breaks ───────
+// returns the leg's ATR-normalised magnitude, or na when the leg does not qualify
+f_disp(int dir, int len) =>
+    float res = na
+    net = dir * (close - open[len - 1])
+    if net > 0
+        netN = net / atrS
+        if netN >= dispAbsE
+            pth = 0.0
+            pur = 0
+            vr  = 0.0
+            for k = 0 to len - 1
+                pth += math.max(high[k] - low[k], syminfo.mintick)
+                pur += dir > 0 ? (close[k] > open[k] ? 1 : 0) : (close[k] < open[k] ? 1 : 0)
+                vr  += nz(partR[k], 0.5)
+            eff  = net / math.max(pth, syminfo.mintick)
+            purF = pur * 1.0 / len
+            vrF  = vr / len
+            if eff >= i_legEff and purF >= i_purity and vrF >= i_legVol and f_rank(ringNet, netN) >= i_dispPct
+                res := netN
+    res
+
+// longest qualifying leg ending on this bar · len 0 = no displacement
+f_bestLeg(int dir) =>
+    lenB = 0
+    netB = 0.0
+    for L = 2 to i_maxLeg
+        v = f_disp(dir, L)
+        if not na(v)
+            lenB := L
+            netB := v
+    [lenB, netB]
+
+// ── Cost-of-Reversal · effort expended leaving the zone ─────────────────────
+f_cor(int len) =>
+    e = 0.0
+    for k = 0 to len - 1
+        e += nz(rngN[k], 1.0) * (0.5 + nz(partR[k], 0.5))
+    e / len
+
+// ── origin cluster + absorption scorecard ───────────────────────────────────
+f_origin(int dir, int len) =>
+    o    = len
+    hi   = high[o]
+    lo   = low[o]
+    cnt  = 1
+    mEff = nz(prEff[o], 0.5)
+    mVol = nz(partR[o], 0.5)
+    mBod = nz(bodyR[o], 0.5)
+    sRng = nz(rngN[o], 1.0)
+    oWk  = (dir > 0 ? dnW[o] : upW[o]) / math.max(rng[o], syminfo.mintick)
+    cont = true
+    if i_clMax >= 2
+        for k = 1 to i_clMax - 1
+            if cont
+                j    = o + k
+                good = nz(rngN[j], 9.0) <= i_clRng and (dir > 0 ? close[j] <= hi : close[j] >= lo)
+                if good
+                    hi   := math.max(hi, high[j])
+                    lo   := math.min(lo, low[j])
+                    cnt  += 1
+                    mEff := math.max(mEff, nz(prEff[j], 0.5))
+                    mVol := math.max(mVol, nz(partR[j], 0.5))
+                    mBod := math.max(mBod, nz(bodyR[j], 0.5))
+                    sRng += nz(rngN[j], 1.0)
+                    oWk  := math.max(oWk, (dir > 0 ? dnW[j] : upW[j]) / math.max(rng[j], syminfo.mintick))
+                else
+                    cont := false
+    absS = 0
+    absS += mEff >= 0.70 ? 30 : 0
+    absS += oWk  >= 0.35 ? 25 : 0
+    absS += mVol >= 0.65 ? 20 : 0
+    absS += sRng / cnt <= 0.85 ? 15 : 0
+    absS += cnt  >= 2 ? 10 : 0
+    [hi, lo, cnt, absS, mBod, oWk]
+
+// ── array lookups ───────────────────────────────────────────────────────────
+f_nodeIdx(int id) =>
+    r = -1
+    if array.size(nodes) > 0 and id >= 0
+        for k = 0 to array.size(nodes) - 1
+            if array.get(nodes, k).id == id
+                r := k
+    r
+
+f_imbIdx(int id) =>
+    r = -1
+    if array.size(imbs) > 0 and id >= 0
+        for k = 0 to array.size(imbs) - 1
+            if array.get(imbs, k).id == id
+                r := k
+    r
+
+// nearest live same-direction channel overlapping / adjacent to a node
+f_findImb(int dir, float prox, float dist, float adj) =>
+    r = -1
+    bg = -1
+    if array.size(imbs) > 0
+        for k = 0 to array.size(imbs) - 1
+            m = array.get(imbs, k)
+            if m.dir == dir and (m.st == 1 or m.st == 2 or m.st == 5)
+                near = f_ovl(prox, dist, m.top, m.bot) > 0.0 or math.min(math.abs(m.bot - math.max(prox, dist)), math.abs(m.top - math.min(prox, dist))) <= adj
+                if near
+                    g = m.grade == 1 ? 3 : m.grade == 2 ? 2 : 1
+                    if g > bg
+                        bg := g
+                        r  := k
+    r
+
+// best armed Tier-1 node in a direction
+f_bestNode(int dir) =>
+    r  = -1
+    bs = -1.0
+    if array.size(nodes) > 0
+        for k = 0 to array.size(nodes) - 1
+            n = array.get(nodes, k)
+            if n.dir == dir and n.st == 1 and n.tier == 1 and n.score > bs
+                bs := n.score
+                r  := k
+    r
+
+// a sweep of `side` liquidity within lb bars (side +1 = highs, -1 = lows)
+f_recentSweep(int side, int lb) =>
+    r = false
+    if array.size(liqs) > 0
+        for k = 0 to array.size(liqs) - 1
+            l = array.get(liqs, k)
+            if l.swept and l.side == side and bar_index - l.sweptBar <= lb
+                r := true
+    r
+
+// nearest resting liquidity beyond a price in `dir` · used for TP1
+f_liqTarget(int dir, float from) =>
+    float best = na
+    if array.size(liqs) > 0
+        for k = 0 to array.size(liqs) - 1
+            px = array.get(liqs, k).px
+            beyond = dir > 0 ? px > from + 0.25 * atrS : px < from - 0.25 * atrS
+            if beyond and (na(best) or (dir > 0 ? px < best : px > best))
+                best := px
+    best
+
+// ══════════════ 7 · NODE FACTORY (IIDE scoring · runs on leg completion) ══════
+f_mkNode(int dir, int len) =>
+    made = 0
+    [ohi, olo, ocnt, oabs, obod, owk] = f_origin(dir, len)
+    prox = dir > 0 ? ohi : olo
+    dst  = dir > 0 ? olo : ohi
+    widN = math.abs(prox - dst) / atrS
+    if widN <= i_maxW and widN >= i_minW
+        lv  = 0.0
+        lb2 = 0.0
+        pb2 = 0.0
+        for k = 0 to len - 1
+            lv  += nz(partR[k], 0.5)
+            lb2 := math.max(lb2, nz(bodyR[k], 0.0))
+            pb2 := math.max(pb2, nz(prBody[k], 0.5))
+        lvR  = lv / len
+        cor  = f_cor(len)
+        corP = f_rank(ringCoR, cor)
+        rHi  = nz(swHi, hh50)
+        rLo  = nz(swLo, ll50)
+        pos  = f_clamp01((prox - rLo) / math.max(rHi - rLo, syminfo.mintick))
+        locR = dir > 0 ? 1.0 - pos : pos
+        edgB = f_clamp01(math.abs(pos - 0.5) / 0.35)
+        pPart = 20.0 * f_clamp01((lvR - 0.50) / 0.45)
+        pCoR  = 20.0 * f_clamp01((corP - 0.45) / 0.50)
+        pAbs  = 15.0 * (oabs / 100.0)
+        pGeo  = 15.0 * (0.5 * f_clamp01((lb2 - 0.60) / 0.35) + 0.3 * f_clamp01(owk / 0.50) + 0.2 * (1.0 - f_clamp01((widN - 0.3) / 1.2)))
+        pFlow = 15.0 * f_clamp01(dir * vwid8 / 0.35)
+        pLoc  = 15.0 * (0.7 * locR + 0.3 * edgB)
+        sc    = pPart + pCoR + pAbs + pGeo + pFlow + pLoc - (ocnt < 2 ? 8.0 : 0.0)
+        sc   := math.max(0.0, math.min(100.0, sc))
+        if sc >= i_t2 or i_diag
+            array.push(nodes, Node.new(id = bar_index * 4 + (dir > 0 ? 1 : 2), birth = bar_index, dir = dir, prox = prox, dist = dst, kill = dst - dir * i_killBuf * atrS, score = sc, baseSc = sc, tier = 3, st = 1, corP = corP, absS = oabs, partB = lvR, bodyG = lb2 >= i_bodyAbs and pb2 >= i_bodyPct))
+            f_ringPush(ringCoR, cor, 60)
+            made := 1
+    made
+
+// ══════════════ 8 · MSE · MACRO STRUCTURE ═════════════════════════════════════
+[legUpL, legUpN] = f_bestLeg(1)
+[legDnL, legDnN] = f_bestLeg(-1)
+dispUp = legUpL > 0
+dispDn = legDnL > 0
+
+newPivH = false
+newPivL = false
+brkUp   = false
+brkDn   = false
+
+if barstate.isconfirmed
+    if na(provHi)
+        provHi    := high
+        provHiBar := bar_index
+        provLo    := low
+        provLoBar := bar_index
+    if high > provHi
+        provHi    := high
+        provHiBar := bar_index
+    if low < provLo
+        provLo    := low
+        provLoBar := bar_index
+
+    // ── confirm swing HIGH (ATR-filtered, right-bar confirmed) ──
+    if pivType <= 0 and not na(provHi)
+        bse  = na(pivPrice) ? provLo : pivPrice
+        amp  = provHi - bse
+        ampN = amp / atrS
+        rtr  = provHi - low
+        rtrN = rtr / atrS
+        sep  = na(pivBar) or (provHiBar - pivBar) >= i_minSep
+        if amp > 0 and rtrN >= swRetE and rtr >= i_swRetFrac * amp and ampN >= swAmpE and f_rank(ringAmp, ampN) >= 0.55 and sep and (bar_index - provHiBar) >= i_rightBars
+            f_ringPush(ringAmp, ampN, 60)
+            swHi      := provHi
+            swHiBar   := provHiBar
+            pivType   := 1
+            pivPrice  := provHi
+            pivBar    := provHiBar
+            provLo    := low
+            provLoBar := bar_index
+            newPivH   := true
+
+    // ── confirm swing LOW ──
+    if pivType >= 0 and not newPivH and not na(provLo)
+        bse2  = na(pivPrice) ? provHi : pivPrice
+        amp2  = bse2 - provLo
+        ampN2 = amp2 / atrS
+        rtr2  = high - provLo
+        rtrN2 = rtr2 / atrS
+        sep2  = na(pivBar) or (provLoBar - pivBar) >= i_minSep
+        if amp2 > 0 and rtrN2 >= swRetE and rtr2 >= i_swRetFrac * amp2 and ampN2 >= swAmpE and f_rank(ringAmp, ampN2) >= 0.55 and sep2 and (bar_index - provLoBar) >= i_rightBars
+            f_ringPush(ringAmp, ampN2, 60)
+            swLo      := provLo
+            swLoBar   := provLoBar
+            pivType   := -1
+            pivPrice  := provLo
+            pivBar    := provLoBar
+            provHi    := high
+            provHiBar := bar_index
+            newPivL   := true
+
+    // ── displacement-gated break classification ──
+    if not na(swHi) and close > swHi + i_brkBuf * atrS and (not i_brkDisp or dispUp)
+        pass = true
+        if mseDir < 0 and i_revStrict
+            pass := legUpN >= i_revDisp and vwid8 > 0
+        if pass
+            mseDir       := 1
+            lastBreakBar := bar_index
+            brkUp        := true
+            swHi         := na
+
+    if not na(swLo) and close < swLo - i_brkBuf * atrS and (not i_brkDisp or dispDn)
+        pass2 = true
+        if mseDir > 0 and i_revStrict
+            pass2 := legDnN >= i_revDisp and vwid8 < 0
+        if pass2
+            mseDir       := -1
+            lastBreakBar := bar_index
+            brkDn        := true
+            swLo         := na
+
+    if mseDir != 0 and not na(lastBreakBar)
+        expand   = (bar_index - lastBreakBar) <= i_contWin
+        mseState := mseDir > 0 ? (expand ? 1 : 2) : (expand ? -1 : -2)
+    if na(lastBreakBar) or (bar_index - lastBreakBar) > i_balWin
+        mseState := 0
+
+rangeHi = nz(swHi, hh50)
+rangeLo = nz(swLo, ll50)
+
+// ══════════════ 9 · IIDE · NODE LIFECYCLE (mitigation simulation) ═════════════
+if barstate.isconfirmed and array.size(nodes) > 0
+    for i = array.size(nodes) - 1 to 0
+        n = array.get(nodes, i)
+        if n.dir > 0 ? close < n.kill : close > n.kill
+            n.st := 3
+        else
+            if n.dir > 0 ? low <= n.prox : high >= n.prox
+                pen = n.dir > 0 ? n.prox - low : high - n.prox
+                dep = pen / math.max(math.abs(n.prox - n.dist), syminfo.mintick)
+                if n.st == 1
+                    n.st      := 2
+                    n.testBar := bar_index
+                else if i_oneShot and n.testBar >= 0 and bar_index > n.testBar
+                    n.st := 3
+                n.depth := math.max(n.depth, dep)
+                if n.depth > i_maxDepth
+                    n.st := 3
+            if n.st == 2 and not n.reacted
+                react = n.dir > 0 ? close - n.prox : n.prox - close
+                if bar_index - n.testBar <= i_reactWin
+                    if react >= i_reactMin * atrS and n.dir * vwid3 > 0
+                        n.reacted := true
+                    else if bar_index - n.testBar >= i_reactWin
+                        n.st := 3
+                else
+                    n.st := 3
+            n.travel := math.max(n.travel, math.abs(close - n.prox) / atrS)
+            if n.st == 1 and n.travel > i_expTravel
+                n.st := 3
+        if n.st == 3
+            if not na(n.bx)
+                box.delete(n.bx)
+            if not na(n.lb)
+                label.delete(n.lb)
+            array.remove(nodes, i)
+
+// ── node creation on completed displacement legs ──
+if barstate.isconfirmed and i_iideOn and inSess and not deadTape
+    if dispUp
+        f_mkNode(1, legUpL)
+    if dispDn
+        f_mkNode(-1, legDnL)
+
+// ── LCC · merge overlapping same-direction zones (sub-additive score) ──
+if barstate.isconfirmed and i_mergeOn and array.size(nodes) > 1
+    for i = array.size(nodes) - 1 to 1
+        if i < array.size(nodes)
+            a = array.get(nodes, i)
+            for j = i - 1 to 0
+                if j < array.size(nodes) and a.st != 3
+                    b = array.get(nodes, j)
+                    if b.dir == a.dir and b.st != 3
+                        aT = math.max(a.prox, a.dist)
+                        aB = math.min(a.prox, a.dist)
+                        bT = math.max(b.prox, b.dist)
+                        bB = math.min(b.prox, b.dist)
+                        gapN = (aB > bT ? aB - bT : bB > aT ? bB - aT : 0.0) / atrS
+                        if gapN <= i_mergeGap
+                            np = a.dir > 0 ? math.max(a.prox, b.prox) : math.min(a.prox, b.prox)
+                            nd = a.dir > 0 ? math.min(a.dist, b.dist) : math.max(a.dist, b.dist)
+                            if math.abs(np - nd) / atrS <= i_maxW
+                                b.prox   := np
+                                b.dist   := nd
+                                b.kill   := nd - b.dir * i_killBuf * atrS
+                                b.score  := math.min(100.0, math.max(a.score, b.score) + 5.0 * math.min(a.score, b.score) / 100.0)
+                                b.baseSc := math.min(100.0, math.max(a.baseSc, b.baseSc))
+                                b.st     := math.max(a.st, b.st)
+                                b.corP   := math.max(a.corP, b.corP)
+                                b.absS   := math.max(a.absS, b.absS)
+                                b.partB  := math.max(a.partB, b.partB)
+                                b.bodyG  := a.bodyG or b.bodyG
+                                b.htfB   := a.htfB or b.htfB
+                                b.birth  := math.min(a.birth, b.birth)
+                                a.st     := 3
+                                if not na(a.bx)
+                                    box.delete(a.bx)
+                                if not na(a.lb)
+                                    label.delete(a.lb)
+                                array.remove(nodes, i)
+
+// ── capacity eviction (oldest first) ──
+if barstate.isconfirmed
+    while array.size(nodes) > i_maxNodes
+        n0 = array.get(nodes, 0)
+        if not na(n0.bx)
+            box.delete(n0.bx)
+        if not na(n0.lb)
+            label.delete(n0.lb)
+        array.remove(nodes, 0)
+
+// ══════════════ 10 · AIE · IMBALANCE LIFECYCLE ════════════════════════════════
+if barstate.isconfirmed and array.size(imbs) > 0
+    for i = array.size(imbs) - 1 to 0
+        m = array.get(imbs, i)
+        if m.st != 4
+            d = m.dir
+            fl = d > 0 ? m.top - math.min(low, m.top) : math.max(high, m.bot) - m.bot
+            m.fill := math.max(m.fill, f_clamp01(fl / math.max(m.wid, syminfo.mintick)))
+            if d > 0 and low < m.top
+                m.top := math.max(math.min(m.top, low), m.bot)
+            if d < 0 and high > m.bot
+                m.bot := math.min(math.max(m.bot, high), m.top)
+            if m.fill >= 0.50 and m.st < 3
+                m.st := 3
+            if d > 0 ? close < m.ce : close > m.ce
+                inv = false
+                if i_invOn and m.st != 5
+                    dOk  = not i_invDisp or (d > 0 ? dispDn : dispUp)
+                    dep2 = d > 0 ? (m.bot - close) / atrS : (close - m.top) / atrS
+                    lOk  = not i_invLiq or f_recentSweep(d > 0 ? -1 : 1, 12)
+                    sOk  = not i_invStr or mseDir == -d
+                    inv := dOk and dep2 >= i_invDepth and lOk and sOk and (-d) * vwid5 > 0.15 and nz(partR, 0.5) >= 0.60
+                if inv
+                    m.st    := 5
+                    m.dir   := -d
+                    m.grade := math.max(m.grade, 2)
+                    m.fill  := 0.0
+                else
+                    m.st := 4
+            if m.fill >= 0.999
+                m.st := 4
+        if m.st == 4
+            if not na(m.bx)
+                box.delete(m.bx)
+            array.remove(imbs, i)
+
+// ── channel detection (volatility-normalised, dual-gated) ──
+if barstate.isconfirmed and i_aieOn and bar_index > 3
+    bullG = low > high[2]
+    bearG = high < low[2]
+    if bullG or bearG
+        d   = bullG ? 1 : -1
+        tp  = bullG ? low : low[2]
+        bt  = bullG ? high[2] : high
+        gs  = tp - bt
+        gsN = gs / atrS
+        szOk = gsN >= gapAbsE and f_rank(ringGap, gsN) >= i_gapPct
+        f_ringPush(ringGap, gsN, 60)
+        midOk = nz(bodyR[1], 0.0) >= 0.62 and nz(prBody[1], 0.0) >= 0.75 and nz(rngN[1], 0.0) >= 1.10 and nz(partR[1], 0.0) >= 0.60
+        seqOk = d > 0 ? close > open and close[1] > open[1] and close[2] > open[2] : close < open and close[1] < open[1] and close[2] < open[2]
+        locOk = d > 0 ? nz(clLoc[1], 0.0) >= 0.66 : nz(clLoc[1], 1.0) <= 0.34
+        if szOk and midOk and seqOk and locOk
+            gsc = 30.0 * f_clamp01((gsN - 0.30) / 0.90) + 25.0 * f_clamp01((nz(partR[1], 0.5) - 0.55) / 0.40) + 20.0 * f_clamp01((nz(bodyR[1], 0.5) - 0.60) / 0.35) + 15.0 * f_clamp01(d * vwid5 / 0.35) + 10.0 * ((d > 0 ? dispUp : dispDn) ? 1.0 : 0.0)
+            gr = gsc >= i_gradeA ? 1 : gsc >= i_gradeB ? 2 : 3
+            if gr <= 2 or i_showC
+                ex = -1
+                if array.size(imbs) > 0
+                    for k = 0 to array.size(imbs) - 1
+                        mm = array.get(imbs, k)
+                        if mm.dir == d and mm.st <= 2 and f_ovl(tp, bt, mm.top, mm.bot) >= 0.60
+                            ex := k
+                if ex >= 0
+                    m2 = array.get(imbs, ex)
+                    m2.top   := math.max(m2.top, tp)
+                    m2.bot   := math.min(m2.bot, bt)
+                    m2.ce    := (m2.top + m2.bot) / 2.0
+                    m2.wid   := m2.top - m2.bot
+                    m2.grade := math.min(m2.grade, gr)
+                else
+                    array.push(imbs, Imb.new(id = bar_index * 4 + (d > 0 ? 3 : 4), birth = bar_index, dir = d, top = tp, bot = bt, top0 = tp, bot0 = bt, ce = (tp + bt) / 2.0, wid = gs, grade = gr, st = 1))
+
+if barstate.isconfirmed
+    while array.size(imbs) > i_maxImbs
+        m0 = array.get(imbs, 0)
+        if not na(m0.bx)
+            box.delete(m0.bx)
+        array.remove(imbs, 0)
+
+// ══════════════ 11 · LCC · LIQUIDITY (detect silently, reveal on sweep) ═══════
+hhSw = ta.highest(high, i_swReclaim)
+llSw = ta.lowest(low, i_swReclaim)
+
+if barstate.isconfirmed and i_liqMode != "Off"
+    if newPivH or newPivL
+        sideN = newPivH ? 1 : -1
+        pxN   = pivPrice
+        fnd   = -1
+        if array.size(liqs) > 0
+            for k = 0 to array.size(liqs) - 1
+                l = array.get(liqs, k)
+                if l.side == sideN and not l.swept and math.abs(l.px - pxN) <= i_eqTol * atrS
+                    fnd := k
+        if fnd >= 0
+            l2 = array.get(liqs, fnd)
+            l2.members += 1
+            l2.px      := (l2.px + pxN) / 2.0
+        else
+            array.push(liqs, Liq.new(px = pxN, side = sideN, members = 1))
+
+    // sweep confirmation · pierce within window + reclaim close + participation
+    if array.size(liqs) > 0
+        for k = 0 to array.size(liqs) - 1
+            l = array.get(liqs, k)
+            if not l.swept
+                if l.side == 1
+                    if hhSw >= l.px + i_swPierce * atrS and close < l.px and nz(partR, 0.5) >= 0.55
+                        l.swept    := true
+                        l.sweptBar := bar_index
+                else
+                    if llSw <= l.px - i_swPierce * atrS and close > l.px and nz(partR, 0.5) >= 0.55
+                        l.swept    := true
+                        l.sweptBar := bar_index
+
+    // eviction · drop stale swept levels first, then oldest
+    while array.size(liqs) > i_maxLiq
+        rmv = 0
+        if array.size(liqs) > 0
+            for k = 0 to array.size(liqs) - 1
+                if array.get(liqs, k).swept
+                    rmv := k
+        l3 = array.get(liqs, rmv)
+        if not na(l3.ln)
+            line.delete(l3.ln)
+        if not na(l3.lb)
+            label.delete(l3.lb)
+        array.remove(liqs, rmv)
+
+// ══════════════ 12 · MTC · DYNAMIC ZONE UPGRADE (stamped, never reversed) ═════
+if barstate.isconfirmed
+    if i_upgradeOn and newPoi and hPoiD != 0 and array.size(nodes) > 0
+        for k = 0 to array.size(nodes) - 1
+            n = array.get(nodes, k)
+            if n.dir == hPoiD and n.st == 1 and not n.htfB and f_ovl(n.prox, n.dist, hPoiT, hPoiB) >= i_htfOvl
+                n.htfB  := true
+                n.score := math.min(100.0, n.score + i_htfBonus)
+    if not na(hPoiT)
+        lastPoiTop := hPoiT
+    if not na(hPoiB)
+        lastPoiBot := hPoiB
+
+// ══════════════ 13 · IIDE · TIER RE-EVALUATION (10 hard gates) ════════════════
+if barstate.isconfirmed and array.size(nodes) > 0
+    for k = 0 to array.size(nodes) - 1
+        n = array.get(nodes, k)
+        g1 = n.score >= t1E
+        g2 = not i_gPart or n.partB >= i_partMin
+        g3 = not i_gCor or n.corP >= i_corMin
+        g4 = not i_gStruct or mseDir == n.dir or (mseState == 0 and allowCtr)
+        g5 = not i_gHtf or htfBias == n.dir or (htfBias == 0 and i_allowNeut)
+        g6 = n.st == 1
+        g7 = not deadTape
+        g9 = not i_gAbs or n.absS >= i_absMin
+        g10 = not i_gImb or f_findImb(n.dir, n.prox, n.dist, 0.5 * atrS) >= 0
+        g8 = true
+        if i_gOpp
+            for q = 0 to array.size(nodes) - 1
+                o = array.get(nodes, q)
+                if o.dir == -n.dir and o.st == 1 and f_ovl(n.prox, n.dist, o.prox, o.dist) > 0.10
+                    g8 := false
+        n.tier := g1 and g2 and g3 and g4 and g5 and g6 and g7 and g8 and g9 and g10 and n.bodyG ? 1 : n.score >= i_t2 ? 2 : 3
+
+// ══════════════ 14 · SSE / CDE · FUNCTIONS ════════════════════════════════════
+// origin of the delivery sequence: open of the first bar of the opposing-close run
+f_anchor(int dir) =>
+    a    = open[1]
+    cont = true
+    for k = 1 to i_anchorLB
+        if cont
+            if dir > 0 ? close[k] < open[k] : close[k] > open[k]
+                a := open[k]
+            else
+                cont := false
+    a
+
+// final zone edge · surviving geometry after merges and fill-shrink
+f_finalEdge(int dir, Node n, int imbId) =>
+    e  = n.prox
+    ii = f_imbIdx(imbId)
+    if ii >= 0
+        m = array.get(imbs, ii)
+        if m.st <= 3 and f_ovl(n.prox, n.dist, m.top, m.bot) > 0.0
+            e := dir > 0 ? math.max(e, m.top) : math.min(e, m.bot)
+    e
+
+f_setupScore(Setup s, Node n) =>
+    sc = n.score
+    sc += n.htfB ? 4.0 : 0.0
+    sc += htfBias == s.dir ? 4.0 : 0.0
+    sc += f_recentSweep(-s.dir, 12) ? 4.0 : 0.0
+    ii = f_imbIdx(s.imbId)
+    if ii >= 0
+        sc += array.get(imbs, ii).grade == 1 ? 4.0 : 0.0
+    math.min(100.0, sc)
+
+f_tp1(int dir, float ent, float r) =>
+    lq = f_liqTarget(dir, ent)
+    v  = ent + dir * 1.5 * r
+    if not na(lq) and math.abs(lq - ent) / math.max(r, syminfo.mintick) >= minRRE
+        v := lq
+    v
+
+f_tp2(int dir, float ent, float r) =>
+    o = dir > 0 ? rangeHi : rangeLo
+    v = ent + dir * 3.0 * r
+    if not na(o) and (dir > 0 ? o > ent + 1.0 * r : o < ent - 1.0 * r)
+        v := o
+    v
+
+f_premise(Setup s) =>
+    ok = true
+    if mseDir == -s.dir and mseState != 0
+        ok := false
+    if htfBias == -s.dir
+        ok := false
+    if s.entry != 0.0 and (s.dir > 0 ? close < s.sl : close > s.sl)
+        ok := false
+    ok
+
+f_eff(Setup s) =>
+    dec = math.exp(-math.max(bar_index - s.stageBar, 0) * 1.0 / i_decayTau)
+    ex  = 1.0
+    if s.st >= 2
+        ex := 1.0 - 0.45 * f_clamp01(s.mae) + 0.25 * f_clamp01(s.mfe / 2.0)
+    s.score * dec * ex * (f_premise(s) ? 1.0 : 0.55)
+
+// ── opposing-setup arbitrator ────────────────────────────────────────────────
+f_arb(Setup cand) =>
+    v = "WATCH"
+    if liveDir == 0
+        v := cand.score >= i_minTrade ? "TAKE" : "WATCH"
+    else if liveDir == cand.dir
+        v := "HOLD"
+    else
+        cur    = liveDir > 0 ? su : sd
+        effCur = f_eff(cur)
+        effNew = cand.score
+        if bar_index - lastSwitchBar < i_switchCd
+            v := "HOLD"
+        else if cur.beSet
+            v := "HOLD"
+        else if effNew < i_minTrade
+            v := "HOLD"
+        else if effNew - effCur < i_switchMrg
+            v := "HOLD"
+        else if f_premise(cur)
+            v := "WATCH"
+        else if i_standDown and effNew >= 78.0 and effCur >= 74.0
+            v := "STAND_DOWN"
+        else
+            v := "SWITCH"
+    v
+
+// ══════════════ 15 · SEQUENCE LOCK · MASTER FSM ═══════════════════════════════
+f_advance(Setup s) =>
+    out = 0
+    dOk = i_dirMode == "Both" or (i_dirMode == "Long only" and s.dir > 0) or (i_dirMode == "Short only" and s.dir < 0)
+
+    // release a finished trade for re-arming
+    if (s.st == 4 or s.st == 5) and bar_index - s.stageBar > 2
+        s.st    := 0
+        s.stage := 0
+
+    // terminal invalidation of a non-live setup
+    if s.stage > 0 and s.stage < 7 and s.st == 0
+        bad = false
+        if s.nodeId >= 0 and f_nodeIdx(s.nodeId) < 0
+            bad := true
+        if s.stage >= 3 and s.imbId >= 0 and f_imbIdx(s.imbId) < 0
+            bad := true
+        if mseDir == -s.dir and mseState != 0
+            bad := true
+        if i_gHtf and htfBias == -s.dir
+            bad := true
+        if not dOk or deadTape or not inSess
+            bad := true
+        if bad
+            s.stage    := 0
+            s.nodeId   := -1
+            s.imbId    := -1
+            s.shiftBar := -1
+            s.touchBar := -1
+
+    if s.st == 0
+        // ── STAGE 1 · context ──
+        if s.stage == 0
+            cStr = not i_gStruct or mseDir == s.dir or (mseState == 0 and allowCtr)
+            cHtf = not i_gHtf or htfBias == s.dir or (htfBias == 0 and i_allowNeut)
+            if dOk and inSess and not deadTape and cStr and cHtf
+                s.stage    := 1
+                s.stageBar := bar_index
+
+        // ── STAGE 2 · Tier-1 intent node ──
+        if s.stage == 1
+            bi = f_bestNode(s.dir)
+            if bi >= 0
+                s.nodeId   := array.get(nodes, bi).id
+                s.stage    := 2
+                s.stageBar := bar_index
+
+        // ── STAGE 3 · grade-A imbalance confluence (8-bar window) ──
+        if s.stage == 2
+            ni = f_nodeIdx(s.nodeId)
+            if ni >= 0
+                n = array.get(nodes, ni)
+                ii = f_findImb(s.dir, n.prox, n.dist, 0.5 * atrS)
+                took = false
+                if ii >= 0
+                    mc = array.get(imbs, ii)
+                    if mc.grade == 1 or not i_gImb
+                        s.imbId    := mc.id
+                        s.stage    := 3
+                        s.stageBar := bar_index
+                        took       := true
+                if not took and bar_index - n.birth > 8
+                    s.stage  := 1
+                    s.nodeId := -1
+
+        // ── STAGE 4 · approach · first test + verified reaction ──
+        if s.stage == 3
+            ni2 = f_nodeIdx(s.nodeId)
+            if ni2 >= 0
+                n2 = array.get(nodes, ni2)
+                if n2.st == 2 and n2.reacted
+                    s.stage    := 4
+                    s.stageBar := bar_index
+                    s.touchBar := n2.testBar
+                    s.edge     := f_finalEdge(s.dir, n2, s.imbId)
+
+        // ── STAGE 5 · state shift · origin break ──
+        if s.stage == 4
+            if not i_sseOn
+                s.stage    := 5
+                s.shiftBar := bar_index
+                s.anchor   := f_anchor(s.dir)
+            else if bar_index - s.touchBar > i_shiftWin
+                s.stage  := 1
+                s.nodeId := -1
+                s.imbId  := -1
+            else
+                an  = f_anchor(s.dir)
+                brk = s.dir > 0 ? close > an + i_shiftBuf * atrS : close < an - i_shiftBuf * atrS
+                gOk = brk and bodyR >= 0.55 and nz(prBody, 0.5) >= 0.65 and s.dir * vwid4 > 0
+                hOk = not i_sseHtf or htfBias == s.dir or (htfBias == 0 and i_allowNeut)
+                if gOk and hOk
+                    s.anchor   := an
+                    s.shiftBar := bar_index
+                    s.stage    := 5
+                    s.stageBar := bar_index
+
+        // ── STAGE 6 · confirmation · final-edge retest + vetoes ──
+        if s.stage == 5
+            if bar_index - s.shiftBar > retWinE
+                s.stage  := 1
+                s.nodeId := -1
+                s.imbId  := -1
+            else
+                ni3 = f_nodeIdx(s.nodeId)
+                if ni3 >= 0 and bar_index > s.shiftBar
+                    n3    = array.get(nodes, ni3)
+                    ed    = f_finalEdge(s.dir, n3, s.imbId)
+                    touch = s.dir > 0 ? low <= ed + i_retestTol * atrS : high >= ed - i_retestTol * atrS
+                    rej   = s.dir > 0 ? close > open and clLoc >= 0.55 : close < open and clLoc <= 0.45
+                    osOk  = s.dir > 0 ? low >= s.anchor - i_overshoot * atrS : high <= s.anchor + i_overshoot * atrS
+                    fOk   = s.dir * vwid3 > 0
+                    if touch and rej and osOk and fOk
+                        dst2 = math.abs(close - ed) / atrS
+                        md   = dst2 <= i_mktProx ? 1 : dst2 <= i_pendMax ? 2 : 0
+                        ent  = md == 1 ? close : ed + s.dir * i_spreadBuf * atrS
+                        slv  = n3.dist - s.dir * i_slBuf * atrS
+                        stN  = math.abs(ent - slv) / atrS
+                        rsk  = math.abs(ent - slv)
+                        t1v  = f_tp1(s.dir, ent, rsk)
+                        t2v  = f_tp2(s.dir, ent, rsk)
+                        rr1  = math.abs(t1v - ent) / math.max(rsk, syminfo.mintick)
+                        scr  = f_setupScore(s, n3)
+                        if md != 0 and stN >= i_minStop and stN <= maxStopE and rr1 >= minRRE and scr >= i_minTrade
+                            s.edge     := ed
+                            s.entry    := ent
+                            s.sl       := slv
+                            s.tp1      := t1v
+                            s.tp2      := t2v
+                            s.risk0    := math.max(rsk, syminfo.mintick)
+                            s.score    := scr
+                            s.mode     := md
+                            s.stage    := 6
+                            s.stageBar := bar_index
+                            out        := md
+    out
+
+// ══════════════ 16 · FSM DRIVE + ARBITRATION + EXECUTION ══════════════════════
+var int   dDir      = 0
+var float dEnt      = na
+var float dSlv      = na
+var float dT1       = na
+var float dT2       = na
+var int   dSt       = 0
+var bool  dT1d      = false
+var int   dOpenBar  = na
+var int   dCloseBar = na
+var float dScore    = 0.0
+
+sigL  = 0
+sigS  = 0
+execL = false
+execS = false
+
+if barstate.isconfirmed
+    sigL := f_advance(su)
+    sigS := f_advance(sd)
+
+if barstate.isconfirmed and (sigL != 0 or sigS != 0)
+    // signal scarcity governor · rolling 100-bar budget
+    if array.size(sigBars) > 0
+        for q = array.size(sigBars) - 1 to 0
+            if bar_index - array.get(sigBars, q) > 100
+                array.remove(sigBars, q)
+    Setup cand = sigL != 0 and sigS != 0 ? (su.score >= sd.score ? su : sd) : (sigL != 0 ? su : sd)
+    v = i_arbOn ? f_arb(cand) : (liveDir == 0 ? (cand.score >= i_minTrade ? "TAKE" : "WATCH") : "HOLD")
+    if array.size(sigBars) < maxSigE and (v == "TAKE" or v == "SWITCH")
+        if v == "SWITCH" and liveDir != 0
+            other = liveDir > 0 ? su : sd
+            other.st       := 0
+            other.stage    := 0
+            other.nodeId   := -1
+            other.imbId    := -1
+            other.stageBar := bar_index
+            lastSwitchBar  := bar_index
+        cand.st       := cand.mode == 1 ? 2 : 1
+        cand.stage    := 7
+        cand.stageBar := bar_index
+        cand.fillBar  := cand.mode == 1 ? bar_index : -1
+        cand.mfe      := 0.0
+        cand.mae      := 0.0
+        cand.tp1Done  := false
+        cand.beSet    := false
+        liveDir       := cand.dir
+        array.push(sigBars, bar_index)
+        dDir      := cand.dir
+        dEnt      := cand.entry
+        dSlv      := cand.sl
+        dT1       := cand.tp1
+        dT2       := cand.tp2
+        dSt       := cand.st
+        dT1d      := false
+        dOpenBar  := bar_index
+        dCloseBar := na
+        dScore    := cand.score
+        execL     := cand.dir > 0
+        execS     := cand.dir < 0
+    verdict := v
+else if barstate.isconfirmed and liveDir == 0 and su.stage < 3 and sd.stage < 3
+    verdict := "—"
+
+// ══════════════ 17 · RMD · TRADE LIFECYCLE ════════════════════════════════════
+if barstate.isconfirmed and liveDir != 0
+    Setup t = liveDir > 0 ? su : sd
+
+    // pending order handling
+    if t.st == 1
+        if t.dir > 0 ? low <= t.entry : high >= t.entry
+            t.st      := 2
+            t.fillBar := bar_index
+        else if bar_index - t.stageBar > i_pendLife or (t.dir > 0 ? close < t.sl : close > t.sl)
+            t.st       := 0
+            t.stage    := 0
+            t.nodeId   := -1
+            t.imbId    := -1
+            t.stageBar := bar_index
+            liveDir    := 0
+            dCloseBar  := bar_index
+            dSt        := 0
+
+    // live management · SL assumed to fill first when both levels print on one bar
+    if t.st == 2 or t.st == 3
+        r0 = math.max(t.risk0, syminfo.mintick)
+        t.mfe := math.max(t.mfe, (t.dir > 0 ? high - t.entry : t.entry - low) / r0)
+        t.mae := math.max(t.mae, (t.dir > 0 ? t.entry - low : high - t.entry) / r0)
+        if t.dir > 0 ? low <= t.sl : high >= t.sl
+            t.st       := 5
+            t.stageBar := bar_index
+            liveDir    := 0
+            dCloseBar  := bar_index
+        else
+            if not t.tp1Done and (t.dir > 0 ? high >= t.tp1 : low <= t.tp1)
+                t.tp1Done := true
+                t.st      := 3
+                if i_beOn
+                    t.sl    := t.entry + t.dir * i_beBuf * atrS
+                    t.beSet := true
+            if t.dir > 0 ? high >= t.tp2 : low <= t.tp2
+                t.st       := 4
+                t.stageBar := bar_index
+                liveDir    := 0
+                dCloseBar  := bar_index
+            else if t.tp1Done and i_trailOn
+                tr   = t.dir > 0 ? hh10 - i_trailMult * atrS : ll10 + i_trailMult * atrS
+                t.sl := t.dir > 0 ? math.max(t.sl, tr) : math.min(t.sl, tr)
+        dSlv := t.sl
+        dSt  := t.st
+        dT1d := t.tp1Done
+
+// ══════════════ 18 · RMD · POSITION SIZING (cross-asset) ══════════════════════
+assetCls = i_assetMode != "Auto" ? i_assetMode : str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "XAG") ? "Metals" : syminfo.type == "forex" ? "Forex" : syminfo.type == "crypto" ? "Crypto" : "Index"
+
+fxRate = request.currency_rate(syminfo.currency, i_acctCur)
+rateOk = not na(fxRate) and fxRate > 0
+convR  = rateOk ? fxRate : 1.0
+
+// value of a 1.0 price-unit move, per 1 unit of position size, in quote currency
+rawVPP = assetCls == "Forex" ? 100000.0 : assetCls == "Metals" ? (str.contains(syminfo.ticker, "XAG") ? 5000.0 : 100.0) : assetCls == "Crypto" ? i_levBase : (syminfo.pointvalue > 0 ? syminfo.pointvalue : 1.0)
+valPP  = i_manualVal > 0 ? i_manualVal : rawVPP * convR
+sizeOk = valPP > 0 and not na(dEnt) and not na(dSlv) and math.abs(dEnt - dSlv) > 0
+
+riskCash = i_equity * i_riskPct / 100.0
+stopDist = sizeOk ? math.abs(dEnt - dSlv) : na
+posSize  = sizeOk ? riskCash / (stopDist * valPP) : na
+notional = sizeOk ? posSize * valPP * dEnt : na
+sizeUnit = assetCls == "Forex" or assetCls == "Metals" ? "lots" : assetCls == "Crypto" ? "units" : "contracts"
+pipSize  = str.endswith(syminfo.currency, "JPY") ? 0.01 : 0.0001
+stopDisp = assetCls == "Forex" and sizeOk ? stopDist / pipSize : sizeOk ? stopDist / syminfo.mintick : na
+stopUnit = assetCls == "Forex" ? "pips" : "ticks"
+
+// ══════════════ 19 · VISUALS · THEME ══════════════════════════════════════════
+bgLum = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+isDark = i_theme == "Dark" or (i_theme == "Auto" and bgLum < 128)
+cBull = isDark ? #8C9AA6 : #57646F
+cBear = isDark ? #A6968C : #6F6157
+cTxt  = isDark ? #C7CDD4 : #2B3138
+cDim  = isDark ? #6C757E : #98A1A9
+cSl   = #C25B5B
+cTp   = #5B9E86
+
+var array<label> pivLbl = array.new<label>()
+var line brkLnH = na
+var line brkLnL = na
+var box  shiftBx = na
+var box  htfBx = na
+
+// ══════════════ 20 · RENDER · INTENT NODES (proximity-ranked, capped) ═════════
+if barstate.isconfirmed or barstate.islast
+    if array.size(nodes) > 0
+        for k = 0 to array.size(nodes) - 1
+            n = array.get(nodes, k)
+            better = 0
+            for q = 0 to array.size(nodes) - 1
+                if q != k
+                    o = array.get(nodes, q)
+                    if o.dir == n.dir and (o.tier < n.tier or (o.tier == n.tier and math.abs(close - o.prox) < math.abs(close - n.prox)))
+                        better += 1
+            vis = better < i_zoneLimit and (n.tier <= 2 or i_diag)
+            if vis
+                col = n.dir > 0 ? cBull : cBear
+                bcl = color.new(col, n.tier == 1 ? 15 : 60)
+                fcl = color.new(col, n.tier == 1 ? i_zoneOpac : math.min(99, i_zoneOpac + 6))
+                zt  = math.max(n.prox, n.dist)
+                zb  = math.min(n.prox, n.dist)
+                if na(n.bx)
+                    n.bx := box.new(n.birth, zt, bar_index + i_extend, zb, border_color = bcl, border_width = n.htfB ? 2 : 1, bgcolor = fcl)
+                else
+                    box.set_lefttop(n.bx, n.birth, zt)
+                    box.set_rightbottom(n.bx, bar_index + i_extend, zb)
+                    box.set_border_color(n.bx, bcl)
+                    box.set_border_width(n.bx, n.htfB ? 2 : 1)
+                    box.set_bgcolor(n.bx, fcl)
+                if n.tier == 1 or i_diag
+                    txt = (n.tier == 1 ? "A+" : "T" + str.tostring(n.tier)) + (i_showScore ? " " + str.tostring(n.score, "#") : "") + (n.htfB ? " ★" : "") + (n.st == 2 ? " ·tested" : "")
+                    if na(n.lb)
+                        n.lb := label.new(bar_index + i_extend, n.prox, txt, style = label.style_none, textcolor = color.new(col, 0), size = size.tiny)
+                    else
+                        label.set_xy(n.lb, bar_index + i_extend, n.prox)
+                        label.set_text(n.lb, txt)
+                        label.set_textcolor(n.lb, color.new(col, 0))
+                else if not na(n.lb)
+                    label.delete(n.lb)
+                    n.lb := na
+            else
+                if not na(n.bx)
+                    box.delete(n.bx)
+                    n.bx := na
+                if not na(n.lb)
+                    label.delete(n.lb)
+                    n.lb := na
+
+// ══════════════ 21 · RENDER · IMBALANCE CHANNELS ══════════════════════════════
+if barstate.isconfirmed or barstate.islast
+    if array.size(imbs) > 0
+        for k = 0 to array.size(imbs) - 1
+            m = array.get(imbs, k)
+            near = math.abs(close - m.ce) / atrS <= 4.0
+            show = i_aieOn and near and (m.grade <= 2 or i_showC)
+            if show
+                tp2 = i_render == "Full" ? m.top0 : i_render == "50% (CE)" ? (m.dir > 0 ? m.top : m.ce) : m.top
+                bt2 = i_render == "Full" ? m.bot0 : i_render == "50% (CE)" ? (m.dir > 0 ? m.ce : m.bot) : m.bot
+                col2 = m.dir > 0 ? cBull : cBear
+                fc2 = color.new(col2, m.st == 5 ? 94 : m.grade == 1 ? 90 : 95)
+                if na(m.bx)
+                    m.bx := box.new(m.birth, math.max(tp2, bt2), bar_index + i_extend, math.min(tp2, bt2), border_color = color.new(col2, 100), bgcolor = fc2)
+                else
+                    box.set_lefttop(m.bx, m.birth, math.max(tp2, bt2))
+                    box.set_rightbottom(m.bx, bar_index + i_extend, math.min(tp2, bt2))
+                    box.set_bgcolor(m.bx, fc2)
+            else if not na(m.bx)
+                box.delete(m.bx)
+                m.bx := na
+
+// ══════════════ 22 · RENDER · LIQUIDITY (sweep-gated) ═════════════════════════
+if barstate.isconfirmed or barstate.islast
+    if array.size(liqs) > 0
+        for k = 0 to array.size(liqs) - 1
+            l = array.get(liqs, k)
+            show2 = i_liqMode == "All" or (i_liqMode == "Post-sweep only" and l.swept)
+            if i_liqMode != "Off" and show2 and math.abs(close - l.px) / atrS <= 8.0
+                x1 = l.swept ? l.sweptBar : math.max(0, bar_index - 30)
+                if na(l.ln)
+                    l.ln := line.new(x1, l.px, bar_index + i_extend, l.px, color = color.new(cDim, 25), style = line.style_dotted, width = 1)
+                else
+                    line.set_xy1(l.ln, x1, l.px)
+                    line.set_xy2(l.ln, bar_index + i_extend, l.px)
+                if l.swept
+                    if na(l.lb)
+                        l.lb := label.new(bar_index + i_extend, l.px, "⌫", style = label.style_none, textcolor = color.new(cDim, 0), size = size.tiny)
+                    else
+                        label.set_xy(l.lb, bar_index + i_extend, l.px)
+            else
+                if not na(l.ln)
+                    line.delete(l.ln)
+                    l.ln := na
+                if not na(l.lb)
+                    label.delete(l.lb)
+                    l.lb := na
+
+// ══════════════ 23 · RENDER · STRUCTURE (minimal) ═════════════════════════════
+if barstate.isconfirmed and i_structShow != "Off" and (newPivH or newPivL)
+    pb = nz(pivBar, bar_index)
+    pp = pivPrice
+    array.push(pivLbl, label.new(pb, pp, newPivH ? "⌃" : "⌄", style = label.style_none, textcolor = color.new(cDim, 20), size = size.tiny, yloc = yloc.price))
+    while array.size(pivLbl) > 24
+        label.delete(array.shift(pivLbl))
+
+if barstate.isconfirmed or barstate.islast
+    if i_structShow == "Full" and not na(swHi)
+        if na(brkLnH)
+            brkLnH := line.new(nz(swHiBar, bar_index), swHi, bar_index + i_extend, swHi, color = color.new(cDim, 40), style = line.style_dashed, width = 1)
+        else
+            line.set_xy1(brkLnH, nz(swHiBar, bar_index), swHi)
+            line.set_xy2(brkLnH, bar_index + i_extend, swHi)
+    else if not na(brkLnH)
+        line.delete(brkLnH)
+        brkLnH := na
+    if i_structShow == "Full" and not na(swLo)
+        if na(brkLnL)
+            brkLnL := line.new(nz(swLoBar, bar_index), swLo, bar_index + i_extend, swLo, color = color.new(cDim, 40), style = line.style_dashed, width = 1)
+        else
+            line.set_xy1(brkLnL, nz(swLoBar, bar_index), swLo)
+            line.set_xy2(brkLnL, bar_index + i_extend, swLo)
+    else if not na(brkLnL)
+        line.delete(brkLnL)
+        brkLnL := na
+
+// ══════════════ 24 · RENDER · STATE-SHIFT ZONE + HTF POI ══════════════════════
+if barstate.isconfirmed or barstate.islast
+    Setup sv = su.stage >= 5 ? su : sd.stage >= 5 ? sd : su
+    if sv.stage >= 5 and sv.shiftBar >= 0 and i_sseOn
+        ext = sv.dir > 0 ? math.max(high, sv.anchor) : math.min(low, sv.anchor)
+        cs = color.new(sv.dir > 0 ? cBull : cBear, i_sseOpac)
+        if na(shiftBx)
+            shiftBx := box.new(sv.shiftBar, math.max(sv.anchor, ext), bar_index + i_extend, math.min(sv.anchor, ext), border_color = color.new(cDim, 100), bgcolor = cs)
+        else
+            box.set_lefttop(shiftBx, sv.shiftBar, math.max(sv.anchor, ext))
+            box.set_rightbottom(shiftBx, bar_index + i_extend, math.min(sv.anchor, ext))
+            box.set_bgcolor(shiftBx, cs)
+    else if not na(shiftBx)
+        box.delete(shiftBx)
+        shiftBx := na
+
+    if i_showHtf and not na(hPoiT) and not na(hPoiB) and hPoiD != 0
+        ch = color.new(hPoiD > 0 ? cBull : cBear, 55)
+        if na(htfBx)
+            htfBx := box.new(math.max(0, bar_index - 40), math.max(hPoiT, hPoiB), bar_index + i_extend, math.min(hPoiT, hPoiB), border_color = ch, border_style = line.style_dashed, bgcolor = color.new(cBull, 100))
+        else
+            box.set_lefttop(htfBx, math.max(0, bar_index - 40), math.max(hPoiT, hPoiB))
+            box.set_rightbottom(htfBx, bar_index + i_extend, math.min(hPoiT, hPoiB))
+            box.set_border_color(htfBx, ch)
+    else if not na(htfBx)
+        box.delete(htfBx)
+        htfBx := na
+
+// ══════════════ 25 · RENDER · TRADE LINES ═════════════════════════════════════
+f_line(line ln, int x1, float y, int x2, color c, string sty) =>
+    line r = ln
+    if na(r)
+        r := line.new(x1, y, x2, y, color = c, style = sty, width = 1)
+    else
+        line.set_xy1(r, x1, y)
+        line.set_xy2(r, x2, y)
+        line.set_color(r, c)
+        line.set_style(r, sty)
+    r
+
+f_lab(label lb, int x, float y, string t, color c) =>
+    label r = lb
+    if na(r)
+        r := label.new(x, y, t, style = label.style_none, textcolor = c, size = size.tiny)
+    else
+        label.set_xy(r, x, y)
+        label.set_text(r, t)
+        label.set_textcolor(r, c)
+    r
+
+var line  lnE  = na
+var line  lnS  = na
+var line  lnT1 = na
+var line  lnT2 = na
+var label lbE  = na
+var label lbS  = na
+var label lbT1 = na
+var label lbT2 = na
+var box   bxR  = na
+var box   bxW  = na
+
+showTrade = not na(dEnt) and dDir != 0 and (na(dCloseBar) or bar_index - dCloseBar <= 20)
+
+if barstate.isconfirmed or barstate.islast
+    if showTrade
+        x1  = nz(dOpenBar, bar_index)
+        x2  = bar_index + i_extend
+        dm  = na(dCloseBar) ? 0 : 55
+        cE  = color.new(cTxt, dm)
+        cS2 = color.new(cSl, dm)
+        cT  = color.new(cTp, dm)
+        lnE  := f_line(lnE, x1, dEnt, x2, cE, line.style_solid)
+        lnS  := f_line(lnS, x1, dSlv, x2, cS2, line.style_solid)
+        lnT1 := f_line(lnT1, x1, dT1, x2, cT, line.style_dashed)
+        lnT2 := f_line(lnT2, x1, dT2, x2, cT, line.style_dotted)
+        lbE  := f_lab(lbE, x2, dEnt, (dDir > 0 ? "LONG " : "SHORT ") + str.tostring(dEnt, format.mintick), cE)
+        lbS  := f_lab(lbS, x2, dSlv, "SL " + str.tostring(dSlv, format.mintick) + (dSt == 5 ? " ✓ stopped" : ""), cS2)
+        lbT1 := f_lab(lbT1, x2, dT1, "TP1 " + str.tostring(dT1, format.mintick) + (dT1d ? " ✓ done" : ""), cT)
+        lbT2 := f_lab(lbT2, x2, dT2, "TP2 " + str.tostring(dT2, format.mintick) + (dSt == 4 ? " ✓ done" : ""), cT)
+        if i_rrBox
+            if na(bxR)
+                bxR := box.new(x1, dEnt, x2, dSlv, border_color = color.new(cSl, 100), bgcolor = color.new(cSl, 93))
+            else
+                box.set_lefttop(bxR, x1, dEnt)
+                box.set_rightbottom(bxR, x2, dSlv)
+            if na(bxW)
+                bxW := box.new(x1, dEnt, x2, dT2, border_color = color.new(cTp, 100), bgcolor = color.new(cTp, 93))
+            else
+                box.set_lefttop(bxW, x1, dEnt)
+                box.set_rightbottom(bxW, x2, dT2)
+    else
+        if not na(lnE)
+            line.delete(lnE)
+            lnE := na
+        if not na(lnS)
+            line.delete(lnS)
+            lnS := na
+        if not na(lnT1)
+            line.delete(lnT1)
+            lnT1 := na
+        if not na(lnT2)
+            line.delete(lnT2)
+            lnT2 := na
+        if not na(lbE)
+            label.delete(lbE)
+            lbE := na
+        if not na(lbS)
+            label.delete(lbS)
+            lbS := na
+        if not na(lbT1)
+            label.delete(lbT1)
+            lbT1 := na
+        if not na(lbT2)
+            label.delete(lbT2)
+            lbT2 := na
+        if not na(bxR)
+            box.delete(bxR)
+            bxR := na
+        if not na(bxW)
+            box.delete(bxW)
+            bxW := na
+
+// ══════════════ 26 · TRADE GUIDE PANEL ════════════════════════════════════════
+f_step(Setup s) =>
+    edgeTxt = s.edge == 0.0 ? "zone edge" : str.tostring(s.edge, format.mintick)
+    t = "No setup · context only"
+    if s.stage == 1
+        t := "Context aligned · awaiting Tier-1 zone"
+    else if s.stage == 2
+        t := "T1 zone armed · awaiting A+ imbalance"
+    else if s.stage == 3
+        t := "A+ confluence · await return to " + edgeTxt
+    else if s.stage == 4
+        t := "Zone tested · await state shift"
+    else if s.stage == 5
+        t := "SHIFT CONFIRMED · await retest of " + edgeTxt
+    else if s.stage == 6
+        t := (s.mode == 1 ? "MARKET " : "PENDING ") + (s.dir > 0 ? "LONG" : "SHORT") + " @ " + str.tostring(s.entry, format.mintick)
+    else if s.stage == 7
+        t := s.st == 1 ? "PENDING order working @ " + str.tostring(s.entry, format.mintick) : s.st == 3 ? "IN TRADE · TP1 done · SL at BE+" : s.st == 2 ? "IN TRADE · managing" : "Trade closed"
+    t
+
+posP = i_panelPos == "Top right" ? position.top_right : i_panelPos == "Bottom right" ? position.bottom_right : i_panelPos == "Top left" ? position.top_left : i_panelPos == "Bottom left" ? position.bottom_left : position.middle_right
+szP  = i_panelSize == "Tiny" ? size.tiny : i_panelSize == "Small" ? size.small : size.normal
+
+var table pnl = table.new(posP, 2, 11, border_width = 1)
+
+if i_panelOn and barstate.islast
+    Setup shown = su.stage >= sd.stage ? su : sd
+    Setup oppo  = su.stage >= sd.stage ? sd : su
+    regTxt = regime == 1 ? "TREND" : regime == 2 ? "BALANCE" : regime == 3 ? "EXPANSION" : "CONTRACTION"
+    strTxt = mseState == 1 ? "BULL EXPANSION" : mseState == 2 ? "BULL RETRACE" : mseState == -1 ? "BEAR EXPANSION" : mseState == -2 ? "BEAR RETRACE" : "BALANCE"
+    htfTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "NEUTRAL"
+    bar    = math.max(0, math.min(10, math.round(shown.score / 10.0)))
+    barTxt = bar <= 0 ? "░░░░░░░░░░" : bar == 1 ? "█░░░░░░░░░" : bar == 2 ? "██░░░░░░░░" : bar == 3 ? "███░░░░░░░" : bar == 4 ? "████░░░░░░" : bar == 5 ? "█████░░░░░" : bar == 6 ? "██████░░░░" : bar == 7 ? "███████░░░" : bar == 8 ? "████████░░" : bar == 9 ? "█████████░" : "██████████"
+    ni4     = f_nodeIdx(shown.nodeId)
+    zoneTxt = "—"
+    if ni4 >= 0
+        nz4     = array.get(nodes, ni4)
+        zoneTxt := (nz4.tier == 1 ? "T1" : "T2") + (nz4.htfB ? " ★ HTF" : "") + " " + str.tostring(nz4.prox, format.mintick)
+    sizeTxt = sizeOk ? str.tostring(posSize, "#.##") + " " + sizeUnit + "  (" + str.tostring(i_riskPct, "#.##") + "% = " + str.tostring(riskCash, "#.##") + " " + i_acctCur + ")" : "SIZE UNAVAILABLE — set manual value"
+    hdCol  = color.new(cTxt, 0)
+    bgCol  = color.new(isDark ? #14181C : #F2F4F6, 12)
+    table.cell(pnl, 0, 0, "AXIOM · " + syminfo.ticker + " · " + timeframe.period, text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 0, "HTF " + htfTf + " " + htfTxt, text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 1, "Regime", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 1, regTxt + " (vol " + str.tostring(math.round(nz(prAtr) * 100)) + "%)", text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 2, "Structure", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 2, strTxt, text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 3, "Setup", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 3, (shown.dir > 0 ? "LONG" : "SHORT") + " · stage " + str.tostring(shown.stage) + "/7", text_color = shown.dir > 0 ? color.new(cBull, 0) : color.new(cBear, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 4, "Confluence", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 4, str.tostring(shown.score, "#") + "/100 " + barTxt, text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 5, "Zone", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 5, zoneTxt, text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 6, "Next step", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 6, f_step(shown), text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 7, "Entry / SL", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 7, showTrade ? str.tostring(dEnt, format.mintick) + " / " + str.tostring(dSlv, format.mintick) + "  (" + str.tostring(stopDisp, "#.#") + " " + stopUnit + ")" : "—", text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 8, "TP1 / TP2", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 8, showTrade ? str.tostring(dT1, format.mintick) + (dT1d ? " ✓" : "") + " / " + str.tostring(dT2, format.mintick) + (dSt == 4 ? " ✓" : "") : "—", text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 9, "Size", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 9, showTrade ? sizeTxt : "—", text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+    table.cell(pnl, 0, 10, "Opposing", text_color = color.new(cDim, 0), text_size = szP, bgcolor = bgCol, text_halign = text.align_left)
+    table.cell(pnl, 1, 10, (oppo.dir > 0 ? "BUY " : "SELL ") + str.tostring(oppo.score, "#") + " → " + verdict + (volOk ? "" : " · SYNTH VOL"), text_color = hdCol, text_size = szP, bgcolor = bgCol, text_halign = text.align_right)
+
+// ══════════════ 27 · ALERTS ═══════════════════════════════════════════════════
+var int prevStL = 0
+var int prevStS = 0
+armL = false
+armS = false
+if barstate.isconfirmed
+    armL    := su.stage >= 3 and prevStL < 3
+    armS    := sd.stage >= 3 and prevStS < 3
+    prevStL := su.stage
+    prevStS := sd.stage
+
+plotshape(execL, "AXIOM long entry", shape.triangleup, location.belowbar, color.new(cBull, 0), size = size.tiny)
+plotshape(execS, "AXIOM short entry", shape.triangledown, location.abovebar, color.new(cBear, 0), size = size.tiny)
+plotshape(armL and not execL, "AXIOM long A+ arming", shape.circle, location.belowbar, color.new(cBull, 45), size = size.tiny)
+plotshape(armS and not execS, "AXIOM short A+ arming", shape.circle, location.abovebar, color.new(cBear, 45), size = size.tiny)
+
+alertcondition(execL, "AXIOM · Long entry confirmed", "AXIOM long entry confirmed · retest of final edge validated")
+alertcondition(execS, "AXIOM · Short entry confirmed", "AXIOM short entry confirmed · retest of final edge validated")
+alertcondition(armL, "AXIOM · Long A+ setup arming", "AXIOM long A+ setup arming · Tier-1 zone with grade-A imbalance")
+alertcondition(armS, "AXIOM · Short A+ setup arming", "AXIOM short A+ setup arming · Tier-1 zone with grade-A imbalance")
+alertcondition(verdict == "SWITCH", "AXIOM · Arbitrator switch", "AXIOM arbitrator recommends switching sides")
+alertcondition(verdict == "STAND_DOWN", "AXIOM · Stand down", "AXIOM two-sided conflict · no position recommended")
+
+// ══════════════ 28 · DISTRIBUTION RINGS (pushed last · rank vs history only) ═══
+if barstate.isconfirmed and bar_index > 2
+    f_ringPush(ringNet, math.abs(close - open[2]) / atrS, 200)

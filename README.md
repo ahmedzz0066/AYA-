@@ -8,6 +8,7 @@ CISD, Liquidity Sweeps, Premium/Discount) with a single deterministic, causally-
 score-gated decision framework.
 
 📄 **[Full specification → `docs/AXIOM-Institutional-Price-Action-Spec.md`](docs/AXIOM-Institutional-Price-Action-Spec.md)**
+⚙️ **[Pine Script v6 indicator → `pine/AXIOM.pine`](pine/AXIOM.pine)** · [install & tuning guide](pine/README.md)
 
 ### What it is
 
