@@ -1,0 +1,235 @@
+<title>XAUUSD 4672.31 Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:wght@400;600&display=swap">
+<style>
+:root{
+  --ground:#EDEFF1;--panel:#FFFFFF;--panel-2:#F6F8F9;--rule:#C9D0D6;--rule-soft:#DEE3E7;
+  --ink:#14181D;--ink-2:#48525C;--ink-3:#6E7A85;
+  --accent:#A85B00;--accent-soft:#F4E7D4;
+  --buy:#0B57D0;--buy-soft:#E1EAFA;--sell:#C4001D;--sell-soft:#FAE1E4;
+  --va:#6D28D9;--va-soft:#EDE7FB;
+  --shadow:0 1px 2px rgba(20,24,29,.06),0 6px 20px rgba(20,24,29,.05);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --ground:#10141A;--panel:#171C23;--panel-2:#1D232B;--rule:#2E3742;--rule-soft:#232A33;
+  --ink:#E3E8EE;--ink-2:#A3AEBA;--ink-3:#7D8994;
+  --accent:#FFB454;--accent-soft:#33260F;
+  --buy:#4FADFF;--buy-soft:#122536;--sell:#FF5C78;--sell-soft:#33161C;
+  --va:#B39DFF;--va-soft:#221C3A;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 22px rgba(0,0,0,.35);
+}}
+:root[data-theme="dark"]{
+  --ground:#10141A;--panel:#171C23;--panel-2:#1D232B;--rule:#2E3742;--rule-soft:#232A33;
+  --ink:#E3E8EE;--ink-2:#A3AEBA;--ink-3:#7D8994;
+  --accent:#FFB454;--accent-soft:#33260F;
+  --buy:#4FADFF;--buy-soft:#122536;--sell:#FF5C78;--sell-soft:#33161C;
+  --va:#B39DFF;--va-soft:#221C3A;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 22px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:"IBM Plex Serif",Georgia,serif;font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:820px;margin:0 auto;padding:22px 16px 90px}
+@media(min-width:700px){.wrap{padding:34px 28px 110px}}
+h1,h2,h3{margin:0;line-height:1.18;text-wrap:balance}
+.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
+.label{font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:700;text-transform:uppercase;
+  letter-spacing:.11em;font-size:11px;color:var(--ink-3)}
+
+header{border-bottom:1px solid var(--rule);padding-bottom:20px;margin-bottom:26px}
+header h1{font-size:clamp(26px,6vw,36px);font-weight:600;letter-spacing:-.02em;margin:8px 0 10px}
+header p{margin:0;color:var(--ink-2);font-size:16px}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+.tags span{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:11px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.08em;border:1px solid var(--rule);border-radius:99px;
+  padding:4px 10px;color:var(--ink-2);background:var(--panel)}
+
+.gate{border:1px solid var(--sell);border-left-width:3px;background:var(--panel);border-radius:4px;
+  padding:15px 17px;margin:0 0 26px}
+.gate .label{color:var(--sell);display:block;margin-bottom:7px}
+.gate p{margin:0 0 .6em;font-size:15.5px}
+.gate p:last-child{margin-bottom:0}
+.gate ol{margin:.5em 0 0;padding-left:1.25em;font-size:15.5px}
+.gate li{margin:.3em 0}
+
+figure{margin:0 0 30px}
+.fig-box{background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:16px 12px;
+  box-shadow:var(--shadow);overflow-x:auto}
+svg{display:block;width:100%;height:auto;color:var(--ink)}
+figcaption{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13px;color:var(--ink-2);
+  margin-top:10px;line-height:1.5}
+.f-buy{fill:var(--buy)}.k-buy{stroke:var(--buy)}
+.f-sell{fill:var(--sell)}.k-sell{stroke:var(--sell)}
+.f-acc{fill:var(--accent)}.k-acc{stroke:var(--accent)}
+.f-va{fill:var(--va)}.k-va{stroke:var(--va)}
+.f-ink{fill:currentColor}
+
+.plan{background:var(--panel);border:1px solid var(--rule);border-radius:5px;margin:0 0 22px;
+  box-shadow:var(--shadow);overflow:hidden}
+.plan-h{padding:15px 18px;border-bottom:1px solid var(--rule);background:var(--panel-2)}
+.plan-h .label{display:block;margin-bottom:5px}
+.plan-h h2{font-size:20px;font-weight:600;letter-spacing:-.01em}
+.plan-h .sub{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13.5px;color:var(--ink-2);margin-top:5px}
+.pA .plan-h{border-left:3px solid var(--buy)}
+.pB .plan-h{border-left:3px solid var(--sell)}
+.rows{display:grid;grid-template-columns:auto 1fr}
+.rows dt{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:11px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);padding:10px 10px 10px 18px;
+  border-bottom:1px solid var(--rule-soft);white-space:nowrap}
+.rows dd{margin:0;padding:10px 18px 10px 0;border-bottom:1px solid var(--rule-soft);
+  font-family:"IBM Plex Sans Condensed",sans-serif;font-size:14.5px}
+.rows dd b{font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:15px}
+.rows dt:last-of-type,.rows dd:last-of-type{border-bottom:0}
+.rr{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;
+  padding:1px 6px;border-radius:3px;background:var(--buy-soft);color:var(--buy);margin-left:6px}
+.warnrow{background:var(--sell-soft)}
+.warnrow b,.warnrow{color:var(--sell)}
+
+.checks{background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:4px 18px;margin:0 0 22px;box-shadow:var(--shadow)}
+.checks .row{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid var(--rule-soft);align-items:flex-start}
+.checks .row:last-child{border-bottom:0}
+.checks .k{font-family:"IBM Plex Mono",monospace;font-size:13px;font-weight:600;min-width:74px;color:var(--accent)}
+.checks .v{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:14.5px;color:var(--ink-2)}
+.checks .v b{color:var(--ink)}
+
+h3.sec{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:12px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.12em;color:var(--accent);margin:34px 0 12px;
+  padding-bottom:6px;border-bottom:1px solid var(--rule-soft)}
+p{margin:0 0 1em}
+pre{background:var(--panel-2);border:1px solid var(--rule);border-radius:4px;padding:12px 14px;
+  overflow-x:auto;font-family:"IBM Plex Mono",monospace;font-size:12.5px;line-height:1.6;margin:14px 0}
+.cm{color:var(--ink-3);font-style:italic}
+.foot{margin-top:40px;padding-top:20px;border-top:1px solid var(--rule);color:var(--ink-3);font-size:13.5px}
+</style>
+
+<div class="wrap">
+<header>
+  <span class="label">XAUUSD &middot; 1H &middot; VFP-Intro &middot; IB 1</span>
+  <h1>4672.31 is a target first, an entry second.</h1>
+  <p>The sell imbalance above is the <em>weaker</em> of your two shelves &mdash; 3.04&sigma; against the lower shelf&rsquo;s 4.20&sigma;, sitting 12 points outside value in the thin tail. Trade toward it with size; trade against it with half.</p>
+  <div class="tags"><span>OVL 0.79 balanced</span><span>RES exact</span><span>failed VAL breakdown</span><span>rotation setup</span></div>
+</header>
+
+<div class="gate">
+<span class="label">Three gates &mdash; none of this runs until all three pass</span>
+<ol>
+<li><b>OVL still &ge; 0.75.</b> Your 0.79 reading was taken <em>before</em> the flush to 4625.27. If the flush knocked it under 0.75 with negative tilt, the rotation thesis is void and 4672 will not be reached. Re-read it now.</li>
+<li><b>4625.27 holds.</b> A new low below it kills Plan A outright.</li>
+<li><b>Fix the frame, or you cannot confirm anything.</b> Your W&#8209;POC / VAH / VAL are all inside 7 cents &mdash; the window is spanning about $1 on an instrument that moves $16 an hour. Every confirmation test below needs a working W&#8209;POC. Patch at the bottom.</li>
+</ol>
+</div>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 620 400" role="img" aria-label="Price ladder from the flush low at 4625.27 up through value area low, point of control, value area high, the sell imbalance at 4672.31 and the penetration ceiling at 4678, with plan A running long from below and plan B shorting the top zone.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<rect x="150" y="26" width="300" height="30" class="f-sell" opacity=".14"/>
+<line x1="150" y1="56" x2="450" y2="56" stroke-width="2.4" class="k-sell"/>
+<line x1="150" y1="26" x2="450" y2="26" stroke-width="1.2" stroke-dasharray="5 4" class="k-sell" opacity=".7"/>
+<text x="458" y="60" class="f-sell" font-weight="700" font-family="IBM Plex Mono, monospace" font-size="13">4672.31</text>
+<text x="458" y="76" class="f-sell" font-size="11">SELL IMB &middot; 3.04&sigma;</text>
+<text x="458" y="24" opacity=".65" font-family="IBM Plex Mono, monospace" font-size="11.5">4678.05 ceiling</text>
+<text x="144" y="46" text-anchor="end" class="f-sell" font-size="11" font-weight="700">short zone</text>
+
+<line x1="150" y1="118" x2="450" y2="118" stroke-width="1.8" stroke-dasharray="6 4" class="k-va"/>
+<text x="458" y="122" class="f-va" font-weight="700" font-family="IBM Plex Mono, monospace" font-size="13">4660.27</text>
+<text x="458" y="138" class="f-va" font-size="11">VAH</text>
+
+<line x1="150" y1="200" x2="450" y2="200" stroke-width="2.6" class="k-acc"/>
+<text x="458" y="204" class="f-acc" font-weight="700" font-family="IBM Plex Mono, monospace" font-size="13">4642.19</text>
+<text x="458" y="220" class="f-acc" font-size="11">C-POC &middot; the magnet</text>
+
+<rect x="150" y="286" width="300" height="26" class="f-buy" opacity=".14"/>
+<line x1="150" y1="286" x2="450" y2="286" stroke-width="2.4" class="k-buy"/>
+<text x="458" y="290" class="f-buy" font-weight="700" font-family="IBM Plex Mono, monospace" font-size="13">4631.01</text>
+<text x="458" y="306" class="f-buy" font-size="11">VAL + BUY IMB &middot; 4.20&sigma;</text>
+
+<line x1="150" y1="312" x2="450" y2="312" stroke-width="1.6" stroke-dasharray="4 3" class="k-buy" opacity=".8"/>
+<text x="458" y="326" opacity=".75" font-family="IBM Plex Mono, monospace" font-size="11.5">4625.27 flush</text>
+<text x="144" y="304" text-anchor="end" class="f-buy" font-size="11" font-weight="700">$5.74</text>
+
+<line x1="150" y1="352" x2="450" y2="352" stroke-width="1.6" class="k-sell" stroke-dasharray="3 3"/>
+<text x="458" y="356" class="f-sell" font-family="IBM Plex Mono, monospace" font-size="11.5">4624.00 stop A</text>
+
+<g stroke-width="3" fill="none" class="k-buy">
+<path d="M96 306 L 96 60" marker-end="url(#up)"/>
+</g>
+<defs><marker id="up" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<text x="88" y="190" text-anchor="end" class="f-buy" font-weight="700" font-size="12.5" transform="rotate(-90 88 190)">PLAN A &mdash; long</text>
+
+<g stroke-width="3" fill="none" class="k-sell">
+<path d="M124 46 L 124 196" marker-end="url(#up)"/>
+</g>
+<text x="118" y="130" text-anchor="middle" class="f-sell" font-weight="700" font-size="12.5" transform="rotate(-90 118 130)">PLAN B</text>
+
+<text x="150" y="382" opacity=".6" font-size="11">Zone widths from your own measured $5.74 penetration at VAL, mirrored above.</text>
+</g>
+</svg>
+</div>
+<figcaption><b>One ladder, two trades that chain.</b> Plan A&rsquo;s exit is Plan B&rsquo;s entry. If both work you capture the top 30 points of the rotation and the first 32 of the return &mdash; but they are independent decisions and B only fires on confirmation.</figcaption>
+</figure>
+
+<div class="plan pA">
+<div class="plan-h">
+  <span class="label">Plan A &middot; primary</span>
+  <h2>Long the failed breakdown &rarr; 4672.31</h2>
+  <p class="sub">Price left value low, found no acceptance at 4625.27, came back in. Re-entry into a balanced band tends to travel across it.</p>
+</div>
+<dl class="rows">
+<dt>Trigger</dt><dd>Reclaim of <b>4642.19</b> (C&#8209;POC) that holds on a retest &mdash; not the first touch</dd>
+<dt>Entry</dt><dd><b>4642.19</b> on the retest &middot; or a VAH breakout-retest at <b>4660.27</b> if you miss it</dd>
+<dt>Stop</dt><dd><b>4624.00</b> &mdash; under the flush low, not under VAL</dd>
+<dt>Risk</dt><dd><b>$18.19</b></dd>
+<dt>T1</dt><dd><b>4660.27</b> VAH &mdash; take 50% <span class="rr">0.99R</span></dd>
+<dt>T2</dt><dd><b>4672.31</b> IMB &mdash; take the rest <span class="rr">1.66R</span></dd>
+<dt>Size</dt><dd>Full</dd>
+<dt>Kill it if</dt><dd class="warnrow">W&#8209;POC follows price back below 4631 &mdash; that is acceptance, not rejection</dd>
+</dl>
+</div>
+
+<div class="plan pB">
+<div class="plan-h">
+  <span class="label">Plan B &middot; secondary, low conviction</span>
+  <h2>Short the 4672 shelf &rarr; back to POC</h2>
+  <p class="sub">The R:R is excellent. The level is not. Size for the level, not for the ratio.</p>
+</div>
+<dl class="rows">
+<dt>Zone</dt><dd><b>4672.31 &ndash; 4678.05</b> (level + your measured penetration)</dd>
+<dt>Entry</dt><dd>Scale: half at <b>4672.50</b>, half at <b>4677.00</b> &rarr; avg <b>4674.75</b></dd>
+<dt>Stop</dt><dd><b>4682.50</b> &mdash; above the profile high</dd>
+<dt>Risk</dt><dd><b>$7.75</b></dd>
+<dt>T1</dt><dd><b>4660.27</b> VAH &mdash; take 50% <span class="rr">1.87R</span></dd>
+<dt>T2</dt><dd><b>4642.19</b> C&#8209;POC &mdash; take the rest <span class="rr">4.20R</span></dd>
+<dt>Size</dt><dd class="warnrow"><b>HALF.</b> 29 vs 10 units on a sparse tail is the ratio test&rsquo;s known false-positive zone</dd>
+<dt>Kill it if</dt><dd class="warnrow">W&#8209;POC migrates above 4672 &mdash; buyers accepted the breakout, stand aside</dd>
+</dl>
+</div>
+
+<h3 class="sec">Confirmation &mdash; rejection, never touch</h3>
+<div class="checks">
+<div class="row"><span class="k">W-POC</span><span class="v">Price above 4672 but W&#8209;POC <b>stays below it</b> &rarr; excursion, short is live. W&#8209;POC follows price up &rarr; acceptance, cancel.</span></div>
+<div class="row"><span class="k">Rows</span><span class="v">Frame rows above 4672 <b>fill thinly</b> &rarr; nobody is doing business up there.</span></div>
+<div class="row"><span class="k">WIN &Delta;</span><span class="v">Does <b>not</b> extend positive as price probes the zone.</span></div>
+<div class="row"><span class="k">OVL</span><span class="v">Still <b>&ge; 0.75</b>. If it drops with buy tilt, you are shorting a trend.</span></div>
+<div class="row"><span class="k">RES</span><span class="v">Reads <b>EXACT</b>. On DRIFT, none of the levels are trustworthy.</span></div>
+</div>
+
+<h3 class="sec">Why 4672 gets half size</h3>
+<p>The two shelves are not comparable. The lower one had <b>82 units</b> at the level and cleared <b>4.20&sigma;</b>; this one has <b>39 units</b> and clears <b>3.04&sigma;</b>. It also sits in the sparse upper tail of your profile, where a small denominator manufactures a large ratio &mdash; the exact false-positive mode the fixed 300% test cannot filter. And it is <b>12 points outside VAH</b>, so it is not defending an edge of value; it is a mark in thin air above one.</p>
+<p>Half size keeps the 4.20R payoff worth taking while the level is only worth about three quarters of what the lower one was.</p>
+
+<h3 class="sec">Fix the frame first</h3>
+<p>On IB and Geometric engines the lattice is hardcoded to <code>syminfo.mintick</code>, so on gold your frame maxes out at &plusmn;$0.50 &mdash; and <code>Ticks Per Row</code> is ignored outside Footprint mode. That is why W&#8209;POC, VAH and VAL are stacked inside 7 cents and why every confirmation test above is currently unusable. One line:</p>
+<pre><span class="cm">// last-bar block: let every engine use the Ticks Per Row lattice</span>
+float tick = syminfo.mintick * ticksPerRowInput
+
+<span class="cm">// and in f_fpViewRows, use the same step so Footprint rows land on it</span>
+int k = int(math.round(row.up_price() / (syminfo.mintick * ticksPerRowInput)))</pre>
+<p>Then set <b>Ticks Per Row 50</b>, <b>Ticks Above/Below 32</b> &rarr; a $32 frame, roughly two average bars. The same change fixes a latent bug: today, Footprint mode with TPR above 1 leaves most frame rows permanently empty, because the rows arrive TPR ticks apart onto a one-tick lattice.</p>
+
+<div class="foot">
+<p>Levels read from your VFP&#8209;Intro panel at 4658.03; zone widths derived from the $5.74 penetration you observed at VAL &mdash; a sample of one, so treat the ceiling as a prior, not a boundary. Re-derive after any change to Profile Period, Resolution or Concentration, since every chart level moves with them.</p>
+<p>Not financial advice. This is a reading of your indicator&rsquo;s output with explicit invalidation, not a forecast.</p>
+</div>
+</div>
