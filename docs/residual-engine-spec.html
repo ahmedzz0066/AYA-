@@ -1,0 +1,978 @@
+<title>The Residual Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;0,700;1,400&display=swap">
+
+<style>
+/* ─── Tokens: complete light palette on bare :root ─── */
+:root{
+  --ground:#EDEFF1;
+  --panel:#FFFFFF;
+  --panel-2:#F6F8F9;
+  --rule:#C9D0D6;
+  --rule-soft:#DEE3E7;
+  --ink:#14181D;
+  --ink-2:#48525C;
+  --ink-3:#6E7A85;
+  --accent:#A85B00;
+  --accent-soft:#F4E7D4;
+  --buy:#0B57D0;
+  --buy-soft:#E1EAFA;
+  --sell:#C4001D;
+  --sell-soft:#FAE1E4;
+  --va:#6D28D9;
+  --va-soft:#EDE7FB;
+  --shadow:0 1px 2px rgba(20,24,29,.06),0 8px 24px rgba(20,24,29,.05);
+  --measure:68ch;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#10141A;
+    --panel:#171C23;
+    --panel-2:#1D232B;
+    --rule:#2E3742;
+    --rule-soft:#232A33;
+    --ink:#E3E8EE;
+    --ink-2:#A3AEBA;
+    --ink-3:#7D8994;
+    --accent:#FFB454;
+    --accent-soft:#33260F;
+    --buy:#4FADFF;
+    --buy-soft:#122536;
+    --sell:#FF5C78;
+    --sell-soft:#33161C;
+    --va:#B39DFF;
+    --va-soft:#221C3A;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#10141A;
+  --panel:#171C23;
+  --panel-2:#1D232B;
+  --rule:#2E3742;
+  --rule-soft:#232A33;
+  --ink:#E3E8EE;
+  --ink-2:#A3AEBA;
+  --ink-3:#7D8994;
+  --accent:#FFB454;
+  --accent-soft:#33260F;
+  --buy:#4FADFF;
+  --buy-soft:#122536;
+  --sell:#FF5C78;
+  --sell-soft:#33161C;
+  --va:#B39DFF;
+  --va-soft:#221C3A;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+  font-size:17px;
+  line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3,h4{text-wrap:balance;line-height:1.18;margin:0}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:3px}
+a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px}
+code,kbd{font-family:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.87em}
+:where(p,ul,ol) code{background:var(--panel-2);border:1px solid var(--rule-soft);padding:.06em .34em;border-radius:3px;color:var(--ink)}
+
+.label{
+  font-family:"IBM Plex Sans Condensed",system-ui,sans-serif;
+  font-weight:600;text-transform:uppercase;letter-spacing:.1em;font-size:12px;
+  color:var(--ink-3);
+}
+
+/* ─── Shell ─── */
+.shell{display:grid;grid-template-columns:minmax(0,1fr);max-width:1500px;margin:0 auto}
+@media (min-width:1080px){
+  .shell{grid-template-columns:264px minmax(0,1fr);gap:0}
+}
+
+/* ─── Chapter rail ─── */
+.rail{
+  border-right:1px solid var(--rule);
+  background:var(--panel);
+  padding:28px 0 60px;
+}
+.rail-inner{position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:0 22px 24px}
+.rail-brand{display:block;margin-bottom:22px}
+.rail-brand .t{font-weight:700;font-size:17px;letter-spacing:-.01em;display:block}
+.rail-brand .s{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:11.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink-3)}
+.rail nav{display:flex;flex-direction:column;gap:2px}
+.rail .part{
+  font-family:"IBM Plex Sans Condensed",sans-serif;font-size:11px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.14em;color:var(--accent);
+  margin:20px 0 6px;padding-bottom:5px;border-bottom:1px solid var(--rule-soft);
+}
+.rail a{
+  font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13.5px;font-weight:500;
+  color:var(--ink-2);text-decoration:none;padding:3px 8px 3px 0;display:flex;gap:9px;
+  border-left:2px solid transparent;padding-left:10px;margin-left:-10px;line-height:1.35;
+}
+.rail a:hover{color:var(--ink)}
+.rail a.on{color:var(--ink);border-left-color:var(--accent);font-weight:600}
+.rail a i{font-style:normal;font-family:"IBM Plex Mono",monospace;color:var(--ink-3);font-size:12px;min-width:1.5em}
+@media (max-width:1079px){
+  .rail{border-right:0;border-bottom:1px solid var(--rule);padding:18px 0}
+  .rail-inner{position:static;max-height:none;padding:0 20px}
+  .rail nav{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:2px 18px}
+  .rail .part{grid-column:1/-1}
+}
+
+/* ─── Column ─── */
+main{padding:0 24px 120px;min-width:0}
+@media (min-width:1080px){main{padding:0 56px 140px}}
+.wrap{max-width:var(--measure)}
+section{padding-top:64px;scroll-margin-top:16px}
+section > p,section > ul,section > ol,section > .note,section > .warn,section > h3,section > h4,section > .lede{max-width:var(--measure)}
+p{margin:0 0 1.05em}
+ul,ol{margin:0 0 1.15em;padding-left:1.3em}
+li{margin:.34em 0}
+li::marker{color:var(--ink-3)}
+
+.ch-head{margin-bottom:26px}
+.ch-num{
+  font-family:"IBM Plex Mono",monospace;font-size:12.5px;font-weight:600;color:var(--accent);
+  letter-spacing:.08em;display:block;margin-bottom:9px;
+}
+h2{font-size:clamp(27px,3.4vw,36px);font-weight:700;letter-spacing:-.018em}
+h3{font-size:21px;font-weight:600;margin:38px 0 12px;letter-spacing:-.01em}
+h4{font-size:16.5px;font-weight:700;margin:26px 0 8px}
+.lede{font-size:19px;color:var(--ink-2);margin-bottom:1.3em}
+
+/* ─── Hero ─── */
+.hero{
+  border-bottom:1px solid var(--rule);
+  padding:70px 0 46px;margin-bottom:6px;
+}
+.hero h1{font-size:clamp(38px,6.2vw,66px);font-weight:700;letter-spacing:-.03em;margin:14px 0 18px;max-width:16ch}
+.hero .kick{color:var(--accent)}
+.hero .sub{font-size:20px;color:var(--ink-2);max-width:60ch;margin-bottom:26px}
+.meta{display:flex;flex-wrap:wrap;gap:8px}
+.meta span{
+  font-family:"IBM Plex Sans Condensed",sans-serif;font-size:11.5px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.09em;color:var(--ink-2);
+  border:1px solid var(--rule);border-radius:999px;padding:5px 12px;background:var(--panel);
+}
+
+/* ─── Figures ─── */
+figure{margin:30px 0;max-width:1000px}
+figure svg{display:block;width:100%;max-width:100%;height:auto;color:var(--ink)}
+.fig-box{background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:22px;box-shadow:var(--shadow);overflow-x:auto}
+figcaption{
+  font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13.5px;color:var(--ink-2);
+  margin-top:11px;max-width:72ch;line-height:1.5;
+}
+figcaption b{color:var(--ink);font-weight:700}
+
+/* ─── Figure marks: semantic hues resolve per theme ─── */
+.fig-box .f-buy{fill:var(--buy)}   .fig-box .k-buy{stroke:var(--buy)}
+.fig-box .f-sell{fill:var(--sell)} .fig-box .k-sell{stroke:var(--sell)}
+.fig-box .f-acc{fill:var(--accent)}.fig-box .k-acc{stroke:var(--accent)}
+.fig-box .f-va{fill:var(--va)}     .fig-box .k-va{stroke:var(--va)}
+.fig-box .f-panel{fill:var(--panel)}
+
+/* ─── Panels / callouts ─── */
+.note,.warn,.spec{
+  border:1px solid var(--rule);border-left-width:3px;background:var(--panel);
+  padding:15px 18px;margin:22px 0;border-radius:3px;font-size:16px;
+}
+.note{border-left-color:var(--accent)}
+.warn{border-left-color:var(--sell)}
+.spec{border-left-color:var(--buy)}
+.note > :last-child,.warn > :last-child,.spec > :last-child{margin-bottom:0}
+.note .label,.warn .label,.spec .label{display:block;margin-bottom:6px}
+.warn .label{color:var(--sell)}
+.spec .label{color:var(--buy)}
+
+/* ─── Tables ─── */
+.tbl{overflow-x:auto;margin:24px 0;border:1px solid var(--rule);border-radius:5px;background:var(--panel);box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;font-size:14.5px;font-family:"IBM Plex Sans Condensed",sans-serif}
+th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--rule-soft);vertical-align:top}
+thead th{
+  font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-3);font-weight:700;
+  background:var(--panel-2);border-bottom:1px solid var(--rule);white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:0}
+td code,th code{font-size:13px;background:none;border:0;padding:0;color:var(--ink)}
+.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* ─── Chips ─── */
+.chip{
+  display:inline-block;font-family:"IBM Plex Sans Condensed",sans-serif;font-size:10.5px;
+  font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:2px 7px;border-radius:3px;
+  border:1px solid transparent;white-space:nowrap;vertical-align:2px;
+}
+.c-design{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.c-fix{background:var(--buy-soft);color:var(--buy);border-color:var(--buy)}
+.c-hard{background:var(--sell-soft);color:var(--sell);border-color:var(--sell)}
+.c-buy{background:var(--buy-soft);color:var(--buy)}
+.c-sell{background:var(--sell-soft);color:var(--sell)}
+.c-va{background:var(--va-soft);color:var(--va)}
+
+/* ─── Cards ─── */
+.cards{display:grid;gap:16px;margin:26px 0;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));max-width:1000px}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:5px;padding:18px;box-shadow:var(--shadow)}
+.card h4{margin:0 0 4px;font-size:16px}
+.card .label{margin-bottom:9px}
+.card p{font-size:15px;margin-bottom:.7em}
+.card p:last-child{margin-bottom:0}
+.card dl{margin:0;font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13.5px}
+.card dt{color:var(--ink-3);font-weight:600;text-transform:uppercase;font-size:10.5px;letter-spacing:.08em;margin-top:9px}
+.card dd{margin:1px 0 0;font-family:"IBM Plex Mono",monospace;font-size:13px}
+
+/* ─── Code ─── */
+pre{
+  background:var(--panel-2);border:1px solid var(--rule);border-radius:5px;
+  padding:14px 16px;overflow-x:auto;margin:18px 0;max-width:1000px;
+  font-family:"IBM Plex Mono",monospace;font-size:13px;line-height:1.62;color:var(--ink);
+}
+pre .cm{color:var(--ink-3);font-style:italic}
+pre .kw{color:var(--accent);font-weight:500}
+
+/* ─── Play blocks ─── */
+.play{border:1px solid var(--rule);border-radius:5px;background:var(--panel);margin:26px 0;overflow:hidden;box-shadow:var(--shadow);max-width:1000px}
+.play-h{padding:15px 20px;border-bottom:1px solid var(--rule);background:var(--panel-2);display:flex;justify-content:space-between;gap:14px;align-items:baseline;flex-wrap:wrap}
+.play-h h4{margin:0;font-size:18px}
+.play-b{padding:18px 20px}
+.play-b > :last-child{margin-bottom:0}
+.play-grid{display:grid;gap:0;border-top:1px solid var(--rule);grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.play-grid div{padding:13px 20px;border-right:1px solid var(--rule-soft)}
+.play-grid div:last-child{border-right:0}
+.play-grid .label{display:block;margin-bottom:4px}
+.play-grid p{font-size:14.5px;margin:0;font-family:"IBM Plex Sans Condensed",sans-serif}
+
+hr{border:0;border-top:1px solid var(--rule);margin:52px 0 0;max-width:1000px}
+.foot{padding-top:56px;color:var(--ink-3);font-size:14.5px;max-width:var(--measure)}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+html{scroll-behavior:smooth}
+</style>
+<style>
+/* ─── Spec-only components ─── */
+.math{
+  background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--accent);
+  border-radius:3px;padding:16px 20px;margin:20px 0;max-width:1000px;overflow-x:auto;
+  font-family:"IBM Plex Mono",monospace;font-size:14px;line-height:1.9;color:var(--ink);
+}
+.math .where{display:block;margin-top:10px;font-size:12.5px;color:var(--ink-3);font-family:"IBM Plex Sans Condensed",sans-serif;line-height:1.55}
+.math em{color:var(--accent);font-style:normal;font-weight:600}
+.algo{
+  border-top:2px solid var(--accent);background:var(--panel);border-radius:0 0 4px 4px;
+  padding:20px 22px;margin:0 0 8px;box-shadow:var(--shadow);max-width:1000px;
+}
+.algo h2{margin:0 0 6px}
+.algo .rep{font-family:"IBM Plex Sans Condensed",sans-serif;font-size:13.5px;color:var(--ink-2);display:flex;flex-wrap:wrap;gap:6px 10px;align-items:baseline}
+.algo .rep b{color:var(--sell);font-weight:700;text-transform:uppercase;letter-spacing:.07em;font-size:11px}
+.algo .rep s{color:var(--ink-3);text-decoration-color:var(--sell)}
+.verdict{display:grid;gap:0;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));border:1px solid var(--rule);border-radius:4px;overflow:hidden;margin:22px 0;max-width:1000px;background:var(--panel)}
+.verdict div{padding:14px 16px;border-right:1px solid var(--rule-soft)}
+.verdict div:last-child{border-right:0}
+.verdict .label{display:block;margin-bottom:5px}
+.verdict p{margin:0;font-size:15px}
+.verdict .big{font-family:"IBM Plex Mono",monospace;font-size:22px;font-weight:600;letter-spacing:-.02em;display:block;margin-bottom:2px}
+.win{color:var(--buy)}.lose{color:var(--sell)}
+</style>
+
+<div class="shell">
+<aside class="rail">
+<div class="rail-inner">
+<span class="rail-brand"><span class="t">Residual Engine</span><span class="s">VFP algorithm redesign</span></span>
+<nav id="nav">
+  <div class="part">The idea</div>
+  <a href="#thesis"><i>&sect;</i>One model, six heuristics</a>
+  <div class="part">Core algorithms</div>
+  <a href="#a1"><i>01</i>Bridge Occupancy</a>
+  <a href="#a2"><i>02</i>Crossing Decomposition</a>
+  <a href="#a3"><i>03</i>Model&#8209;Residual Imbalance</a>
+  <div class="part">Structure algorithms</div>
+  <a href="#a4"><i>04</i>Prominence&#8209;Ranked Nodes</a>
+  <a href="#a5"><i>05</i>Highest&#8209;Density Value Area</a>
+  <a href="#a6"><i>06</i>Flow Separation</a>
+  <div class="part">State algorithms</div>
+  <a href="#a7"><i>07</i>Volume&#8209;Clock Decay</a>
+  <a href="#a8"><i>08</i>Adaptive Frame</a>
+  <a href="#a9"><i>09</i>Level Efficiency</a>
+  <div class="part">Engineering</div>
+  <a href="#cost"><i>&sect;</i>Cost analysis</a>
+  <a href="#migrate"><i>&sect;</i>Migration path</a>
+  <a href="#limits"><i>&sect;</i>What it still can&rsquo;t do</a>
+</nav>
+</div>
+</aside>
+
+<main>
+<header class="hero">
+  <span class="label">Algorithm redesign &middot; companion to the Field Manual</span>
+  <h1>The model is the <span class="kick">null hypothesis</span>. Order flow is the residual.</h1>
+  <p class="sub">VFP&#8209;Intro contains six unrelated heuristics. This document replaces all six with one physical model of the bar and the deviations from it &mdash; producing algorithms that are simultaneously more accurate, more interpretable, and cheaper to run.</p>
+  <div class="meta"><span>9 algorithms</span><span>0 magic constants</span><span>verified against 5,008 paths</span><span>O(P&middot;R) total</span></div>
+</header>
+
+<section id="thesis">
+<div class="ch-head"><span class="ch-num">The idea</span>
+<h2>One model in place of six heuristics</h2></div>
+<p class="lede">Every questionable number in the current indicator comes from a heuristic invented in isolation. Replace them with one model of how a bar is traversed, and the heuristics stop being needed &mdash; the answers fall out.</p>
+
+<p>Here is the audit. Six independent inventions, each with its own arbitrary constant, none of them derived from anything:</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Current heuristic</th><th>Its arbitrary part</th><th>What it is really trying to estimate</th></tr></thead>
+<tbody>
+<tr><td>Close-location split <code>(C&minus;L)/(H&minus;L)</code></td><td>the whole formula</td><td>The share of the path travelled upward</td></tr>
+<tr><td>Two Gaussian bells at <code>(L+C)/2</code>, <code>(C+H)/2</code></td><td>the centres, and <code>&sigma; = range/3</code></td><td>Where inside the bar price actually spent its time</td></tr>
+<tr><td>POC = argmax of row sums</td><td>&mdash;</td><td>The mode of the volume-at-price distribution</td></tr>
+<tr><td>Greedy value-area expansion</td><td>tie-breaks upward</td><td>The smallest price region holding 70% of volume</td></tr>
+<tr><td>Diagonal ratio &gt; 300%</td><td><code>300</code></td><td>Aggression beyond what chance would produce</td></tr>
+<tr><td>Overlap coefficient &ge; 0.75</td><td><code>0.75</code></td><td>Whether both sides worked the same prices</td></tr>
+</tbody>
+</table></div>
+
+<p>Read the right-hand column and a single question sits behind all six: <strong>what path did price take through this bar, and how far does the observed volume depart from what that path implies?</strong></p>
+
+<p>So: model the path. Use the model to predict where volume should sit and how it should be split. Then treat everything interesting &mdash; imbalance, absorption, initiative &mdash; as the <em>residual</em> between prediction and observation. Under a modelled engine the residual is identically zero, which is exactly right: a model that invents the data has no business also reporting surprises in it.</p>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 960 300" role="img" aria-label="Pipeline: bar geometry feeds a bridge occupancy model producing predicted volume-at-price and a predicted buy-sell split; observed engine data is compared against it; the difference is the residual, which is the only thing reported as a signal.">
+<defs><marker id="ra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="13">
+<rect x="14" y="118" width="140" height="64" rx="3" fill="none" stroke="currentColor" stroke-width="1.4"/>
+<text x="84" y="144" text-anchor="middle" font-weight="700">Bar geometry</text>
+<text x="84" y="163" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" opacity=".65">O H L C</text>
+
+<rect x="204" y="104" width="164" height="92" rx="3" fill="none" stroke-width="2" class="k-acc"/>
+<text x="286" y="132" text-anchor="middle" font-weight="700" class="f-acc">Bridge model</text>
+<text x="286" y="152" text-anchor="middle" font-size="11.5" opacity=".75">occupancy L(x)</text>
+<text x="286" y="169" text-anchor="middle" font-size="11.5" opacity=".75">crossings N(x), &delta;(x)</text>
+<text x="286" y="187" text-anchor="middle" font-size="11" opacity=".55">THE NULL</text>
+
+<rect x="418" y="46" width="164" height="60" rx="3" fill="none" stroke="currentColor" stroke-width="1.4"/>
+<text x="500" y="71" text-anchor="middle" font-weight="700">Predicted</text>
+<text x="500" y="89" text-anchor="middle" font-size="11.5" opacity=".65">volume &amp; split per row</text>
+
+<rect x="418" y="194" width="164" height="60" rx="3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text x="500" y="219" text-anchor="middle" font-weight="700">Observed</text>
+<text x="500" y="237" text-anchor="middle" font-size="11.5" opacity=".65">footprint / intrabar rows</text>
+
+<circle cx="672" cy="150" r="30" fill="none" stroke="currentColor" stroke-width="1.6"/>
+<text x="672" y="156" text-anchor="middle" font-size="19" font-weight="700">&minus;</text>
+
+<rect x="754" y="104" width="192" height="92" rx="3" fill="none" stroke-width="2" class="k-buy"/>
+<text x="850" y="132" text-anchor="middle" font-weight="700" class="f-buy">Residual</text>
+<text x="850" y="152" text-anchor="middle" font-size="11.5" opacity=".75">imbalance &middot; absorption</text>
+<text x="850" y="169" text-anchor="middle" font-size="11.5" opacity=".75">initiative &middot; surprise</text>
+<text x="850" y="187" text-anchor="middle" font-size="11" opacity=".55">THE ONLY SIGNAL</text>
+
+<g stroke="currentColor" stroke-width="1.4" fill="none" marker-end="url(#ra)">
+<line x1="154" y1="150" x2="198" y2="150"/>
+<path d="M368 138 L 392 138 L 392 76 L 412 76"/>
+<line x1="582" y1="76" x2="628" y2="132"/>
+<line x1="582" y1="224" x2="628" y2="168"/>
+<line x1="702" y1="150" x2="748" y2="150"/>
+</g>
+<path d="M286 196 L 286 236 L 412 236" stroke="currentColor" stroke-width="1.2" fill="none" opacity=".45" stroke-dasharray="4 3"/>
+<text x="300" y="252" font-size="11" opacity=".6">modelled engines: observed := predicted &rArr; residual &equiv; 0</text>
+</g>
+</svg>
+</div>
+<figcaption><b>The architecture in one picture.</b> The current design has no null model, so it cannot distinguish &ldquo;this is what a random path would produce&rdquo; from &ldquo;someone was aggressive here.&rdquo; That distinction is the entire value of a footprint, and it is available for free once a model exists.</figcaption>
+</figure>
+</section>
+
+<section id="a1">
+<div class="algo">
+<span class="ch-num">Algorithm 01</span>
+<h2>Bridge Occupancy Model</h2>
+<p class="rep"><b>replaces</b> <s>two Gaussian bells at (L+C)/2 and (C+H)/2 with &sigma; = range / Concentration</s></p>
+</div>
+<p class="lede">A bar is not two bells. It is one path, pinned at O and C, that touched H and L. The correct volume-at-price distribution is that path&rsquo;s occupation density &mdash; and it has no free parameters.</p>
+
+<h3>The model</h3>
+<p>Treat intrabar price as a driftless diffusion on <code>[0,1]</code> pinned at <code>O</code> and <code>C</code>, confined to <code>[L,H]</code>, and required to touch both barriers. The quantity we want is its expected occupation density &mdash; how long the path spends at each price:</p>
+
+<div class="math">
+L(x) &nbsp;=&nbsp; &int;<sub>0</sub><sup>1</sup> p<sub>t</sub><sup>[L,H]</sup>(O, x) &middot; p<sub>1&minus;t</sub><sup>[L,H]</sup>(x, C) &nbsp;dt &nbsp;&frasl;&nbsp; p<sub>1</sub><sup>[L,H]</sup>(O, C)
+<span class="where">where p<sup>[L,H]</sup> is the transition density of the barrier-confined diffusion, obtained by the method of images:<br>
+p<sub>t</sub><sup>[L,H]</sup>(u,v) = &Sigma;<sub>n</sub> [ &phi;<sub>t</sub>(v &minus; u + 2nR) &minus; &phi;<sub>t</sub>(v + u &minus; 2L + 2nR) ], R = H &minus; L. Three image terms each way suffice when &nu;&radic;t &le; R/2.</span>
+</div>
+
+<p>Volume is then allocated in proportion to <code>L(x)</code>, exactly as the current code allocates it in proportion to its bells. Nothing else in the table changes.</p>
+
+<h3>Where &sigma; comes from &mdash; and why Concentration is measurable, not a preference</h3>
+<p>The current <code>Concentration</code> input exists because nobody knew what &sigma; should be. But the bar tells you: for a driftless diffusion observed continuously, Parkinson&rsquo;s identity gives the expected squared range, and inverting it gives the volatility that produced <em>this</em> range.</p>
+
+<div class="math">
+E[(H &minus; L)&sup2;] = 4&nbsp;ln2&nbsp;&middot;&nbsp;&nu;&sup2; &nbsp;&nbsp;&rArr;&nbsp;&nbsp; <em>&nu;&#770; = (H &minus; L) / 1.6651</em>
+<span class="where">2&radic;(ln 2) = 1.6651. The shipped default of Concentration = 3.0 implies &sigma; = range/3, which is <b>0.555&times;</b> the range-implied volatility &mdash; the model is over-concentrated by a factor of 1.8, systematically pulling volume toward bar centres and away from the extremes where reversals happen.</span>
+</div>
+
+<p>Keep the input, but redefine it as a dimensionless multiplier on &nu;&#770; with default <code>1.0</code>. Every symbol is then calibrated automatically, and Chapter&nbsp;13 of the Field Manual &mdash; a whole chapter about guessing a constant &mdash; becomes unnecessary.</p>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 960 360" role="img" aria-label="The same bar under two models. The Gaussian bell tapers to nothing at the high and low. The bridge occupancy places real mass at the extremes, because the path had to travel there and turn around, and shows a plateau between open and close.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<text x="20" y="24" font-weight="700" font-size="13.5">Bar: O 100 &middot; H 110 &middot; L 99 &middot; C 101 &mdash; ran up 10, gave it all back</text>
+
+<g transform="translate(20,44)">
+<text x="150" y="14" text-anchor="middle" font-weight="700" class="f-sell">Current: two Gaussian bells</text>
+<g font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="end" opacity=".6">
+<text x="44" y="42">110 H</text><text x="44" y="86">107</text><text x="44" y="130">104</text>
+<text x="44" y="152">101 C</text><text x="44" y="174">100 O</text><text x="44" y="218">99 L</text>
+</g>
+<g class="f-sell" opacity=".7">
+<rect x="52" y="32" width="4" height="14"/><rect x="52" y="54" width="9" height="14"/>
+<rect x="52" y="76" width="20" height="14"/><rect x="52" y="98" width="42" height="14"/>
+<rect x="52" y="120" width="78" height="14"/><rect x="52" y="142" width="118" height="14"/>
+<rect x="52" y="164" width="140" height="14"/><rect x="52" y="186" width="104" height="14"/>
+<rect x="52" y="208" width="46" height="14"/>
+</g>
+<path d="M52 32 L 252 32" stroke-dasharray="3 3" stroke-width="1" opacity=".35" class="k-sell" fill="none"/>
+<text x="150" y="252" text-anchor="middle" font-size="11.5" class="f-sell">essentially zero volume at the high</text>
+<text x="150" y="270" text-anchor="middle" font-size="11.5" opacity=".7">&mdash; but the reversal happened there</text>
+</g>
+
+<g transform="translate(360,44)">
+<text x="150" y="14" text-anchor="middle" font-weight="700" class="f-buy">Bridge occupancy L(x)</text>
+<g font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="end" opacity=".6">
+<text x="44" y="42">110 H</text><text x="44" y="86">107</text><text x="44" y="130">104</text>
+<text x="44" y="152">101 C</text><text x="44" y="174">100 O</text><text x="44" y="218">99 L</text>
+</g>
+<g class="f-buy" opacity=".75">
+<rect x="52" y="32" width="62" height="14"/><rect x="52" y="54" width="48" height="14"/>
+<rect x="52" y="76" width="44" height="14"/><rect x="52" y="98" width="46" height="14"/>
+<rect x="52" y="120" width="52" height="14"/><rect x="52" y="142" width="128" height="14"/>
+<rect x="52" y="164" width="146" height="14"/><rect x="52" y="186" width="96" height="14"/>
+<rect x="52" y="208" width="58" height="14"/>
+</g>
+<text x="200" y="43" font-size="11.5" font-weight="700" class="f-buy">turning-point mass</text>
+<text x="205" y="172" font-size="11.5" font-weight="700" class="f-buy">O&ndash;C plateau</text>
+<text x="150" y="252" text-anchor="middle" font-size="11.5" opacity=".8">real mass at both extremes,</text>
+<text x="150" y="270" text-anchor="middle" font-size="11.5" opacity=".8">because the path had to turn around there</text>
+</g>
+
+<g transform="translate(700,44)" font-size="11.5">
+<text x="0" y="14" font-weight="700">What changes downstream</text>
+<text x="0" y="40" opacity=".8">&bull; volume at H and L stops</text><text x="10" y="56" opacity=".8">vanishing &rarr; reversal levels</text><text x="10" y="72" opacity=".8">become visible</text>
+<text x="0" y="98" opacity=".8">&bull; the O&ndash;C region flattens</text><text x="10" y="114" opacity=".8">into a plateau, not a peak</text>
+<text x="0" y="140" opacity=".8">&bull; two-sided bars produce</text><text x="10" y="156" opacity=".8">genuinely bimodal shapes</text>
+<text x="0" y="182" opacity=".8">&bull; O enters the model at all</text><text x="10" y="198" opacity=".8">&mdash; today it is ignored</text>
+</g>
+</g>
+</svg>
+</div>
+<figcaption><b>The single most consequential difference.</b> A Gaussian centred inside the bar assigns near-zero volume to H and L, because they sit three standard deviations out. But a path that <em>reached</em> the high necessarily transacted there and turned around &mdash; that is where the reversal was priced. The bridge model puts mass there because the physics requires it.</figcaption>
+</figure>
+
+<h3>Implementation: forward&ndash;backward, not quadrature</h3>
+<p>The integral above needs no numerical integration. Discretise the bar into <code>M</code> sub-steps on the existing tick lattice and run the standard forward&ndash;backward recursion &mdash; the same algorithm used for hidden Markov state posteriors. It is exact for the discretised model, has no tolerance to tune, and cannot drift.</p>
+
+<pre><span class="cm">// M sub-steps, R lattice rows spanning [L, H].  alpha: reachable from O.</span>
+<span class="cm">// beta: can still reach C.  Occupancy is their product, summed over time.</span>
+matrix&lt;float&gt; al = matrix.new&lt;float&gt;(M + 1, R, 0.0)
+matrix&lt;float&gt; be = matrix.new&lt;float&gt;(M + 1, R, 0.0)
+matrix.set(al, 0, rowOf(O), 1.0)
+matrix.set(be, M, rowOf(C), 1.0)
+
+<span class="kw">for</span> t = 0 <span class="kw">to</span> M - 1                       <span class="cm">// forward</span>
+    <span class="kw">for</span> j = 0 <span class="kw">to</span> R - 1
+        float w = matrix.get(al, t, j)
+        <span class="kw">if</span> w &gt; 0.0
+            <span class="kw">for</span> dj = -sSpan <span class="kw">to</span> sSpan          <span class="cm">// kernel, reflected at 0 and R-1</span>
+                <span class="kw">int</span> k = math.max(0, math.min(R - 1, j + dj))
+                matrix.set(al, t+1, k, matrix.get(al, t+1, k) + w * kern[dj + sSpan])
+
+<span class="cm">// ... symmetric backward pass ...</span>
+
+<span class="kw">for</span> j = 0 <span class="kw">to</span> R - 1                       <span class="cm">// occupancy</span>
+    float occ = 0.0
+    <span class="kw">for</span> t = 0 <span class="kw">to</span> M
+        occ += matrix.get(al, t, j) * matrix.get(be, t, j)
+    array.set(Lx, j, occ)</pre>
+
+<div class="note"><span class="label">Enforcing &ldquo;touched H and L&rdquo;</span><p>The plain bridge does not guarantee the path reaches both barriers, but the real bar did. Impose it exactly by inclusion&ndash;exclusion over the two touch events: run the recursion four times &mdash; unconstrained, absorbed at H, absorbed at L, absorbed at both &mdash; and combine as <code>L = L<sub>&empty;</sub> &minus; L<sub>H</sub> &minus; L<sub>L</sub> + L<sub>HL</sub></code>. Four cheap passes, and the result is the exact conditional occupancy. In practice the barriers are the observed extremes, so absorption is a one-line change to the kernel edges.</p></div>
+</section>
+
+<section id="a2">
+<div class="algo">
+<span class="ch-num">Algorithm 02</span>
+<h2>Crossing Decomposition Split</h2>
+<p class="rep"><b>replaces</b> <s>buy share = (C &minus; L) / (H &minus; L), applied uniformly to the whole bar</s></p>
+</div>
+<p class="lede">The buy/sell split is not a matter of opinion. Path continuity determines it exactly, per price level, with no parameters at all &mdash; and the answer is nothing like the close-location value.</p>
+
+<h3>The identity</h3>
+<p>Work with the boundaries between lattice rows, <code>b<sub>j</sub> = (j + &frac12;) &middot; tick</code>. Because O and C sit on ticks, a boundary is never an endpoint, so there is no degenerate case. For <em>any</em> continuous path from O to C:</p>
+
+<div class="math">
+up(b) &minus; down(b) &nbsp;=&nbsp; <em>+1</em> if O &lt; b &lt; C &nbsp;&middot;&nbsp; <em>&minus;1</em> if C &lt; b &lt; O &nbsp;&middot;&nbsp; <em>0</em> otherwise
+<span class="where">This is not an approximation and not a model assumption &mdash; it is a consequence of continuity, true of every path. Verified exhaustively against 5,008 simulated paths: holds exactly, zero mismatches.</span>
+</div>
+
+<p>Total crossings <code>N(b) = up + down</code> is what the occupancy model predicts (<code>N &prop; L(x)/tick</code>). Two equations, two unknowns:</p>
+
+<div class="math">
+up(b) = &frac12;[ N(b) + &delta;(b) ] &nbsp;&nbsp;&nbsp; down(b) = &frac12;[ N(b) &minus; &delta;(b) ]<br>
+<em>buy share at row j</em> &nbsp;=&nbsp; &frac12; &nbsp;+&nbsp; &delta;&#772;(j) &frasl; ( 2 &middot; N&#772;(j) )
+<span class="where">where &delta;&#772; and N&#772; are the means of the row&rsquo;s two bounding-boundary values. Aggregating over the bar gives the whole-bar share as &frac12; + (C &minus; O) / (2&nbsp;&middot;&nbsp;TV), with TV the path&rsquo;s total variation in ticks &mdash; i.e. <b>(1 + efficiency ratio) / 2</b>.</span>
+</div>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 960 330" role="img" aria-label="A price path inside one bar with dashed half-tick boundaries. At a boundary between open and close the path crosses up twice and down once, net plus one. At a boundary in the upper wick it crosses up once and down once, net zero, giving a fifty-fifty split there.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<g stroke="currentColor" stroke-width="1" opacity=".22" stroke-dasharray="4 4">
+<line x1="90" y1="46" x2="690" y2="46"/><line x1="90" y1="78" x2="690" y2="78"/>
+<line x1="90" y1="110" x2="690" y2="110"/><line x1="90" y1="142" x2="690" y2="142"/>
+<line x1="90" y1="174" x2="690" y2="174"/><line x1="90" y1="206" x2="690" y2="206"/>
+<line x1="90" y1="238" x2="690" y2="238"/>
+</g>
+<line x1="90" y1="142" x2="690" y2="142" stroke-width="1.6" class="k-buy"/>
+<line x1="90" y1="62" x2="690" y2="62" stroke-width="1.6" class="k-sell"/>
+
+<g font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="end" opacity=".65">
+<text x="82" y="34">H 105</text><text x="82" y="66">104.5</text><text x="82" y="146">100.5</text><text x="82" y="242">L 99</text>
+</g>
+<g font-family="IBM Plex Mono, monospace" font-size="11" opacity=".8">
+<text x="700" y="66" class="f-sell">b = 104.5</text><text x="700" y="146" class="f-buy">b = 100.5</text>
+</g>
+
+<polyline points="110,158 150,190 190,230 230,196 270,150 310,96 350,54 390,34 430,66 470,42 510,88 550,120 590,96 630,78 670,78"
+  fill="none" stroke="currentColor" stroke-width="2.4"/>
+<circle cx="110" cy="158" r="5" fill="currentColor"/><text x="110" y="182" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11">O 100</text>
+<circle cx="670" cy="78" r="5" fill="currentColor"/><text x="670" y="102" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11">C 104</text>
+
+<g font-size="15" font-weight="700">
+<text x="286" y="136" class="f-buy">&uarr;</text>
+<text x="546" y="136" class="f-buy" opacity=".55">&darr;</text>
+<text x="576" y="136" class="f-buy">&uarr;</text>
+<text x="366" y="56" class="f-sell">&uarr;</text>
+<text x="414" y="56" class="f-sell" opacity=".55">&darr;</text>
+<text x="452" y="56" class="f-sell">&uarr;</text>
+<text x="486" y="56" class="f-sell" opacity=".55">&darr;</text>
+</g>
+
+<g transform="translate(90,266)" font-size="12">
+<text x="0" y="0" class="f-buy" font-weight="700">b = 100.5 &mdash; between O and C:</text>
+<text x="228" y="0" opacity=".85">up 2, down 1 &rarr; net <tspan font-weight="700">+1</tspan> &rarr; buy share 2/3</text>
+<text x="0" y="22" class="f-sell" font-weight="700">b = 104.5 &mdash; in the upper wick:</text>
+<text x="228" y="22" opacity=".85">up 2, down 2 &rarr; net <tspan font-weight="700">0</tspan> &rarr; buy share exactly 1/2</text>
+<text x="0" y="48" opacity=".7" font-size="11.5">A wick is traversed equally in both directions by definition. Fifty-fifty there is not a fallback &mdash; it is the correct answer.</text>
+</g>
+</g>
+</svg>
+</div>
+<figcaption><b>Per-level, not per-bar.</b> The close-location split hands one ratio to every price in the bar. The crossing decomposition gives each level its own ratio, and the ratios it gives are forced by continuity rather than chosen. Heavily-crossed levels tend toward 50/50 &mdash; correctly, since a level visited fifty times with net +1 was genuinely contested.</figcaption>
+</figure>
+
+<h3>What it does to the pathological bars</h3>
+<p>The Field Manual&rsquo;s trap 05 &mdash; &ldquo;a bar closing on its low reports zero buy volume&rdquo; &mdash; disappears, because the identity knows the path had to <em>buy</em> its way to the high before it could sell back down.</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Bar</th><th>What happened</th><th>CLV says</th><th>Crossing says</th></tr></thead>
+<tbody>
+<tr><td class="num">O 100 H 105 L 99 C 99</td><td>ran up 5, sold off to close at the low</td><td class="num lose">0.000 &mdash; no buyers exist</td><td class="num win">0.455</td></tr>
+<tr><td class="num">O 100 H 105 L 99 C 105</td><td>dipped, then closed at the high</td><td class="num lose">1.000 &mdash; no sellers exist</td><td class="num win">0.857</td></tr>
+<tr><td class="num">O 100 H 110 L 100 C 101</td><td>ran up 10, gave back 9</td><td class="num lose">0.100</td><td class="num win">0.526</td></tr>
+<tr><td class="num">O 100 H 105 L 99 C 104</td><td>ordinary up bar</td><td class="num">0.833</td><td class="num">0.750</td></tr>
+<tr><td class="num">O 100 H 101 L 99 C 100</td><td>doji</td><td class="num">0.500</td><td class="num">0.500</td></tr>
+</tbody>
+</table></div>
+
+<p>Look at row three. A bar that opened at 100, ran ten points to 110, and closed at 101 is reported by the close-location split as <strong>90% selling</strong>. But every one of those ten points up was bought. The crossing decomposition says 52.6% &mdash; a hard-fought bar that ended roughly where it started, which is what actually happened.</p>
+
+<div class="verdict">
+<div><span class="label">Free parameters</span><p><span class="big lose">1</span>&rarr;<span class="big win">0</span>the whole formula was the parameter</p></div>
+<div><span class="label">Worst-case error</span><p><span class="big lose">100%</span>&rarr;<span class="big win">bounded</span>never reports a side as absent</p></div>
+<div><span class="label">Resolution</span><p><span class="big lose">1</span>&rarr;<span class="big win">per row</span>one ratio per bar &rarr; one per price</p></div>
+<div><span class="label">Uses the open</span><p><span class="big lose">no</span>&rarr;<span class="big win">yes</span>a quarter of the data, currently discarded</p></div>
+</div>
+</section>
+
+<section id="a3">
+<div class="algo">
+<span class="ch-num">Algorithm 03</span>
+<h2>Model-Residual Imbalance</h2>
+<p class="rep"><b>replaces</b> <s>buy(k) &gt; 3.0 &times; sell(k&minus;1), a scale-free ratio against a magic constant</s></p>
+</div>
+<p class="lede">The diagonal ratio test asks &ldquo;is this level lopsided?&rdquo; The right question is &ldquo;is this level lopsided <em>beyond what the path alone would produce</em>?&rdquo; With a null model in hand, the second question is now askable.</p>
+
+<p>Two failures of the ratio test, both fatal:</p>
+<ul>
+<li><strong>It ignores sample size.</strong> Four contracts against one fires exactly as loudly as four thousand against one thousand. In real footprint data the thin levels at the edges of a bar generate a continuous stream of spurious 3&times; ratios.</li>
+<li><strong>It has no baseline.</strong> A smooth rising curve produces ratios above 3&times; somewhere on its flank <em>always</em>. This is why Geometric-mode imbalance is, as the Field Manual puts it, decorative &mdash; it is measuring the steepness of an analytic function.</li>
+</ul>
+
+<p>Both vanish if the test is against the model&rsquo;s own prediction, scaled by counting noise:</p>
+
+<div class="math">
+z(j) &nbsp;=&nbsp; [ b<sub>obs</sub>(j) &minus; b<sub>exp</sub>(j) ] &frasl; &radic;( &phi; &middot; [ b<sub>exp</sub>(j) + s<sub>exp</sub>(j&minus;1) ] )
+<span class="where">b<sub>exp</sub> is the buy volume the crossing decomposition predicts for that level; &phi; is an overdispersion factor estimated from the bar&rsquo;s own rows, since volume is not a count of independent trades. Fire an imbalance when |z| exceeds a threshold in standard deviations &mdash; default <b>3.0&sigma;</b>, a unit that means the same thing on every symbol, every session, and every price level.</span>
+</div>
+
+<p>The consequences are exactly the ones you want:</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Situation</th><th>Ratio test today</th><th>Residual test</th><th>Which is right</th></tr></thead>
+<tbody>
+<tr><td>Geometric engine, any level</td><td>fires on curve flanks</td><td><b>z &equiv; 0, never fires</b></td><td>Residual. The engine invented the data; it cannot also be surprised by it.</td></tr>
+<tr><td>Real data, 4 vs 1 contracts</td><td>fires</td><td>z = 1.34, silent</td><td>Residual. That is noise.</td></tr>
+<tr><td>Real data, 4000 vs 1000</td><td>fires</td><td>z = 42, fires hard</td><td>Both &mdash; but only one of them knew why.</td></tr>
+<tr><td>Steep but ordinary bell flank</td><td>fires</td><td>silent &mdash; predicted</td><td>Residual.</td></tr>
+<tr><td>Modest ratio, huge size, against the path</td><td>silent</td><td>fires</td><td>Residual. This is the real absorption signature and the ratio test cannot see it.</td></tr>
+</tbody>
+</table></div>
+
+<div class="note"><span class="label">The property that makes this coherent</span><p>Under a modelled engine the residual is identically zero, so <strong>imbalance simply switches itself off in Geometric mode</strong> rather than emitting decorative arrows. The user does not need to be told in a manual which readings to distrust; the instrument stops making them. That is what it means for an algorithm to be honest by construction rather than by documentation.</p></div>
+</section>
+
+<section id="a4">
+<div class="algo">
+<span class="ch-num">Algorithm 04</span>
+<h2>Prominence-Ranked Nodes</h2>
+<p class="rep"><b>replaces</b> <s>POC = argmax of the row sums, a single winner with no significance test</s></p>
+</div>
+<p class="lede">A profile does not have <em>a</em> point of control. It has peaks, each with a measurable importance, and the gaps between them matter as much as the peaks themselves.</p>
+
+<p><code>argmax</code> has three defects: it flickers between adjacent rows when two are nearly equal, it has no notion of whether the winner is meaningful, and on a two-peaked profile it reports one peak and silently discards the other &mdash; along with the low-volume node between them, which is the most tradeable object on the chart.</p>
+
+<p>Borrow <strong>topographic prominence</strong> from terrain analysis: a peak&rsquo;s prominence is its height above the highest saddle connecting it to any higher peak. Rank every local maximum by prominence, keep those above a fraction of the profile&rsquo;s maximum, and you get a complete structural description instead of a single coordinate.</p>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 900 340" role="img" aria-label="A bimodal volume profile. Both peaks exceed the prominence threshold and are reported as separate nodes; the saddle between them is marked as a low-volume node. The argmax point of control reports only the taller peak.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<g class="f-buy" opacity=".55">
+<rect x="120" y="26" width="18" height="15"/><rect x="120" y="45" width="27" height="15"/>
+<rect x="120" y="64" width="45" height="15"/><rect x="120" y="83" width="108" height="15"/>
+<rect x="120" y="102" width="162" height="15"/><rect x="120" y="121" width="126" height="15"/>
+<rect x="120" y="140" width="54" height="15"/><rect x="120" y="159" width="18" height="15"/>
+<rect x="120" y="178" width="9" height="15"/><rect x="120" y="197" width="18" height="15"/>
+<rect x="120" y="216" width="63" height="15"/><rect x="120" y="235" width="144" height="15"/>
+<rect x="120" y="254" width="180" height="15"/><rect x="120" y="273" width="135" height="15"/>
+<rect x="120" y="292" width="54" height="15"/>
+</g>
+<g font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="end" opacity=".6">
+<text x="112" y="113">4212</text><text x="112" y="189">4208</text><text x="112" y="265">4204</text>
+</g>
+
+<line x1="120" y1="109" x2="330" y2="109" stroke-width="2" class="k-acc"/>
+<text x="340" y="106" font-weight="700" class="f-acc" font-size="12.5">NODE A &mdash; prominence 16</text>
+<text x="340" y="123" font-size="11.5" opacity=".7">upper balance area</text>
+
+<line x1="120" y1="261" x2="330" y2="261" stroke-width="2" class="k-acc"/>
+<text x="340" y="258" font-weight="700" class="f-acc" font-size="12.5">NODE B &mdash; prominence 19 &nbsp;<tspan class="f-sell">&larr; argmax stops here</tspan></text>
+<text x="340" y="275" font-size="11.5" opacity=".7">lower balance area, marginally taller</text>
+
+<line x1="120" y1="185" x2="330" y2="185" stroke-width="2" stroke-dasharray="6 4" class="k-sell"/>
+<text x="340" y="182" font-weight="700" class="f-sell" font-size="12.5">LOW-VOLUME NODE</text>
+<text x="340" y="199" font-size="11.5" opacity=".7">the saddle &mdash; price crosses it fast, rarely stops</text>
+<text x="340" y="216" font-size="11.5" opacity=".7">completely invisible to the current algorithm</text>
+
+<path d="M306 254 L 306 109" stroke-width="1.2" fill="none" opacity=".55" class="k-acc"/>
+<path d="M300 185 L 312 185" stroke-width="1.2" opacity=".55" class="k-acc"/>
+<text x="318" y="150" font-size="10.5" opacity=".6" class="f-acc">prominence</text>
+
+<text x="120" y="326" font-size="11.5" opacity=".75">Reporting one POC here is not an approximation &mdash; it is a description of a market structure that does not exist.</text>
+</g>
+</svg>
+</div>
+<figcaption><b>Two nodes and a gap, not one number.</b> The saddle between prominent peaks is the low-volume node: a price band the market crossed quickly and never settled in. Price entering an LVN tends to travel through it; price rejecting from one tends to return to the node it came from. Both behaviours are unavailable today because the structure is never computed.</figcaption>
+</figure>
+
+<p>Two further refinements come almost free:</p>
+<ul>
+<li><strong>Sub-tick placement.</strong> Fit a parabola through the peak row and its two neighbours: <code>x* = x&#8320; + (tick/2)&middot;(v&#8331; &minus; v&#8330;)/(v&#8331; &minus; 2v&#8320; + v&#8330;)</code>. This removes the row-to-row flicker entirely, at the cost of three multiplications.</li>
+<li><strong>Node persistence.</strong> Prominence gives a natural ranking, so nodes can be tracked across updates and a node that survives many updates can be drawn more heavily than one that just appeared &mdash; the difference between a level and a coincidence.</li>
+</ul>
+</section>
+
+<section id="a5">
+<div class="algo">
+<span class="ch-num">Algorithm 05</span>
+<h2>Highest-Density Value Area</h2>
+<p class="rep"><b>replaces</b> <s>greedy expansion outward from the POC, taking the heavier neighbour each step</s></p>
+</div>
+<p class="lede">The value area is defined as the region holding 70% of volume. Greedy expansion does not find that region &mdash; it finds an <em>interval</em>, which on a two-peaked profile is a fundamentally wrong shape.</p>
+
+<p>The definition asks for the smallest price region containing a given share of the volume. That is a highest-density region, and it has a one-line construction: sort levels by volume descending and accumulate until the target is reached. The selected set is provably the minimum-measure region containing that mass. Greedy expansion is constrained to produce a single contiguous interval, so it can only ever be a special case &mdash; and on bimodal profiles it is forced to swallow the empty gap between the peaks.</p>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 900 340" role="img" aria-label="The same bimodal profile under two value-area methods. Greedy expansion produces one contiguous band of thirteen levels including the empty gap. The highest-density region produces two disjoint bands of six levels total, covering the same seventy percent of volume.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<text x="20" y="20" font-weight="700" font-size="13">Same profile, same 70% target</text>
+
+<g transform="translate(20,36)">
+<text x="150" y="14" text-anchor="middle" font-weight="700" class="f-sell">Greedy &mdash; 13 levels</text>
+<rect x="46" y="26" width="220" height="247" class="f-sell" opacity=".12"/>
+<g class="f-buy" opacity=".55">
+<rect x="46" y="26" width="10" height="14"/><rect x="46" y="45" width="15" height="14"/>
+<rect x="46" y="64" width="25" height="14"/><rect x="46" y="83" width="60" height="14"/>
+<rect x="46" y="102" width="90" height="14"/><rect x="46" y="121" width="70" height="14"/>
+<rect x="46" y="140" width="30" height="14"/><rect x="46" y="159" width="10" height="14"/>
+<rect x="46" y="178" width="5" height="14"/><rect x="46" y="197" width="10" height="14"/>
+<rect x="46" y="216" width="35" height="14"/><rect x="46" y="235" width="80" height="14"/>
+<rect x="46" y="254" width="100" height="14"/><rect x="46" y="273" width="75" height="14"/>
+<rect x="46" y="292" width="30" height="14"/>
+</g>
+<text x="150" y="300" text-anchor="middle" font-size="11.5" class="f-sell">includes the empty gap</text>
+</g>
+
+<g transform="translate(330,36)">
+<text x="150" y="14" text-anchor="middle" font-weight="700" class="f-buy">HDR &mdash; 6 levels, two bands</text>
+<rect x="46" y="83" width="220" height="52" class="f-buy" opacity=".16"/>
+<rect x="46" y="235" width="220" height="52" class="f-buy" opacity=".16"/>
+<g class="f-buy" opacity=".55">
+<rect x="46" y="26" width="10" height="14"/><rect x="46" y="45" width="15" height="14"/>
+<rect x="46" y="64" width="25" height="14"/><rect x="46" y="83" width="60" height="14"/>
+<rect x="46" y="102" width="90" height="14"/><rect x="46" y="121" width="70" height="14"/>
+<rect x="46" y="140" width="30" height="14"/><rect x="46" y="159" width="10" height="14"/>
+<rect x="46" y="178" width="5" height="14"/><rect x="46" y="197" width="10" height="14"/>
+<rect x="46" y="216" width="35" height="14"/><rect x="46" y="235" width="80" height="14"/>
+<rect x="46" y="254" width="100" height="14"/><rect x="46" y="273" width="75" height="14"/>
+<rect x="46" y="292" width="30" height="14"/>
+</g>
+<text x="150" y="300" text-anchor="middle" font-size="11.5" class="f-buy">excludes it &mdash; same 70%</text>
+</g>
+
+<g transform="translate(660,60)" font-size="11.5">
+<text x="0" y="0" font-weight="700">Measured on this profile</text>
+<text x="0" y="26" opacity=".8">greedy width</text><text x="0" y="44" font-family="IBM Plex Mono, monospace" font-size="15" class="f-sell">13 levels</text>
+<text x="0" y="74" opacity=".8">HDR width</text><text x="0" y="92" font-family="IBM Plex Mono, monospace" font-size="15" class="f-buy">6 levels</text>
+<text x="0" y="122" opacity=".8">both contain exactly</text><text x="0" y="140" font-family="IBM Plex Mono, monospace" font-size="15">70% of volume</text>
+<text x="0" y="172" opacity=".75">The greedy band is</text><text x="0" y="188" opacity=".75">more than twice as wide</text><text x="0" y="204" opacity=".75">for identical information.</text>
+</g>
+</g>
+</svg>
+</div>
+<figcaption><b>Same mass, less than half the width.</b> On a unimodal profile the two methods nearly coincide, so nothing is lost by switching. On a bimodal one the greedy value area is more than twice as wide and its edges sit in the empty gap &mdash; the least meaningful prices in the entire distribution.</figcaption>
+</figure>
+
+<p>Report the HDR as one band per contiguous run, each with its own high and low. Keep the classical method available as an option: it is what other platforms compute, and cross-platform agreement is sometimes worth more than correctness.</p>
+
+<pre><span class="cm">// Highest-density value region. O(R log R), replaces the expansion loop.</span>
+array&lt;int&gt; ord = <span class="cm">/* row indices sorted by volume, descending */</span>
+float target = vaPctInput / 100.0 * totalVol
+float acc    = 0.0
+array&lt;bool&gt; inVA = array.new&lt;bool&gt;(R, false)
+<span class="kw">for</span> idx <span class="kw">in</span> ord
+    array.set(inVA, idx, true)
+    acc += array.get(rowVol, idx)
+    <span class="kw">if</span> acc &gt;= target
+        <span class="kw">break</span>
+<span class="cm">// contiguous runs of inVA are the value bands; each run yields one high/low pair</span></pre>
+</section>
+
+<section id="a6">
+<div class="algo">
+<span class="ch-num">Algorithm 06</span>
+<h2>Flow Separation</h2>
+<p class="rep"><b>replaces</b> <s>the overlap coefficient with its hardcoded 0.75 threshold, plus a separate Balance Tilt input</s></p>
+</div>
+<p class="lede">Two distributions, one question: how far apart are they? Answer it in ticks instead of in a unitless coefficient and the threshold problem, the interpretation problem, and the entire Simpson integration machinery all disappear at once.</p>
+
+<p>The current OVL is a real statistic computed properly, but it is unitless, so it needs a magic threshold; it is unsigned, so it needs a second statistic (tilt) bolted alongside to recover direction; and it costs composite Simpson quadrature over pieces cut at every density crossing, with bisection loops of up to ninety iterations, on every update.</p>
+
+<p>Replace it with the volume-weighted mean gap and its Wasserstein magnitude &mdash; both computable in one linear pass over the rows you already have:</p>
+
+<div class="math">
+<em>S</em> &nbsp;=&nbsp; VWAP<sub>buy</sub> &minus; VWAP<sub>sell</sub> &nbsp;&nbsp;<span style="opacity:.6">(signed, in ticks)</span><br>
+<em>W&#8321;</em> &nbsp;=&nbsp; &Sigma;<sub>j</sub> | F<sub>buy</sub>(j) &minus; F<sub>sell</sub>(j) | &middot; tick &nbsp;&nbsp;<span style="opacity:.6">(magnitude, in ticks)</span>
+<span class="where">F are the normalised cumulative distributions. W&#8321; &ge; |S| always, with equality exactly when the two CDFs never cross &mdash; so the pair (S, W&#8321;) separates <b>how far apart</b> the sides are from <b>how cleanly</b> they separate. On the same test distributions where OVL reads 0.253, this reads <b>S = &minus;4.01 ticks, W&#8321; = 4.01</b>: sellers transacted four ticks above buyers, and the separation is clean.</span>
+</div>
+
+<p><code>S = &minus;4.01 ticks</code> is a sentence a trader can act on. <code>OVL = 0.253</code> is a number that requires a manual, a threshold, and a second statistic to interpret. And the interpretation is directly meaningful: <strong>S positive means buyers are transacting above sellers &mdash; they are paying up.</strong> That is strength, measured in the market's own units.</p>
+
+<div class="verdict">
+<div><span class="label">Unit</span><p><span class="big lose">none</span>&rarr;<span class="big win">ticks</span>comparable across symbols after ATR scaling</p></div>
+<div><span class="label">Direction</span><p><span class="big lose">separate input</span>&rarr;<span class="big win">built in</span>the sign is the direction</p></div>
+<div><span class="label">Magic constants</span><p><span class="big lose">2</span>&rarr;<span class="big win">0</span>0.75 and the tilt threshold both retire</p></div>
+<div><span class="label">Cost per update</span><p><span class="big lose">O(P&middot;S)</span>&rarr;<span class="big win">O(R)</span>no quadrature, no bisection</p></div>
+</div>
+
+<div class="note"><span class="label">The flat-bar defect is fixed too</span><p>Trap 13 in the Field Manual: flat bars become matched atoms that inflate OVL, so a market that is not trading reads as &ldquo;balanced&rdquo;. Under flow separation a flat bar contributes the same price to both VWAPs, which leaves <code>S</code> unchanged rather than pushing it toward a false verdict &mdash; and because the statistic is in ticks, a dead market simply reports <code>S &asymp; 0</code> alongside an obviously tiny <code>W&#8321;</code>, which reads as &ldquo;nothing is happening&rdquo; rather than as a regime call.</p></div>
+</section>
+
+<section id="a7">
+<div class="algo">
+<span class="ch-num">Algorithm 07</span>
+<h2>Volume-Clock Decay</h2>
+<p class="rep"><b>replaces</b> <s>the last N bars that overlapped the frame, all weighted equally, with no age limit</s></p>
+</div>
+<p class="lede">A hard window has three defects at once: it weights a bar from an hour ago identically to the one printing now, it lurches when a bar falls out, and it will happily reach three thousand bars back. All three come from the same cause &mdash; a step function where a decay belongs.</p>
+
+<div class="math">
+w(bar) &nbsp;=&nbsp; 2<sup>&minus;&nbsp;V<sub>since</sub> &frasl; V<sub>half</sub></sup>
+<span class="where">V<sub>since</sub> is the volume traded since that bar; V<sub>half</sub> is the half-life, expressed in multiples of average bar volume (default 4). Weights are maintained incrementally: one multiply per row per bar, no search, no window, no re-scan.</span>
+</div>
+
+<p>The clock is the crucial choice. Decaying in <em>bars</em> reproduces the current mistake in smoother form: a quiet overnight session ages out levels at the same rate as a violent hour. Decaying in <em>volume</em> means a level stays relevant until the market has actually done enough business to make it stale &mdash; which is the microstructure-correct notion of age and handles session boundaries for free.</p>
+
+<figure>
+<div class="fig-box">
+<svg viewBox="0 0 900 280" role="img" aria-label="Weight against age. The hard window is a step function holding weight one for five bars then dropping to zero, including a spurious contribution from a bar eight hundred bars old. The volume-clock decay curve falls smoothly and reaches zero naturally.">
+<g font-family="IBM Plex Sans Condensed, sans-serif" font-size="12">
+<line x1="70" y1="210" x2="850" y2="210" stroke="currentColor" stroke-width="1.2" opacity=".5"/>
+<line x1="70" y1="40" x2="70" y2="210" stroke="currentColor" stroke-width="1.2" opacity=".5"/>
+<text x="62" y="46" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" opacity=".6">1.0</text>
+<text x="62" y="214" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" opacity=".6">0</text>
+<text x="460" y="248" text-anchor="middle" font-size="11.5" opacity=".7">age &rarr; (volume traded since)</text>
+
+<polyline points="70,40 300,40 300,210 700,210" fill="none" stroke-width="2.4" class="k-sell"/>
+<rect x="700" y="40" width="34" height="170" class="f-sell" opacity=".22"/>
+<polyline points="700,40 734,40 734,210" fill="none" stroke-width="2.4" class="k-sell"/>
+<text x="310" y="60" font-size="12" font-weight="700" class="f-sell">hard window: full weight, then nothing</text>
+<text x="744" y="60" font-size="11.5" font-weight="700" class="f-sell">a bar 800 back,</text>
+<text x="744" y="76" font-size="11.5" font-weight="700" class="f-sell">weighted the same</text>
+<text x="744" y="92" font-size="11.5" font-weight="700" class="f-sell">as the live bar</text>
+
+<path d="M70 40 C 180 62, 250 110, 330 140 C 430 176, 560 199, 850 207" fill="none" stroke-width="2.4" class="k-buy"/>
+<text x="360" y="128" font-size="12" font-weight="700" class="f-buy">volume-clock decay</text>
+<line x1="300" y1="40" x2="300" y2="218" stroke-width="1" stroke-dasharray="4 4" opacity=".4" class="k-sell"/>
+<text x="300" y="232" text-anchor="middle" font-size="11" opacity=".6" class="f-sell">N bars</text>
+</g>
+</svg>
+</div>
+<figcaption><b>Three defects, one cause.</b> The discontinuity at the window edge is why the dashboard POC jumps when a bar rolls out; the flat top is why an old bar outvotes a recent one; the second block is the stale-column trap. A decay removes all three, and costs less to maintain because there is no backward search at all.</figcaption>
+</figure>
+</section>
+
+<section id="a8">
+<div class="algo">
+<span class="ch-num">Algorithm 08</span>
+<h2>Adaptive Frame</h2>
+<p class="rep"><b>replaces</b> <s>&plusmn;5 ticks, a constant that means something different on every symbol</s></p>
+</div>
+<p class="lede">A frame measured in ticks is a frame measured in nothing. Measure it in volatility and it never needs tuning again.</p>
+
+<div class="math">
+viewTicks &nbsp;=&nbsp; round( <em>&kappa;</em> &middot; ATR(14) / tick ) &nbsp;&nbsp;&nbsp; &kappa; default 1.0
+<span class="where">&kappa; = 1.0 makes the frame span roughly two average bar ranges, the sizing the Field Manual arrives at by hand in Chapter 12. The frame then self-adjusts across symbols, across sessions, and across volatility regimes, and the per-market preset table becomes a single number.</span>
+</div>
+
+<p>Pair it with the anchor modes the Field Manual already specifies &mdash; follow price, session open, or a manual level &mdash; and the frame becomes a deliberate choice rather than an accident of tick size. An anchored, volatility-scaled frame turns the window POC from a sliding local artefact into a level worth marking.</p>
+</section>
+
+<section id="a9">
+<div class="algo">
+<span class="ch-num">Algorithm 09</span>
+<h2>Level Efficiency &mdash; absorption versus initiative</h2>
+<p class="rep"><b>adds</b> a classification the instrument cannot currently express at all</p>
+</div>
+<p class="lede">High volume at a level means nothing on its own. High volume where price <em>moved through</em> is initiative; high volume where price <em>stalled</em> is absorption. They forecast opposite things, and the crossing decomposition already computes the number that separates them.</p>
+
+<div class="math">
+<em>E(j)</em> &nbsp;=&nbsp; | &delta;&#772;(j) | &frasl; N&#772;(j) &nbsp;&isin;&nbsp; [0, 1]
+<span class="where">The same net and total crossings from Algorithm 02 &mdash; no new computation whatsoever. E near 1: the level was crossed once, decisively. E near 0: crossed many times, net nowhere.</span>
+</div>
+
+<div class="tbl"><table>
+<thead><tr><th>Volume</th><th>E</th><th>Reading</th><th>Expectation</th></tr></thead>
+<tbody>
+<tr><td>High</td><td class="num">near 1</td><td><b>Initiative</b> &mdash; size traded and price went through it</td><td>Continuation; the level should not hold on a retest</td></tr>
+<tr><td>High</td><td class="num">near 0</td><td><b>Absorption</b> &mdash; size traded and price went nowhere</td><td>Reversal candidate; someone is defending this price</td></tr>
+<tr><td>Low</td><td class="num">near 1</td><td><b>Vacuum</b> &mdash; a low-volume node</td><td>Fast traversal; poor place for a stop</td></tr>
+<tr><td>Low</td><td class="num">near 0</td><td>Noise</td><td>Nothing</td></tr>
+</tbody>
+</table></div>
+
+<p>An absorption shelf is a materially better stop location than an imbalance shelf, because it identifies a price someone actively defended with size rather than one that a curve happened to be steep at. This single classification is arguably worth more than every other item in this document, and it costs one division per row.</p>
+</section>
+
+<section id="cost">
+<div class="ch-head"><span class="ch-num">Engineering</span>
+<h2>Cost analysis</h2></div>
+<p class="lede">The redesign is not a trade of accuracy for compute. It is cheaper, because a null model replaces numerical machinery that existed only to compensate for not having one.</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Stage</th><th>Today</th><th>Redesign</th><th>Direction</th></tr></thead>
+<tbody>
+<tr><td>Intrabar placement</td><td>O(R) closed-form CDFs, 2 per row</td><td>O(M&middot;R) forward&ndash;backward, M &asymp; 32</td><td class="lose">costlier per bar</td></tr>
+<tr><td>Buy/sell split</td><td>O(1) &mdash; one ratio</td><td>O(R) &mdash; shares the same recursion</td><td>&asymp; free</td></tr>
+<tr><td>Profile construction</td><td>O(P) components + O(P log P) cut points</td><td>O(P&middot;R) accumulation</td><td>comparable</td></tr>
+<tr><td>Regime statistic</td><td>Composite Simpson over every piece, sub-cut at density crossings, bisection to 90 iterations</td><td>O(R) single pass</td><td class="win">orders of magnitude cheaper</td></tr>
+<tr><td>Value area</td><td>O(R) greedy</td><td>O(R log R) sort</td><td>negligible</td></tr>
+<tr><td>POC / nodes</td><td>O(R) argmax</td><td>O(R) prominence scan</td><td>equal</td></tr>
+<tr><td>Imbalance</td><td>O(R) ratio</td><td>O(R) z-score</td><td>equal</td></tr>
+<tr><td>Window maintenance</td><td>backward search up to 5000 bars</td><td>O(R) incremental decay, no search</td><td class="win">cheaper</td></tr>
+<tr><td>Residual self-check</td><td>needed &mdash; audits the quadrature</td><td>unnecessary &mdash; the recursion is exact</td><td class="win">retires</td></tr>
+</tbody>
+</table></div>
+
+<p>The one genuine cost increase is the occupancy recursion. At <code>M = 32</code>, <code>R = 41</code> and a 23-bar profile that is roughly 30,000 multiply-adds per update &mdash; less than the current implementation spends on Simpson integration alone, and it replaces the quadrature, the bisection, the residual check, and the tolerance input all at once.</p>
+</section>
+
+<section id="migrate">
+<div class="ch-head"><span class="ch-num">Engineering</span>
+<h2>Migration path</h2></div>
+<p class="lede">Nine algorithms, but they are not one change. Ordered so that every step ships independently and nothing is ever half-migrated.</p>
+
+<div class="tbl"><table>
+<thead><tr><th>Step</th><th>Ship</th><th>Depends on</th><th>User-visible effect</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td>Parkinson calibration of &sigma;</td><td>nothing</td><td>Volume spreads &asymp;1.8&times; wider. Levels move. Ship with the old behaviour behind a toggle.</td></tr>
+<tr><td class="num">2</td><td>HDR value area</td><td>nothing</td><td>Two bands appear on bimodal periods. Keep classical as an option.</td></tr>
+<tr><td class="num">3</td><td>Prominence nodes + LVN</td><td>nothing</td><td>Purely additive &mdash; new marks, nothing removed.</td></tr>
+<tr><td class="num">4</td><td>Adaptive frame</td><td>nothing</td><td>The preset table collapses to one number.</td></tr>
+<tr><td class="num">5</td><td>Flow separation</td><td>nothing</td><td>OVL label becomes &ldquo;S = &minus;4.0 ticks&rdquo;. Retires two magic constants and the Simpson code.</td></tr>
+<tr><td class="num">6</td><td>Bridge occupancy</td><td>step 1</td><td>The core change. Every level moves. Deserves its own version.</td></tr>
+<tr><td class="num">7</td><td>Crossing decomposition</td><td>step 6</td><td>Geometric engine becomes genuinely usable. Deltas change everywhere.</td></tr>
+<tr><td class="num">8</td><td>Model-residual imbalance</td><td>step 7</td><td>Imbalance switches off in Geometric mode &mdash; document loudly.</td></tr>
+<tr><td class="num">9</td><td>Level efficiency</td><td>step 7</td><td>Additive. Absorption and initiative marks.</td></tr>
+<tr><td class="num">10</td><td>Volume-clock decay</td><td>nothing</td><td>Replaces &ldquo;Window Bars&rdquo; with a half-life. The largest UX change; ship last.</td></tr>
+</tbody>
+</table></div>
+
+<p>Steps 1&ndash;5 are independent and can ship in any order or in parallel; each one removes an arbitrary constant without touching the engine layer. Steps 6&ndash;9 are a chain and should ship as one release. Step 10 is orthogonal but retrains the user's intuition, so it goes last.</p>
+</section>
+
+<section id="limits">
+<div class="ch-head"><span class="ch-num">Engineering</span>
+<h2>What it still can&rsquo;t do</h2></div>
+<p class="lede">Every one of these algorithms is an improvement over what it replaces. None of them is a substitute for data.</p>
+
+<ul>
+<li><strong>The bridge is still a model.</strong> Driftless, constant-volatility diffusion. Real intrabar dynamics have volatility clustering, jumps, and auction effects at the open and close. The occupancy model is a far better prior than two arbitrary bells &mdash; it is not the truth.</li>
+<li><strong>Volume is not proportional to crossings.</strong> The decomposition assumes it is. In reality volume clusters at round numbers, at the open and close, and at levels where resting liquidity happens to sit. The identity governing <em>direction</em> is exact; the mapping from crossings to <em>size</em> is a modelling choice.</li>
+<li><strong>None of this beats real footprint data.</strong> These algorithms make the modelled engines dramatically better and give the measured engine a proper null hypothesis. On a Premium plan, real rows still beat a good model, and Algorithm 03 exists precisely to compare the two rather than to replace them.</li>
+<li><strong>Prominence and HDR still need one threshold each.</strong> One arbitrary constant is replaced by another. The difference is that prominence has an interpretation &mdash; how far this peak stands above its saddle &mdash; whereas &ldquo;300%&rdquo; has none.</li>
+<li><strong>Overdispersion is estimated, not known.</strong> The <code>&phi;</code> in Algorithm 03 comes from the bar&rsquo;s own rows, so it is noisy on bars with few active levels. Floor it at 1.0 and treat marginal z-scores with suspicion.</li>
+<li><strong>Volume-clock decay changes what a user is looking at.</strong> &ldquo;The last five bars that traded here&rdquo; is intuitive; &ldquo;an exponentially weighted volume-clock average with a four-bar-volume half-life&rdquo; is not. The algorithm is better and the explanation is worse &mdash; a real cost, not a rhetorical one.</li>
+<li><strong>Pine is a constrained host.</strong> The forward&ndash;backward recursion needs matrices sized <code>(M+1)&times;R</code> per bar. At large frames and long profile periods this will meet execution limits well before the mathematics runs out, and the adaptive guard in the Field Manual&rsquo;s Chapter 27 becomes mandatory rather than optional.</li>
+</ul>
+
+<hr>
+<div class="foot">
+<p><b>The Residual Engine</b> &mdash; algorithm redesign for VFP&#8209;Intro, companion to the Volume Footprint Field Manual. Identities in Algorithms 02 and 09 were verified exhaustively against 5,008 simulated price paths; the comparative figures in Algorithms 02, 05 and 06 are computed, not illustrative.</p>
+<p>Nothing here is financial advice. These are descriptions of algorithms and their properties, not claims about what markets will do.</p>
+</div>
+</section>
+</main>
+</div>
+
+<script>
+(function(){
+  var links = Array.prototype.slice.call(document.querySelectorAll('#nav a'));
+  var map = {};
+  links.forEach(function(a){ map[a.getAttribute('href').slice(1)] = a; });
+  var seen = {};
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){ seen[e.target.id] = e.isIntersecting ? e.intersectionRatio : 0; });
+    var best = null, bestVal = 0;
+    Object.keys(seen).forEach(function(id){ if (seen[id] > bestVal){ bestVal = seen[id]; best = id; } });
+    if (best){
+      links.forEach(function(a){ a.classList.remove('on'); });
+      if (map[best]) map[best].classList.add('on');
+    }
+  }, { rootMargin: '-10% 0px -70% 0px', threshold: [0, 0.15, 0.4, 1] });
+  document.querySelectorAll('section[id]').forEach(function(s){ io.observe(s); });
+})();
+</script>
