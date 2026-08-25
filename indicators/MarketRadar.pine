@@ -1,0 +1,535 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MARKET RADAR  —  رادار السوق                                        Pine v6
+// ───────────────────────────────────────────────────────────────────────────────
+//  ثلاثة محركات رئيسية داخل مؤشر واحد:
+//
+//  ① Hidden Trends  |  الاتجاه الخفي
+//      خطوط ترند مقطّعة (Dashed) تُرسم تلقائياً من القمم والقيعان المحورية:
+//        • الخط الأخضر المقطّع  = اتجاه صاعد خفي (دعم مؤسسي زاحف للأعلى)
+//        • الخط الأحمر المقطّع  = اتجاه هابط خفي (عرض مؤسسي زاحف للأسفل)
+//      الإغلاق فوق الخط الأحمر  → تأكيد صعود قوي.
+//      الإغلاق تحت الخط الأخضر  → تأكيد هبوط قوي.
+//
+//  ② Buy / Sell Liquidity  |  سيولة الشراء وسيولة البيع
+//      مستويات أفقية عند تجمّع القمم/القيعان المتساوية مع فوليوم مرتفع،
+//      أي مناطق تكدّس أوامر الإيقاف والأوامر المعلّقة (بِرَك السيولة).
+//      عند كنس المستوى (Sweep) يتحوّل إلى منقّط ويصدر تنبيه.
+//
+//  ③ Clearing & Coverage Zones  |  منطقة التصفية ومنطقة التغطية
+//      مناطق مبنيّة على شمعة الأساس التي سبقت حركة اندفاعية (Displacement)
+//      مصحوبة بفوليوم مؤسسي وكسر هيكل:
+//        • منطقة التصفية (Clearing) = دعم مؤسسي قوي / قاع محتمل → شراء.
+//        • منطقة التغطية (Coverage) = مقاومة مؤسسية قوية / قمة محتملة → بيع.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("Market Radar | رادار السوق", "MarketRadar", overlay = true,
+     max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPES  |  الأنواع
+// ═══════════════════════════════════════════════════════════════════════════════
+type Liq
+    float price      // سعر بركة السيولة
+    int   startBar   // بار التكوّن
+    int   touches    // عدد اللمسات (قوة التجمّع)
+    float relVol     // الفوليوم النسبي عند التكوّن
+    bool  swept      // هل تم كنسها؟
+    line  ln
+    label lb
+
+type Zone
+    float top
+    float bot
+    int   left
+    bool  bull       // true = تصفية (دعم) / false = تغطية (مقاومة)
+    float score      // قوة المنطقة
+    bool  mitigated  // هل تم اختراقها؟
+    box   bx
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS  |  الإعدادات
+// ═══════════════════════════════════════════════════════════════════════════════
+const string G0 = "⚙️  عام | General"
+const string G1 = "①  الاتجاه الخفي | Hidden Trends"
+const string G2 = "②  السيولة | Buy / Sell Liquidity"
+const string G3 = "③  التصفية والتغطية | Clearing & Coverage"
+const string G4 = "④  الواجهة | Dashboard & Style"
+
+// ── عام
+atrLen       = input.int(200,  "طول ATR المرجعي | ATR length",        minval = 10, maxval = 1000, group = G0)
+volLen       = input.int(20,   "طول متوسط الفوليوم | Volume MA",      minval = 2,  maxval = 500,  group = G0)
+confirmClose = input.bool(true,"تأكيد الإشارات بإغلاق الشمعة | Confirm signals on bar close", group = G0,
+   tooltip = "عند التفعيل لا تُطلق أي إشارة إلا بعد إغلاق الشمعة (يمنع إعادة الرسم اللحظية).")
+
+// ── ① الاتجاه الخفي
+htShow    = input.bool(true, "تفعيل الاتجاه الخفي | Enable", group = G1)
+htLen     = input.int(14,    "حساسية المحاور | Pivot sensitivity", minval = 2, maxval = 100, group = G1,
+   tooltip = "كلما زاد الرقم كان الاتجاه الخفي أكبر وأبطأ (فريمات عليا)، والرقم الصغير يلتقط الاتجاهات القصيرة.")
+htMult    = input.float(1.0, "ميل الخط (× ATR) | Slope factor", minval = 0.0, maxval = 10.0, step = 0.1, group = G1,
+   tooltip = "0 = خطوط أفقية تماماً. القيمة الأكبر تجعل الخط المقطّع يزحف بسرعة نحو السعر.")
+htWidth   = input.int(2,     "سماكة الخط | Line width", minval = 1, maxval = 5, group = G1)
+htKeep    = input.int(3,     "عدد الخطوط المنتهية المحفوظة | Keep broken lines", minval = 0, maxval = 20, group = G1)
+htSignals = input.bool(true, "إظهار إشارات الاختراق ▲▼ | Break markers", group = G1)
+htPaint   = input.bool(false,"تلوين الشموع بالاتجاه الخفي | Color bars by hidden trend", group = G1)
+cHTUp     = input.color(#00E676, "لون الاتجاه الصاعد الخفي | Hidden up", inline = "htc", group = G1)
+cHTDn     = input.color(#FF1744, "الهابط | Hidden down",                 inline = "htc", group = G1)
+
+// ── ② السيولة
+lqShow      = input.bool(true, "تفعيل مستويات السيولة | Enable", group = G2)
+lqLen       = input.int(10,    "حساسية القمم/القيعان | Swing sensitivity", minval = 2, maxval = 100, group = G2)
+lqTol       = input.float(0.20,"تسامح التجميع (× ATR) | Cluster tolerance", minval = 0.0, maxval = 3.0, step = 0.05, group = G2,
+   tooltip = "المستويات المتقاربة ضمن هذه المسافة تُدمج في بركة سيولة واحدة ويزداد عدّاد اللمسات.")
+lqVolFilter = input.bool(true, "فلترة بالفوليوم | Volume filter", inline = "lqv", group = G2)
+lqVolMult   = input.float(1.2, "× المتوسط", minval = 0.1, maxval = 10.0, step = 0.1, inline = "lqv", group = G2)
+lqMax       = input.int(8,     "أقصى عدد مستويات لكل جهة | Max levels per side", minval = 1, maxval = 30, group = G2)
+lqLabels    = input.bool(true, "إظهار وسوم السيولة | Show labels", group = G2)
+lqHideSwept = input.bool(false,"إخفاء السيولة بعد كنسها | Delete swept levels", group = G2)
+cBuyLq      = input.color(#26C6DA, "سيولة شراء (فوق القمم) | Buy-side", inline = "lqc", group = G2)
+cSellLq     = input.color(#FFA726, "سيولة بيع (تحت القيعان) | Sell-side", inline = "lqc", group = G2)
+cSwept      = input.color(#78909C, "مكنوسة | Swept", inline = "lqc", group = G2)
+
+// ── ③ التصفية والتغطية
+znShow    = input.bool(true,  "تفعيل مناطق التصفية/التغطية | Enable", group = G3)
+znBody    = input.float(1.1,  "قوة الاندفاع (جسم الشمعة × ATR) | Displacement", minval = 0.2, maxval = 10.0, step = 0.1, group = G3)
+znVol     = input.float(1.5,  "الفوليوم المؤسسي (× المتوسط) | Institutional volume", minval = 0.5, maxval = 10.0, step = 0.1, group = G3)
+znNeedBos = input.bool(true,  "اشتراط كسر الهيكل | Require structure break", group = G3)
+znBos     = input.int(10,     "مدى كسر الهيكل | Structure lookback", minval = 3, maxval = 100, group = G3)
+znBodyOnly= input.bool(false, "استخدام جسم شمعة الأساس فقط | Body-only zone", group = G3)
+znMaxH    = input.float(2.0,  "أقصى ارتفاع للمنطقة (× ATR) | Max zone height", minval = 0.2, maxval = 10.0, step = 0.1, group = G3)
+znMitClose= input.bool(true,  "الاختراق بالإغلاق (وإلا بالظل) | Mitigate on close", group = G3)
+znMax     = input.int(4,      "أقصى عدد مناطق لكل نوع | Max zones per type", minval = 1, maxval = 20, group = G3)
+znHideMit = input.bool(false, "إخفاء المناطق المخترَقة | Delete mitigated zones", group = G3)
+znAlertIn = input.bool(true,  "تنبيه عند دخول السعر المنطقة | Alert on zone entry", group = G3)
+cClear    = input.color(#00C853, "منطقة التصفية | Clearing", inline = "znc", group = G3)
+cCover    = input.color(#D50000, "منطقة التغطية | Coverage", inline = "znc", group = G3)
+znTransp  = input.int(85,     "شفافية التعبئة | Fill transparency", minval = 0, maxval = 100, group = G3)
+
+// ── ④ الواجهة
+showDash  = input.bool(true, "إظهار لوحة الرادار | Show dashboard", group = G4)
+dashPosIn = input.string("top_right", "موقع اللوحة | Position",
+   options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = G4)
+dashSize  = input.string("normal", "حجم الخط | Text size", options = ["tiny", "small", "normal", "large"], group = G4)
+
+dashPos = dashPosIn == "top_right"    ? position.top_right    :
+          dashPosIn == "middle_right" ? position.middle_right :
+          dashPosIn == "bottom_right" ? position.bottom_right :
+          dashPosIn == "top_left"     ? position.top_left     : position.bottom_left
+dashTxt = dashSize == "tiny" ? size.tiny : dashSize == "small" ? size.small : dashSize == "large" ? size.large : size.normal
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONTEXT  |  السياق العام (تقلب / فوليوم)
+// ═══════════════════════════════════════════════════════════════════════════════
+atrV   = nz(ta.atr(atrLen), ta.tr)
+volV   = nz(volume)
+volMA  = ta.sma(volV, volLen)
+relVol = volMA > 0 ? volV / volMA : 1.0
+okBar  = not confirmClose or barstate.isconfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ①  HIDDEN TRENDS  |  الاتجاه الخفي
+//     الخط الأحمر المقطّع يهبط من كل قمة محورية، والأخضر يصعد من كل قاع محوري.
+//     كسر الأحمر بالإغلاق = تأكيد صعود.   كسر الأخضر بالإغلاق = تأكيد هبوط.
+// ═══════════════════════════════════════════════════════════════════════════════
+htAtr   = nz(ta.atr(htLen), ta.tr)
+htSlope = htAtr / htLen * htMult
+
+phHT = ta.pivothigh(high, htLen, htLen)
+plHT = ta.pivotlow(low,  htLen, htLen)
+
+var float redVal   = na          // قيمة الخط الأحمر المقطّع (اتجاه هابط خفي)
+var float greenVal = na          // قيمة الخط الأخضر المقطّع (اتجاه صاعد خفي)
+var line  redLine   = na
+var line  greenLine = na
+var bool  redOn   = false        // الخط الأحمر ما زال حياً (لم يُكسر)
+var bool  greenOn = false
+var array<line> redHist   = array.new<line>()
+var array<line> greenHist = array.new<line>()
+
+archive(array<line> store, line ln, simple int keep) =>
+    if not na(ln)
+        if keep > 0
+            array.push(store, ln)
+            while array.size(store) > keep
+                line.delete(array.shift(store))
+        else
+            line.delete(ln)
+
+// ── تكوّن قمة محورية → خط أحمر مقطّع جديد
+if htShow and not na(phHT)
+    if redOn
+        line.set_color(redLine, color.new(cHTDn, 55))
+    archive(redHist, redLine, htKeep)
+    redVal  := phHT
+    redOn   := true
+    redLine := line.new(bar_index - htLen, phHT, bar_index, phHT, color = cHTDn, style = line.style_dashed, width = htWidth)
+else if htShow
+    redVal := na(redVal) ? na : redVal - htSlope
+
+// ── تكوّن قاع محوري → خط أخضر مقطّع جديد
+if htShow and not na(plHT)
+    if greenOn
+        line.set_color(greenLine, color.new(cHTUp, 55))
+    archive(greenHist, greenLine, htKeep)
+    greenVal  := plHT
+    greenOn   := true
+    greenLine := line.new(bar_index - htLen, plHT, bar_index, plHT, color = cHTUp, style = line.style_dashed, width = htWidth)
+else if htShow
+    greenVal := na(greenVal) ? na : greenVal + htSlope
+
+// ── مدّ الخطوط الحيّة حتى الشمعة الحالية
+if redOn and not na(redLine) and not na(redVal)
+    line.set_xy2(redLine, bar_index, redVal)
+if greenOn and not na(greenLine) and not na(greenVal)
+    line.set_xy2(greenLine, bar_index, greenVal)
+
+// كشف الكسر بصيغة آمنة ضد قيم na (بديل صريح لـ ta.crossover)
+xRed   = not na(redVal)   and not na(redVal[1])   and close > redVal   and close[1] <= redVal[1]
+xGreen = not na(greenVal) and not na(greenVal[1]) and close < greenVal and close[1] >= greenVal[1]
+
+htBreakUp = htShow and redOn   and xRed   and okBar
+htBreakDn = htShow and greenOn and xGreen and okBar
+
+if htBreakUp
+    redOn := false
+    line.set_color(redLine, color.new(cHTDn, 55))
+    line.set_style(redLine, line.style_dotted)
+if htBreakDn
+    greenOn := false
+    line.set_color(greenLine, color.new(cHTUp, 55))
+    line.set_style(greenLine, line.style_dotted)
+
+var int   htState     = 0        // 1 = صعود خفي مؤكَّد | -1 = هبوط خفي مؤكَّد
+var int   htStateBar  = na
+if htBreakUp and htState != 1
+    htState    := 1
+    htStateBar := bar_index
+if htBreakDn and htState != -1
+    htState    := -1
+    htStateBar := bar_index
+
+plotshape(htSignals and htBreakUp, "اختراق صاعد | Hidden bullish break", shape.triangleup,
+     location.belowbar, cHTUp, size = size.tiny)
+plotshape(htSignals and htBreakDn, "اختراق هابط | Hidden bearish break", shape.triangledown,
+     location.abovebar, cHTDn, size = size.tiny)
+
+barcolor(htPaint ? (htState == 1 ? cHTUp : htState == -1 ? cHTDn : na) : na, title = "تلوين الاتجاه الخفي")
+
+plot(htShow and redOn   ? redVal   : na, "الخط الأحمر المقطّع | Hidden downtrend", cHTDn, display = display.data_window)
+plot(htShow and greenOn ? greenVal : na, "الخط الأخضر المقطّع | Hidden uptrend",  cHTUp, display = display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ②  BUY / SELL LIQUIDITY  |  سيولة الشراء وسيولة البيع
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<Liq> buyLq  = array.new<Liq>()   // فوق القمم  = أوامر شراء/إيقاف البائعين
+var array<Liq> sellLq = array.new<Liq>()   // تحت القيعان = أوامر بيع/إيقاف المشترين
+
+lqPh    = ta.pivothigh(high, lqLen, lqLen)
+lqPl    = ta.pivotlow(low,  lqLen, lqLen)
+pvBar   = bar_index - lqLen
+pvRel   = nz(volMA[lqLen]) > 0 ? nz(volV[lqLen]) / volMA[lqLen] : 1.0
+lqPass  = not lqVolFilter or pvRel >= lqVolMult
+
+lqText(bool buy, Liq l) =>
+    (buy ? "BSL" : "SSL") + (l.touches > 1 ? " ×" + str.tostring(l.touches) : "") + (l.relVol >= 1.5 ? " 🔥" : "")
+
+lqTip(bool buy, Liq l) =>
+    (buy ? "سيولة شراء فوق القمم (Buy-side liquidity)" : "سيولة بيع تحت القيعان (Sell-side liquidity)") +
+     "\nالسعر: " + str.tostring(l.price, format.mintick) +
+     "\nعدد اللمسات: " + str.tostring(l.touches) +
+     "\nالفوليوم النسبي: " + str.tostring(l.relVol, "#.##") + "×"
+
+addLiq(array<Liq> store, float px, bool buy, float rel, simple int maxN) =>
+    bool merged = false
+    if array.size(store) > 0
+        for i = array.size(store) - 1 to 0
+            Liq l = array.get(store, i)
+            if not l.swept and math.abs(l.price - px) <= lqTol * atrV
+                l.touches := l.touches + 1
+                l.price   := buy ? math.max(l.price, px) : math.min(l.price, px)
+                l.relVol  := math.max(l.relVol, rel)
+                line.set_y1(l.ln, l.price)
+                line.set_y2(l.ln, l.price)
+                line.set_width(l.ln, math.min(4, l.touches))
+                merged := true
+                break
+    if not merged
+        color c  = buy ? cBuyLq : cSellLq
+        line  ln = line.new(pvBar, px, bar_index, px, color = c, style = line.style_solid, width = 1)
+        label lb = na
+        if lqLabels
+            lb := label.new(bar_index + 3, px, buy ? "BSL" : "SSL", style = label.style_label_left,
+                 color = color.new(c, 85), textcolor = c, size = size.tiny)
+        array.push(store, Liq.new(price = px, startBar = pvBar, touches = 1, relVol = rel, swept = false, ln = ln, lb = lb))
+        while array.size(store) > maxN
+            Liq old = array.shift(store)
+            line.delete(old.ln)
+            label.delete(old.lb)
+    merged
+
+if lqShow and not na(lqPh) and lqPass
+    addLiq(buyLq, lqPh, true, pvRel, lqMax)
+if lqShow and not na(lqPl) and lqPass
+    addLiq(sellLq, lqPl, false, pvRel, lqMax)
+
+bool buySweep  = false
+bool sellSweep = false
+
+// ── تحديث وكنس سيولة الشراء (فوق القمم)
+if lqShow and array.size(buyLq) > 0
+    for i = array.size(buyLq) - 1 to 0
+        Liq l = array.get(buyLq, i)
+        if l.swept
+            continue
+        if high > l.price and okBar
+            l.swept   := true
+            buySweep  := true
+            line.set_x2(l.ln, bar_index)
+            line.set_color(l.ln, cSwept)
+            line.set_style(l.ln, line.style_dotted)
+            if not na(l.lb)
+                label.set_text(l.lb, "SWEPT")
+                label.set_textcolor(l.lb, cSwept)
+                label.set_color(l.lb, color.new(cSwept, 85))
+            if lqHideSwept
+                line.delete(l.ln)
+                label.delete(l.lb)
+                array.remove(buyLq, i)
+        else
+            line.set_x2(l.ln, bar_index)
+            line.set_width(l.ln, math.min(4, l.touches))
+            if not na(l.lb)
+                label.set_xy(l.lb, bar_index + 3, l.price)
+                label.set_text(l.lb, lqText(true, l))
+                label.set_tooltip(l.lb, lqTip(true, l))
+
+// ── تحديث وكنس سيولة البيع (تحت القيعان)
+if lqShow and array.size(sellLq) > 0
+    for i = array.size(sellLq) - 1 to 0
+        Liq l = array.get(sellLq, i)
+        if l.swept
+            continue
+        if low < l.price and okBar
+            l.swept    := true
+            sellSweep  := true
+            line.set_x2(l.ln, bar_index)
+            line.set_color(l.ln, cSwept)
+            line.set_style(l.ln, line.style_dotted)
+            if not na(l.lb)
+                label.set_text(l.lb, "SWEPT")
+                label.set_textcolor(l.lb, cSwept)
+                label.set_color(l.lb, color.new(cSwept, 85))
+            if lqHideSwept
+                line.delete(l.ln)
+                label.delete(l.lb)
+                array.remove(sellLq, i)
+        else
+            line.set_x2(l.ln, bar_index)
+            line.set_width(l.ln, math.min(4, l.touches))
+            if not na(l.lb)
+                label.set_xy(l.lb, bar_index + 3, l.price)
+                label.set_text(l.lb, lqText(false, l))
+                label.set_tooltip(l.lb, lqTip(false, l))
+
+plotshape(lqShow and buySweep,  "كنس سيولة الشراء | Buy-side sweep",  shape.diamond, location.abovebar, cBuyLq,  size = size.tiny)
+plotshape(lqShow and sellSweep, "كنس سيولة البيع | Sell-side sweep", shape.diamond, location.belowbar, cSellLq, size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ③  CLEARING & COVERAGE ZONES  |  منطقة التصفية ومنطقة التغطية
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<Zone> clearZ = array.new<Zone>()   // تصفية = دعم مؤسسي (قيعان)
+var array<Zone> coverZ = array.new<Zone>()   // تغطية = مقاومة مؤسسية (قمم)
+
+bodySz   = math.abs(close - open)
+bullDisp = close > open and bodySz >= znBody * atrV and relVol >= znVol
+bearDisp = close < open and bodySz >= znBody * atrV and relVol >= znVol
+bosUp    = close > nz(ta.highest(high, znBos)[1], high)
+bosDn    = close < nz(ta.lowest(low,  znBos)[1], low)
+
+// شمعة الأساس: آخر شمعة معاكسة اللون قبل الاندفاع (أصل الأمر المؤسسي)
+baseIdx(bool bull) =>
+    int idx = 1
+    for i = 1 to 12
+        if (bull ? close[i] < open[i] : close[i] > open[i])
+            idx := i
+            break
+    idx
+
+bullBase = baseIdx(true)
+bearBase = baseIdx(false)
+
+zoneStars(float s) => s >= 4.5 ? "★★★" : s >= 3.2 ? "★★" : "★"
+
+addZone(array<Zone> store, bool bull, int bIdx, float score, simple int maxN) =>
+    float t = znBodyOnly ? math.max(open[bIdx], close[bIdx]) : high[bIdx]
+    float b = znBodyOnly ? math.min(open[bIdx], close[bIdx]) : low[bIdx]
+    float cap = znMaxH * atrV
+    if t - b > cap
+        if bull
+            b := t - cap        // نُبقي الحافة القريبة (أعلى منطقة الطلب)
+        else
+            t := b + cap        // نُبقي الحافة القريبة (أسفل منطقة العرض)
+    color c = bull ? cClear : cCover
+    box bx = box.new(bar_index - bIdx, t, bar_index + 5, b,
+         border_color = color.new(c, 30), border_width = 1, bgcolor = color.new(c, znTransp),
+         extend = extend.right,
+         text = (bull ? "تصفية Clearing " : "تغطية Coverage ") + zoneStars(score),
+         text_color = color.new(c, 15), text_size = size.tiny,
+         text_halign = text.align_left, text_valign = bull ? text.align_bottom : text.align_top)
+    array.push(store, Zone.new(top = t, bot = b, left = bar_index - bIdx, bull = bull, score = score, mitigated = false, bx = bx))
+    while array.size(store) > maxN
+        Zone old = array.shift(store)
+        box.delete(old.bx)
+
+newClear = znShow and okBar and bullDisp and (not znNeedBos or bosUp)
+newCover = znShow and okBar and bearDisp and (not znNeedBos or bosDn)
+zScore   = bodySz / math.max(atrV, syminfo.mintick) + relVol
+
+if newClear
+    addZone(clearZ, true, bullBase, zScore, znMax)
+if newCover
+    addZone(coverZ, false, bearBase, zScore, znMax)
+
+bool inClear = false
+bool inCover = false
+
+// ── متابعة مناطق التصفية (دعم)
+if array.size(clearZ) > 0
+    for i = array.size(clearZ) - 1 to 0
+        Zone z = array.get(clearZ, i)
+        if not z.mitigated
+            bool broken = znMitClose ? close < z.bot : low < z.bot
+            if broken and okBar
+                z.mitigated := true
+                box.set_extend(z.bx, extend.none)
+                box.set_right(z.bx, bar_index)
+                box.set_bgcolor(z.bx, color.new(cClear, math.min(99, znTransp + 8)))
+                box.set_border_color(z.bx, color.new(cClear, 70))
+                box.set_text(z.bx, "مخترقة Mitigated")
+                if znHideMit
+                    box.delete(z.bx)
+                    array.remove(clearZ, i)
+            else
+                if low <= z.top and high >= z.bot
+                    inClear := true
+
+// ── متابعة مناطق التغطية (مقاومة)
+if array.size(coverZ) > 0
+    for i = array.size(coverZ) - 1 to 0
+        Zone z = array.get(coverZ, i)
+        if not z.mitigated
+            bool broken = znMitClose ? close > z.top : high > z.top
+            if broken and okBar
+                z.mitigated := true
+                box.set_extend(z.bx, extend.none)
+                box.set_right(z.bx, bar_index)
+                box.set_bgcolor(z.bx, color.new(cCover, math.min(99, znTransp + 8)))
+                box.set_border_color(z.bx, color.new(cCover, 70))
+                box.set_text(z.bx, "مخترقة Mitigated")
+                if znHideMit
+                    box.delete(z.bx)
+                    array.remove(coverZ, i)
+            else
+                if low <= z.top and high >= z.bot
+                    inCover := true
+
+enterClear = znShow and znAlertIn and inClear and not inClear[1]
+enterCover = znShow and znAlertIn and inCover and not inCover[1]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD  |  لوحة الرادار
+// ═══════════════════════════════════════════════════════════════════════════════
+nearest(array<Zone> store, bool bull) =>
+    float best = na
+    float bs   = na
+    if array.size(store) > 0
+        for i = 0 to array.size(store) - 1
+            Zone z = array.get(store, i)
+            if not z.mitigated
+                float edge = bull ? z.top : z.bot
+                if (bull ? edge <= close : edge >= close)
+                    if na(best) or math.abs(close - edge) < math.abs(close - best)
+                        best := edge
+                        bs   := z.score
+    [best, bs]
+
+nearestLq(array<Liq> store, bool buy) =>
+    float best = na
+    int   tch  = 0
+    if array.size(store) > 0
+        for i = 0 to array.size(store) - 1
+            Liq l = array.get(store, i)
+            if not l.swept and (buy ? l.price >= close : l.price <= close)
+                if na(best) or math.abs(close - l.price) < math.abs(close - best)
+                    best := l.price
+                    tch  := l.touches
+    [best, tch]
+
+pxTxt(float p) => na(p) ? "—" : str.tostring(p, format.mintick) + "  (" + str.tostring((p - close) / close, format.percent) + ")"
+
+var table dash = table.new(dashPos, 2, 8, border_width = 1, frame_width = 1,
+     frame_color = color.new(color.gray, 40), border_color = color.new(color.gray, 70))
+
+[clrPx, clrSc] = nearest(clearZ, true)
+[cvrPx, cvrSc] = nearest(coverZ, false)
+[bslPx, bslTc] = nearestLq(buyLq, true)
+[sslPx, sslTc] = nearestLq(sellLq, false)
+
+if showDash and barstate.islast
+    color hdrBg   = htState == 1 ? color.new(cHTUp, 75) : htState == -1 ? color.new(cHTDn, 75) : color.new(color.gray, 75)
+    string stTxt  = htState == 1 ? "صاعد خفي ▲" : htState == -1 ? "هابط خفي ▼" : "محايد ●"
+    color  stCol  = htState == 1 ? cHTUp : htState == -1 ? cHTDn : color.gray
+    string ageTxt = na(htStateBar) ? "" : "  (" + str.tostring(bar_index - htStateBar) + " شمعة)"
+    string bias   = htState == 1 ? "صعودي: الشراء من مناطق التصفية" : htState == -1 ? "هبوطي: البيع من مناطق التغطية" : "انتظر كسر خط مقطّع"
+
+    table.cell(dash, 0, 0, "📡 رادار السوق | MARKET RADAR", text_color = color.white, bgcolor = hdrBg, text_size = dashTxt)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.white, bgcolor = hdrBg, text_size = dashTxt)
+
+    table.cell(dash, 0, 1, "① الاتجاه الخفي", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 1, stTxt + ageTxt, text_color = stCol, text_size = dashTxt)
+
+    table.cell(dash, 0, 2, "الخط الأحمر المقطّع", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 2, redOn ? pxTxt(redVal) : "مكسور ✔", text_color = cHTDn, text_size = dashTxt)
+
+    table.cell(dash, 0, 3, "الخط الأخضر المقطّع", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 3, greenOn ? pxTxt(greenVal) : "مكسور ✔", text_color = cHTUp, text_size = dashTxt)
+
+    table.cell(dash, 0, 4, "② سيولة شراء أعلى", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 4, pxTxt(bslPx) + (bslTc > 1 ? " ×" + str.tostring(bslTc) : ""), text_color = cBuyLq, text_size = dashTxt)
+
+    table.cell(dash, 0, 5, "② سيولة بيع أسفل", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 5, pxTxt(sslPx) + (sslTc > 1 ? " ×" + str.tostring(sslTc) : ""), text_color = cSellLq, text_size = dashTxt)
+
+    table.cell(dash, 0, 6, "③ التصفية / التغطية", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 6, (na(clrPx) ? "—" : "▼ " + str.tostring(clrPx, format.mintick) + " " + zoneStars(nz(clrSc))) + "   " +
+         (na(cvrPx) ? "—" : "▲ " + str.tostring(cvrPx, format.mintick) + " " + zoneStars(nz(cvrSc))),
+         text_color = color.new(color.white, 10), text_size = dashTxt)
+
+    table.cell(dash, 0, 7, "الخلاصة | Bias", text_color = color.silver, text_size = dashTxt, text_halign = text.align_left)
+    table.cell(dash, 1, 7, bias + (inClear ? "  · داخل التصفية" : "") + (inCover ? "  · داخل التغطية" : ""),
+         text_color = stCol, text_size = dashTxt)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTS  |  التنبيهات
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(htBreakUp,  "① اختراق صاعد خفي | Hidden bullish break",  "إغلاق فوق الخط الأحمر المقطّع — تأكيد صعود قوي")
+alertcondition(htBreakDn,  "① اختراق هابط خفي | Hidden bearish break",  "إغلاق تحت الخط الأخضر المقطّع — تأكيد هبوط قوي")
+alertcondition(buySweep,   "② كنس سيولة الشراء | Buy-side sweep",       "تم كنس بركة سيولة الشراء أعلى القمم")
+alertcondition(sellSweep,  "② كنس سيولة البيع | Sell-side sweep",       "تم كنس بركة سيولة البيع أسفل القيعان")
+alertcondition(newClear,   "③ منطقة تصفية جديدة | New clearing zone",   "تكوّنت منطقة تصفية (دعم مؤسسي) جديدة")
+alertcondition(newCover,   "③ منطقة تغطية جديدة | New coverage zone",   "تكوّنت منطقة تغطية (مقاومة مؤسسية) جديدة")
+alertcondition(enterClear, "③ دخول منطقة التصفية | Price in clearing",  "السعر يتفاعل مع منطقة تصفية — منطقة شراء محتملة")
+alertcondition(enterCover, "③ دخول منطقة التغطية | Price in coverage",  "السعر يتفاعل مع منطقة تغطية — منطقة بيع محتملة")
+
+anyEvent = htBreakUp or htBreakDn or buySweep or sellSweep or newClear or newCover or enterClear or enterCover
+if anyEvent
+    string msg = "📡 رادار السوق " + syminfo.ticker + " (" + timeframe.period + ") @ " + str.tostring(close, format.mintick)
+    msg := msg + (htBreakUp  ? "\n▲ اختراق الخط الأحمر المقطّع — تأكيد صعود قوي" : "")
+    msg := msg + (htBreakDn  ? "\n▼ كسر الخط الأخضر المقطّع — تأكيد هبوط قوي"   : "")
+    msg := msg + (buySweep   ? "\n💧 كنس سيولة شراء أعلى القمم"                  : "")
+    msg := msg + (sellSweep  ? "\n💧 كنس سيولة بيع أسفل القيعان"                 : "")
+    msg := msg + (newClear   ? "\n🟩 منطقة تصفية جديدة (دعم مؤسسي)"             : "")
+    msg := msg + (newCover   ? "\n🟥 منطقة تغطية جديدة (مقاومة مؤسسية)"          : "")
+    msg := msg + (enterClear ? "\n🎯 السعر داخل منطقة تصفية — فرصة شراء"        : "")
+    msg := msg + (enterCover ? "\n🎯 السعر داخل منطقة تغطية — فرصة بيع"         : "")
+    alert(msg, alert.freq_once_per_bar_close)
