@@ -1,0 +1,1418 @@
+//@version=6
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Original concept: "Liquidity Trendline With Signals [StratifyTrade]" © StratifyTrade (CC BY-NC-SA 4.0)
+// Full rebuild / derivative work: AYA · XAUUSD Liquidity Engine [SMC] — released under the same licence.
+//
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//  AYA · XAUUSD LIQUIDITY ENGINE [SMC]                                                          v1.0
+// ───────────────────────────────────────────────────────────────────────────────────────────────────
+//  A non-repainting Smart-Money-Concepts liquidity engine purpose-built for XAUUSD on M1 / M5.
+//
+//  WHAT IT DOES
+//    1. LIQUIDITY MAP     — clusters swing pivots into equal-high / equal-low pools, plus session
+//                           (Asia / London / NY) and daily / weekly extremes. Every pool carries a
+//                           "resting stops" weight based on how many times it was touched.
+//    2. LIQUIDITY TRENDLINES — the rebuilt StratifyTrade engine: descending resistance / ascending
+//                           support channels anchored on two validated pivots, slope-clamped,
+//                           retro-validated, age-limited, and projected with exact geometry
+//                           (y = y1 + slope * (x - x1)) instead of drifting incremental updates.
+//    3. SWEEP DETECTOR    — separates a genuine liquidity GRAB (wick through, close back inside)
+//                           from a clean BREAK (close through) using penetration depth, rejection
+//                           wick ratio, pool strength and relative volume.
+//    4. STRUCTURE ENGINE  — dual-resolution BOS / CHoCH (internal + swing) with level consumption
+//                           so a level can only be broken once.
+//    5. IMBALANCE / OB    — ATR-filtered FVGs and displacement order blocks with mitigation tracking.
+//    6. SIGNAL ENGINE     — a state machine: liquidity grab ➜ CHoCH/BOS in the grab direction ➜
+//                           weighted confluence score ➜ signal with entry, invalidation and 3 targets.
+//    7. RISK + STATS      — R-multiple targets, lot sizing for gold (100 oz / lot) and a live
+//                           first-touch performance tracker (win rate, avg R, expectancy, PF).
+//
+//  NON-REPAINTING GUARANTEE
+//    Every piece of state that can produce a signal is mutated ONLY inside `if barstate.isconfirmed`.
+//    On historical bars that flag is always true, and on the live bar it is true only on the closing
+//    tick — so the live path executes exactly the same computation, with exactly the same inputs,
+//    as the historical path. Consequences:
+//      • Signals print on the CLOSE of their bar and never move, vanish or re-paint afterwards.
+//      • Pivots are only registered once the confirmation window has fully closed.
+//      • HTF bias uses request.security(..., expr[1], lookahead_on) — the canonical confirmed-bar
+//        idiom — so no future data leaks onto historical bars.
+//      • No security() on the chart timeframe, no `offset` trickery, no lookahead on live data.
+//    The unavoidable, honest cost: a pivot of length L is only known L bars after it happened.
+//    That latency is real and is deliberately NOT hidden.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+indicator(
+     "AYA · XAUUSD Liquidity Engine [SMC]"
+   , "AYA · XAU Liquidity Engine"
+   , overlay          = true
+   , max_lines_count  = 500
+   , max_labels_count = 500
+   , max_boxes_count  = 500
+   , max_bars_back    = 2000
+   )
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 00 · INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════════════════
+gPRO = "❶ PROFILE · CORE"
+gSTR = "❷ MARKET STRUCTURE"
+gLIQ = "❸ LIQUIDITY POOLS"
+gTRD = "❹ LIQUIDITY TRENDLINES"
+gSWP = "❺ SWEEPS · DISPLACEMENT"
+gIMB = "❻ IMBALANCE · ORDER BLOCKS"
+gSES = "❼ SESSIONS · KILLZONES"
+gSIG = "❽ SIGNAL ENGINE"
+gRSK = "❾ RISK MODEL"
+gVIZ = "❿ DASHBOARD · STYLE"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 01 · PROFILE & CORE
+// ═══════════════════════════════════════════════════════════════════════════════
+i_prof   = input.string("Auto", "Tuning profile", options = ["Auto", "M1 Scalp", "M5 Intraday", "Manual"], group = gPRO,
+   tooltip = "Auto  : M1 preset on 1–3m charts, M5 preset elsewhere.\nManual: every length below is taken literally.")
+i_atrLen = input.int(200, "ATR (volatility unit)", minval = 14, maxval = 1000, group = gPRO,
+   tooltip = "All tolerances in this script are expressed as multiples of this ATR, so the engine self-scales between a quiet Asian range and a CPI release.")
+i_pipIn  = input.float(0.0, "Pip size override", minval = 0, step = 0.01, group = gPRO,
+   tooltip = "0 = auto (mintick × 10). XAUUSD normally quotes 0.01 mintick, so 1 pip = $0.10.")
+
+i_htfOn  = input.bool(true, "HTF bias filter", group = gPRO, inline = "h1")
+i_htf    = input.timeframe("15", "", group = gPRO, inline = "h1")
+i_htf2   = input.timeframe("60", "", group = gPRO, inline = "h1")
+i_htfLen = input.int(50, "HTF baseline EMA", minval = 5, maxval = 400, group = gPRO,
+   tooltip = "Bias = HTF close vs HTF EMA + EMA slope, read from the CONFIRMED HTF bar only.")
+
+isM1  = i_prof == "M1 Scalp" or (i_prof == "Auto" and timeframe.isintraday and timeframe.multiplier <= 3)
+isMan = i_prof == "Manual"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 02 · MARKET STRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+i_swLenIn  = input.int(7, "Swing pivot length", minval = 2, maxval = 60, group = gSTR)
+i_inLenIn  = input.int(3, "Internal pivot length", minval = 1, maxval = 30, group = gSTR,
+   tooltip = "Internal structure is what actually confirms an entry; swing structure sets the bias.")
+i_useClose = input.bool(true, "Confirm breaks on candle CLOSE", group = gSTR,
+   tooltip = "ON  = a level is broken only by a body close beyond it (fewer, cleaner events).\nOFF = wicks count (faster, noisier).")
+i_showSw   = input.bool(true, "Draw swing BOS / CHoCH", group = gSTR, inline = "s1")
+i_showIn   = input.bool(false, "Draw internal", group = gSTR, inline = "s1")
+i_showPD   = input.bool(true, "Premium / Discount (equilibrium)", group = gSTR)
+
+swLen   = isMan ? i_swLenIn : (isM1 ? 8 : 6)
+inLen   = isMan ? i_inLenIn : (isM1 ? 3 : 3)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 03 · LIQUIDITY POOLS
+// ═══════════════════════════════════════════════════════════════════════════════
+i_poolOn   = input.bool(true, "Map liquidity pools", group = gLIQ)
+i_poolLenI = input.int(5, "Pool pivot length", minval = 2, maxval = 40, group = gLIQ)
+i_eqTol    = input.float(0.18, "Equal-level tolerance (×ATR)", minval = 0.01, maxval = 1.5, step = 0.01, group = gLIQ,
+   tooltip = "Two pivots inside this distance are the SAME pool of resting stops. 0.18×ATR on M1 gold ≈ 10–15 cents.")
+i_poolMax  = input.int(24, "Max live pools", minval = 4, maxval = 60, group = gLIQ)
+i_poolKeep = input.int(30, "Keep swept pools for N bars", minval = 0, maxval = 300, group = gLIQ)
+i_poolMinH = input.int(1, "Min touches to draw", minval = 1, maxval = 6, group = gLIQ)
+i_eqLbl    = input.bool(true, "Label EQH / EQL", group = gLIQ, inline = "l1")
+i_sesLiq   = input.bool(true, "Session & daily liquidity", group = gLIQ, inline = "l1",
+   tooltip = "Adds Asia / London / NY session extremes and PDH / PDL as high-weight pools — the levels gold actually hunts.")
+
+poolLen = isMan ? i_poolLenI : (isM1 ? 5 : 4)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 04 · LIQUIDITY TRENDLINES  (rebuilt StratifyTrade engine)
+// ═══════════════════════════════════════════════════════════════════════════════
+i_tlOn      = input.bool(true, "Liquidity trendlines", group = gTRD)
+i_tlLenIn   = input.int(5, "Trendline pivot length", minval = 2, maxval = 40, group = gTRD)
+i_tlPad     = input.float(2.0, "Band padding", minval = 0.1, maxval = 12, step = 0.1, group = gTRD,
+   tooltip = "Half-width of the liquidity band around the anchor line, in 0.1×ATR units (2.0 ≈ 0.20×ATR each side).")
+i_tlMinSpan = input.int(4, "Min pivot span (bars)", minval = 2, maxval = 100, group = gTRD, inline = "t1")
+i_tlMaxSpan = input.int(60, "Max", minval = 5, maxval = 400, group = gTRD, inline = "t1")
+i_tlSlope   = input.float(0.35, "Max slope (×ATR / bar)", minval = 0.02, maxval = 3.0, step = 0.01, group = gTRD,
+   tooltip = "Rejects near-vertical lines built from two adjacent spike pivots — the single biggest source of junk trendlines.")
+i_tlMaxAge  = input.int(250, "Max age (bars)", minval = 20, maxval = 2000, group = gTRD)
+i_tlMax     = input.int(2, "Max live lines per side", minval = 1, maxval = 5, group = gTRD)
+i_tlFill    = input.bool(true, "Fill band", group = gTRD, inline = "t2")
+i_tlBreaks  = input.bool(true, "Break markers", group = gTRD, inline = "t2")
+i_tlArm     = input.bool(true, "Trendline events can arm a setup", group = gTRD,
+   tooltip = "A wick through the band that closes back inside is a trendline liquidity GRAB and arms a reversal setup.\nA close through the band is a BREAK and arms a continuation setup.")
+
+tlLen   = isMan ? i_tlLenIn : (isM1 ? 5 : 4)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 05 · SWEEPS & DISPLACEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+i_swpMinP = input.float(0.03, "Min penetration (×ATR)", minval = 0.0, maxval = 2, step = 0.01, group = gSWP,
+   tooltip = "Below this the level was merely tagged, not swept.")
+i_swpMaxP = input.float(1.20, "Max penetration (×ATR)", minval = 0.1, maxval = 6, step = 0.05, group = gSWP,
+   tooltip = "Above this it is a violent expansion, not a stop-run — gold does this on news and it is not a fade.")
+i_swpRej  = input.float(0.30, "Min rejection wick ratio", minval = 0.0, maxval = 1, step = 0.05, group = gSWP)
+i_disp    = input.float(0.55, "Displacement body (×ATR)", minval = 0.05, maxval = 4, step = 0.05, group = gSWP)
+i_volOn   = input.bool(true, "Relative volume confluence", group = gSWP, inline = "v1")
+i_volMult = input.float(1.4, "×", minval = 1.0, maxval = 6, step = 0.1, group = gSWP, inline = "v1")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 06 · IMBALANCE & ORDER BLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+i_fvgOn   = input.bool(true, "Fair value gaps", group = gIMB, inline = "f1")
+i_fvgMin  = input.float(0.15, "min size ×ATR", minval = 0.01, maxval = 2, step = 0.01, group = gIMB, inline = "f1",
+   tooltip = "M1 gold prints dozens of 2-cent gaps per hour; this filter is what makes FVGs usable.")
+i_fvgMit  = input.string("Touch", "FVG mitigation", options = ["Touch", "50%", "Full"], group = gIMB)
+i_obOn    = input.bool(true, "Order blocks", group = gIMB, inline = "o1")
+i_obLook  = input.int(12, "lookback", minval = 2, maxval = 60, group = gIMB, inline = "o1")
+i_obBody  = input.bool(false, "Order block = body only", group = gIMB)
+i_zoneMax = input.int(24, "Max live zones", minval = 4, maxval = 80, group = gIMB)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 07 · SESSIONS & KILLZONES
+// ═══════════════════════════════════════════════════════════════════════════════
+i_tzSel   = input.string("UTC", "Timezone", options = ["Exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo", "Asia/Dubai"], group = gSES)
+i_sAsia   = input.session("0000-0700", "Asia",   group = gSES, inline = "k1")
+i_kAsia   = input.bool(false, "KZ", group = gSES, inline = "k1")
+i_sLon    = input.session("0700-1000", "London", group = gSES, inline = "k2")
+i_kLon    = input.bool(true,  "KZ", group = gSES, inline = "k2")
+i_sNY     = input.session("1200-1500", "NY",     group = gSES, inline = "k3")
+i_kNY     = input.bool(true,  "KZ", group = gSES, inline = "k3")
+i_kzFilt  = input.bool(false, "Signals only inside killzones", group = gSES,
+   tooltip = "Sessions are entered as UTC by default. London 07:00–10:00 and NY 12:00–15:00 UTC cover the gold open-drive windows.")
+i_kzBg    = input.bool(true, "Shade killzones", group = gSES)
+i_sesLine = input.bool(true, "Draw session / daily levels", group = gSES)
+
+tzUse = i_tzSel == "Exchange" ? syminfo.timezone : i_tzSel
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 08 · SIGNAL ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+i_sigOn    = input.bool(true, "Enable signals", group = gSIG)
+i_minScore = input.float(4.5, "Min confluence score", minval = 0, maxval = 12, step = 0.1, group = gSIG,
+   tooltip = "Theoretical max ≈ 10.5. 4.5 is balanced, 6.0 is sniper-only, 3.5 floods the chart.")
+i_confWin  = input.int(12, "Confirmation window (bars)", minval = 1, maxval = 60, group = gSIG,
+   tooltip = "After a liquidity grab, structure must flip within this many bars or the setup is discarded.")
+i_cool     = input.int(8, "Cooldown between signals", minval = 0, maxval = 200, group = gSIG)
+i_maxDay   = input.int(12, "Max signals per day", minval = 1, maxval = 100, group = gSIG)
+i_dirF     = input.string("Both", "Direction filter", options = ["Both", "Long only", "Short only"], group = gSIG)
+i_reqHtf   = input.bool(false, "Require HTF alignment", group = gSIG, inline = "g1")
+i_oneTrade = input.bool(true, "One trade at a time", group = gSIG, inline = "g1",
+   tooltip = "ON  = no new signal while a tracked trade is still running.\nOFF = signals keep firing; the outstanding trade is booked at market so the record stays complete.")
+i_minAtrU  = input.float(0.15, "Min ATR ($)", minval = 0, maxval = 50, step = 0.05, group = gSIG, inline = "g2",
+   tooltip = "Volatility regime gate. Below the floor the market is dead; above the ceiling it is news-driven chaos.")
+i_maxAtrU  = input.float(6.00, "Max ATR ($)", minval = 0.1, maxval = 200, step = 0.1, group = gSIG, inline = "g2")
+i_showScr  = input.bool(true, "Show score on signal label", group = gSIG)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 09 · RISK MODEL
+// ═══════════════════════════════════════════════════════════════════════════════
+i_slBuf    = input.float(0.35, "Stop buffer beyond sweep (×ATR)", minval = 0.0, maxval = 3, step = 0.05, group = gRSK)
+i_slMinU   = input.float(0.30, "Min stop distance ($)", minval = 0.01, maxval = 50, step = 0.01, group = gRSK,
+   tooltip = "Protects against a stop tighter than the XAUUSD spread + slippage.")
+i_slMaxA   = input.float(3.0, "Max stop distance (×ATR)", minval = 0.3, maxval = 12, step = 0.1, group = gRSK,
+   tooltip = "If the structural stop is wider than this the setup is rejected rather than resized — bad structure, not a sizing problem.")
+i_tpMode   = input.string("R multiples", "Target mode", options = ["R multiples", "Opposing liquidity"], group = gRSK)
+i_rr1      = input.float(1.0, "TP1 (R)", minval = 0.2, step = 0.1, group = gRSK, inline = "r1")
+i_rr2      = input.float(2.0, "TP2 (R)", minval = 0.3, step = 0.1, group = gRSK, inline = "r1")
+i_rr3      = input.float(3.0, "TP3 (R)", minval = 0.5, step = 0.1, group = gRSK, inline = "r1")
+i_maxHold  = input.int(90, "Time stop (bars)", minval = 5, maxval = 1000, group = gRSK)
+i_acct     = input.float(10000, "Account ($)", minval = 1, step = 100, group = gRSK, inline = "r2")
+i_riskPct  = input.float(0.5, "Risk %", minval = 0.01, maxval = 20, step = 0.05, group = gRSK, inline = "r2")
+i_ozLot    = input.float(100, "Ounces per lot", minval = 1, step = 1, group = gRSK,
+   tooltip = "Standard XAUUSD contract = 100 oz, so $1 of price = $100 per lot.")
+i_showLvl  = input.bool(true, "Draw entry / stop / targets", group = gRSK, inline = "r3")
+i_lvlBars  = input.int(40, "extend", minval = 5, maxval = 300, group = gRSK, inline = "r3")
+i_keepTr   = input.int(3, "Keep last N trade drawings", minval = 1, maxval = 10, group = gRSK)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 10 · DASHBOARD & STYLE
+// ═══════════════════════════════════════════════════════════════════════════════
+i_dash    = input.bool(true, "Dashboard", group = gVIZ, inline = "d1")
+i_dashPos = input.string("Top Right", "", options = ["Top Right", "Middle Right", "Bottom Right", "Top Left", "Bottom Left"], group = gVIZ, inline = "d1")
+i_dashSz  = input.string("Small", "", options = ["Tiny", "Small", "Normal"], group = gVIZ, inline = "d1")
+i_stats   = input.bool(true, "Live performance tracker", group = gVIZ,
+   tooltip = "First-touch simulation: a trade ends at TP1 or at the stop. If both are hit inside one bar it is booked as a LOSS (conservative). This is a diagnostic, not a backtest.")
+
+cUp   = input.color(#0044ff, "Support / bullish",  group = gVIZ, inline = "c1")
+cDn   = input.color(#ff2b00, "Resistance / bearish", group = gVIZ, inline = "c1")
+cBuy  = input.color(#00c853, "Buy signal",  group = gVIZ, inline = "c2")
+cSell = input.color(#e91e63, "Sell signal", group = gVIZ, inline = "c2")
+cLiq  = input.color(#ffb300, "Liquidity pool", group = gVIZ, inline = "c3")
+cSwp  = input.color(#9c27b0, "Sweep", group = gVIZ, inline = "c3")
+cTxt  = input.color(#d1d4dc, "Dashboard text", group = gVIZ, inline = "c4")
+cBg   = input.color(#0c0e15, "Dashboard bg", group = gVIZ, inline = "c4")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 11 · CORE SERIES & VOLATILITY UNIT
+// ═══════════════════════════════════════════════════════════════════════════════
+// Every distance in this script is measured in `unit` (one ATR). That is what makes
+// a single parameter set behave the same way on a $0.30 Asian range and a $4 CPI bar.
+tick   = syminfo.mintick
+atrRaw = ta.atr(i_atrLen)
+atrF   = ta.atr(14)
+unit   = math.max(nz(atrRaw, nz(atrF, ta.tr(true))), tick * 10)   // never zero, never na
+pipSz  = i_pipIn > 0 ? i_pipIn : tick * 10
+volAvg = ta.sma(volume, 20)
+rvol   = na(volAvg) or volAvg <= 0 ? 1.0 : volume / volAvg
+barRng = math.max(high - low, tick)
+barBod = math.abs(close - open)
+
+// THE NON-REPAINT GATE. Historical bars: always true. Live bar: true only on the
+// closing tick. Everything that can create, arm or fire a signal lives behind it.
+conf = barstate.isconfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 12 · TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+type Lvl
+    float price = na
+    int   bar   = na
+
+// Dual-resolution market structure state machine.
+type Struct
+    float shP   = na      // live (unbroken) swing-high level
+    int   shB   = na
+    float slP   = na      // live (unbroken) swing-low level
+    int   slB   = na
+    int   bias  = 0       // +1 bullish / -1 bearish / 0 undefined
+    bool  bos   = false   // this bar: break of structure (with the bias)
+    bool  choch = false   // this bar: change of character (against the bias)
+    int   dir   = 0       // this bar: +1 / -1 / 0
+    float lvl   = na      // level that was taken
+    int   lvlB  = na      // bar index of that level
+    int   evtB  = na
+
+// A pocket of resting stops.
+type Pool
+    bool  isHigh = true
+    float top    = na
+    float bot    = na
+    int   b0     = na     // first pivot that formed it
+    int   b1     = na     // most recent touch
+    int   hits   = 1
+    bool  dead   = false
+    int   kind   = 0      // 0 live · 1 swept (grab) · 2 broken (close through)
+    int   deadB  = na
+    int   grade  = 0      // 0 pivot cluster · 1 session extreme · 2 daily/weekly extreme
+    string tag   = ""
+    line  ln     = na
+    label lb     = na
+
+// FVG / order block.
+type Zone
+    bool  bull = true
+    int   kind = 0        // 0 FVG · 1 order block
+    float top  = na
+    float bot  = na
+    int   b0   = na
+    int   cb   = na       // creation bar — mitigation is only tested from the NEXT bar on
+    bool  mit  = false
+    box   bx   = na
+
+// Liquidity trendline channel (two anchors + a band).
+type Chan
+    bool  bull   = true   // true  = ascending support built from rising lows
+    float y1     = na     // anchor price at x1
+    int   x1     = na
+    float slp    = 0.0    // price per bar (exact geometry, no drift)
+    float half   = na     // half band width
+    int   bornB  = na
+    int   anchB  = na     // second anchor bar
+    bool  dead   = false
+    int   deadB  = na
+    line  la     = na     // upper edge
+    line  lb     = na     // lower edge
+    linefill lf  = na
+
+// Event bus for one confirmed bar.
+type Bus
+    bool   upFire = false   // highs were taken  → bearish setup
+    float  upLvl  = na
+    float  upExt  = na
+    float  upQ    = 0.0
+    string upSrc  = ""
+    bool   dnFire = false   // lows were taken   → bullish setup
+    float  dnLvl  = na
+    float  dnExt  = na
+    float  dnQ    = 0.0
+    string dnSrc  = ""
+    bool   tlUp   = false   // trendline broken upward   (bullish continuation)
+    bool   tlDn   = false   // trendline broken downward (bearish continuation)
+
+// Armed-but-unconfirmed setup.
+type Setup
+    int    dir  = 0
+    int    b0   = na
+    float  lvl  = na
+    float  ext  = na       // the sweep extreme = structural invalidation
+    float  base = 0.0      // sweep quality carried into the score
+    string src  = ""
+    bool   live = false
+
+// A fired signal, tracked to its outcome.
+type Trade
+    int    dir   = 0
+    float  en    = na
+    float  sl    = na
+    float  t1    = na
+    float  t2    = na
+    float  t3    = na
+    int    b0    = na
+    int    state = 0       // 0 running · 1 TP1 · -1 stop · 2 time stop
+    float  score = 0.0
+    float  mfe   = 0.0     // max favourable excursion, in R
+    string tags  = ""
+    bool   live  = false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 13 · GENERIC HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+// Bounded drawing pools — TradingView hard-caps objects, so every collection is capped.
+pushLn(array<line> a, line l, int cap) =>
+    a.push(l)
+    while a.size() > cap
+        line d = a.shift()
+        d.delete()
+
+pushLb(array<label> a, label l, int cap) =>
+    a.push(l)
+    while a.size() > cap
+        label d = a.shift()
+        d.delete()
+
+f2(float x)  => str.tostring(x, "#.##")
+fPx(float x) => str.tostring(math.round_to_mintick(x), format.mintick)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 14 · STRUCTURE STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════════
+// A level can be taken exactly once: on a break it is consumed (set to na) and only a
+// freshly confirmed pivot can arm a new one. That single rule removes the classic
+// "same high broken on twenty consecutive bars" spam.
+method advance(Struct s, float ph, float pl, int piv, bool byClose) =>
+    s.bos   := false
+    s.choch := false
+    s.dir   := 0
+    if not na(ph)
+        s.shP := ph
+        s.shB := bar_index - piv
+    if not na(pl)
+        s.slP := pl
+        s.slB := bar_index - piv
+    float upRef = byClose ? close : high
+    float dnRef = byClose ? close : low
+    if not na(s.shP) and upRef > s.shP
+        s.choch := s.bias < 0
+        s.bos   := s.bias >= 0
+        s.dir   := 1
+        s.lvl   := s.shP
+        s.lvlB  := s.shB
+        s.evtB  := bar_index
+        s.bias  := 1
+        s.shP   := na
+        s.shB   := na
+    else if not na(s.slP) and dnRef < s.slP
+        s.choch := s.bias > 0
+        s.bos   := s.bias <= 0
+        s.dir   := -1
+        s.lvl   := s.slP
+        s.lvlB  := s.slB
+        s.evtB  := bar_index
+        s.bias  := -1
+        s.slP   := na
+        s.slB   := na
+    s.dir
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 15 · TRENDLINE GEOMETRY
+// ═══════════════════════════════════════════════════════════════════════════════
+// Exact projection. The original script advanced y2 by one slope step per bar inside a
+// loop, which accumulates rounding error and silently desynchronises the two band edges.
+method yAt(Chan c, int x) => c.y1 + c.slp * (x - c.x1)
+method topAt(Chan c, int x) => c.yAt(x) + c.half
+method botAt(Chan c, int x) => c.yAt(x) - c.half
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 16 · PERSISTENT STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+var Struct swS = Struct.new()          // swing structure  → bias
+var Struct inS = Struct.new()          // internal structure → entry trigger
+var Bus    bus = Bus.new()
+
+var array<Pool> pools = array.new<Pool>()
+var array<Zone> zones = array.new<Zone>()
+var array<Chan> chans = array.new<Chan>()
+var array<Lvl>  phL   = array.new<Lvl>()     // recent pivot highs (trendline anchors)
+var array<Lvl>  plL   = array.new<Lvl>()     // recent pivot lows
+
+var Setup setB = Setup.new()           // armed bullish setup
+var Setup setS = Setup.new()           // armed bearish setup
+var Trade cur  = Trade.new()           // trade currently being tracked
+
+var array<line>  stLn = array.new<line>()      // structure lines
+var array<label> stLb = array.new<label>()     // structure labels
+var array<line>  sgLn = array.new<line>()      // signal level lines
+var array<label> sgLb = array.new<label>()     // signal labels
+
+var int   lastSigB = -100000
+var int   daySigs  = 0
+var int   nTr      = 0
+var int   nWin     = 0
+var int   nLoss    = 0
+var float sumR     = 0.0
+var float sumWin   = 0.0
+var float sumLoss  = 0.0
+var int   lastDir  = 0
+var float lastScore= 0.0
+var string lastTags= ""
+var int   nTL      = 0                 // trendlines built
+var int   nSweep   = 0                 // sweeps detected
+
+var Lvl swHi = Lvl.new()               // dealing range anchors
+var Lvl swLo = Lvl.new()
+
+var float asiaH = na
+var float asiaL = na
+var float lonH  = na
+var float lonL  = na
+var float nyH   = na
+var float nyL   = na
+var float dHi   = na
+var float dLo   = na
+var float pdH   = na
+var float pdL   = na
+var float pwH   = na
+var float pwL   = na
+var float wHi   = na
+var float wLo   = na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 17 · HTF BIAS  (confirmed-bar only — no lookahead leak)
+// ═══════════════════════════════════════════════════════════════════════════════
+// `expr[1]` + lookahead_on is the canonical non-repainting request.security idiom:
+// it returns the value of the LAST CLOSED higher-timeframe bar, which is information
+// that was genuinely available at that moment in history and on the live bar alike.
+htfPack() =>
+    e = ta.ema(close, i_htfLen)
+    [close[1], e[1], e[1] - e[4]]
+
+[h1c, h1e, h1s] = request.security(syminfo.tickerid, i_htf,  htfPack(), lookahead = barmerge.lookahead_on)
+[h2c, h2e, h2s] = request.security(syminfo.tickerid, i_htf2, htfPack(), lookahead = barmerge.lookahead_on)
+
+biasOf(float c_, float e_, float s_) =>
+    float r = 0.0
+    if not na(c_) and not na(e_)
+        r := c_ > e_ ? 1.0 : c_ < e_ ? -1.0 : 0.0
+        r := r + (na(s_) ? 0.0 : s_ > 0 ? 0.5 : s_ < 0 ? -0.5 : 0.0)
+    r
+
+htfBias = i_htfOn ? (biasOf(h1c, h1e, h1s) + biasOf(h2c, h2e, h2s)) * 0.5 : 0.0
+htfDir  = htfBias > 0.4 ? 1 : htfBias < -0.4 ? -1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 18 · SESSIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+intra   = timeframe.isintraday
+inAsia  = intra and not na(time(timeframe.period, i_sAsia, tzUse))
+inLon   = intra and not na(time(timeframe.period, i_sLon,  tzUse))
+inNY    = intra and not na(time(timeframe.period, i_sNY,   tzUse))
+kzAny   = i_kAsia or i_kLon or i_kNY
+inKZ    = (i_kAsia and inAsia) or (i_kLon and inLon) or (i_kNY and inNY)
+kzOK    = not i_kzFilt or not kzAny or inKZ
+newDay  = intra and timeframe.change("D")
+newWeek = intra and timeframe.change("W")
+
+sessName = inNY ? "NEW YORK" : inLon ? "LONDON" : inAsia ? "ASIA" : "OFF-SESSION"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 19 · PIVOTS  (confirmed by construction — value is only known `len` bars later)
+// ═══════════════════════════════════════════════════════════════════════════════
+phSw = ta.pivothigh(high, swLen,   swLen)
+plSw = ta.pivotlow (low,  swLen,   swLen)
+phIn = ta.pivothigh(high, inLen,   inLen)
+plIn = ta.pivotlow (low,  inLen,   inLen)
+phPo = ta.pivothigh(high, poolLen, poolLen)
+plPo = ta.pivotlow (low,  poolLen, poolLen)
+phTl = ta.pivothigh(high, tlLen,   tlLen)
+plTl = ta.pivotlow (low,  tlLen,   tlLen)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 20 · LIQUIDITY POOL CONSTRUCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pivots inside `eqTol` of each other are not two levels — they are one pool of stops
+// that got deeper. `hits` is the depth of that pool and is a first-class score input.
+addPool(array<Pool> ps, bool isHigh, float p, int b, int grade, string tag) =>
+    float tol   = unit * i_eqTol
+    bool merged = false
+    if ps.size() > 0
+        for i = 0 to ps.size() - 1
+            Pool q = ps.get(i)
+            if not q.dead and q.isHigh == isHigh
+                float ref = isHigh ? q.top : q.bot
+                if math.abs(p - ref) <= tol
+                    q.hits  := q.hits + 1
+                    q.b1    := b
+                    q.top   := math.max(q.top, p)
+                    q.bot   := math.min(q.bot, p)
+                    q.grade := math.max(q.grade, grade)
+                    if grade > 0 and str.length(tag) > 0
+                        q.tag := tag
+                    merged := true
+                    break
+    if not merged
+        ps.push(Pool.new(isHigh = isHigh, top = p, bot = p, b0 = b, b1 = b, hits = 1, grade = grade, tag = tag))
+    merged
+
+// Sweep quality: depth of penetration, rejection wick, pool depth, relative volume.
+sweepQuality(bool isHigh, float lvl, int hits, int grade) =>
+    float pen  = (isHigh ? high - lvl : lvl - low) / unit
+    float wick = isHigh ? high - math.max(open, close) : math.min(open, close) - low
+    float rej  = wick / barRng
+    float q    = 1.0
+    q := q + (pen >= i_swpMinP * 3 ? 0.5 : 0.0)
+    q := q + (rej >= i_swpRej ? 0.6 : 0.0)
+    q := q + (hits >= 3 ? 0.8 : hits == 2 ? 0.4 : 0.0)
+    q := q + (grade >= 2 ? 0.6 : grade == 1 ? 0.3 : 0.0)
+    q := q + (i_volOn and rvol >= i_volMult ? 0.4 : 0.0)
+    q
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 21 · PER-BAR EVENT FLAGS  (declared here, filled inside the confirmed pass)
+// ═══════════════════════════════════════════════════════════════════════════════
+int  swDir      = 0
+int  inDir      = 0
+bool fvgUpNow   = false
+bool fvgDnNow   = false
+bool fireBuy    = false
+bool fireSell   = false
+bool tlBreakUp  = false
+bool tlBreakDn  = false
+bool grabUp     = false      // highs grabbed (bearish)
+bool grabDn     = false      // lows grabbed  (bullish)
+
+lo10 = ta.lowest(low, 10)
+hi10 = ta.highest(high, 10)
+// Highest / lowest CLOSE across the pivot's confirmation window. A pivot high that price has
+// already closed above during the `poolLen` bars it took to confirm is stale, not liquidity.
+hiCloseN = ta.highest(close, math.max(poolLen, 1))
+loCloseN = ta.lowest(close,  math.max(poolLen, 1))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 22 · CONFIRMED PASS ①  —  bus reset, sessions, daily & weekly liquidity
+// ═══════════════════════════════════════════════════════════════════════════════
+if conf
+    bus.upFire := false
+    bus.dnFire := false
+    bus.upQ    := 0.0
+    bus.dnQ    := 0.0
+    bus.tlUp   := false
+    bus.tlDn   := false
+
+if conf and intra
+    // ── rolling day extremes → PDH / PDL become the highest-grade pools on gold ──
+    if newDay
+        pdH     := dHi
+        pdL     := dLo
+        dHi     := high
+        dLo     := low
+        daySigs := 0
+        if i_sesLiq and not na(pdH)
+            addPool(pools, true,  pdH, bar_index - 1, 2, "PDH")
+            addPool(pools, false, pdL, bar_index - 1, 2, "PDL")
+    else
+        dHi := math.max(nz(dHi, high), high)
+        dLo := math.min(nz(dLo, low),  low)
+
+    if newWeek
+        pwH := wHi
+        pwL := wLo
+        wHi := high
+        wLo := low
+        if i_sesLiq and not na(pwH)
+            addPool(pools, true,  pwH, bar_index - 1, 2, "PWH")
+            addPool(pools, false, pwL, bar_index - 1, 2, "PWL")
+    else
+        wHi := math.max(nz(wHi, high), high)
+        wLo := math.min(nz(wLo, low),  low)
+
+    // ── session extremes: the Asian range is the single most-hunted pool on XAUUSD ──
+    if inAsia and not inAsia[1]
+        asiaH := high
+        asiaL := low
+    else if inAsia
+        asiaH := math.max(nz(asiaH, high), high)
+        asiaL := math.min(nz(asiaL, low),  low)
+    if inAsia[1] and not inAsia and i_sesLiq and not na(asiaH)
+        addPool(pools, true,  asiaH, bar_index - 1, 1, "ASIA H")
+        addPool(pools, false, asiaL, bar_index - 1, 1, "ASIA L")
+
+    if inLon and not inLon[1]
+        lonH := high
+        lonL := low
+    else if inLon
+        lonH := math.max(nz(lonH, high), high)
+        lonL := math.min(nz(lonL, low),  low)
+    if inLon[1] and not inLon and i_sesLiq and not na(lonH)
+        addPool(pools, true,  lonH, bar_index - 1, 1, "LON H")
+        addPool(pools, false, lonL, bar_index - 1, 1, "LON L")
+
+    if inNY and not inNY[1]
+        nyH := high
+        nyL := low
+    else if inNY
+        nyH := math.max(nz(nyH, high), high)
+        nyL := math.min(nz(nyL, low),  low)
+    if inNY[1] and not inNY and i_sesLiq and not na(nyH)
+        addPool(pools, true,  nyH, bar_index - 1, 1, "NY H")
+        addPool(pools, false, nyL, bar_index - 1, 1, "NY L")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 23 · CONFIRMED PASS ②  —  register pivots
+// ═══════════════════════════════════════════════════════════════════════════════
+if conf
+    if i_poolOn
+        if not na(phPo) and hiCloseN <= phPo
+            addPool(pools, true,  phPo, bar_index - poolLen, 0, "")
+        if not na(plPo) and loCloseN >= plPo
+            addPool(pools, false, plPo, bar_index - poolLen, 0, "")
+
+    if not na(phTl)
+        phL.unshift(Lvl.new(phTl, bar_index - tlLen))
+        while phL.size() > 6
+            phL.pop()
+    if not na(plTl)
+        plL.unshift(Lvl.new(plTl, bar_index - tlLen))
+        while plL.size() > 6
+            plL.pop()
+
+    if not na(phSw)
+        swHi.price := phSw
+        swHi.bar   := bar_index - swLen
+    if not na(plSw)
+        swLo.price := plSw
+        swLo.bar   := bar_index - swLen
+
+// Dealing range → premium / discount. Longs from discount, shorts from premium.
+eqLvl      = na(swHi.price) or na(swLo.price) ? float(na) : (swHi.price + swLo.price) * 0.5
+inDisc     = not na(eqLvl) and close < eqLvl
+inPrem     = not na(eqLvl) and close > eqLvl
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 24 · CONFIRMED PASS ③  —  sweep scan over the liquidity map
+// ═══════════════════════════════════════════════════════════════════════════════
+// GRAB  : wick clears the pool, body closes back inside  → reversal fuel.
+// BREAK : body closes clean through                      → pool consumed, continuation.
+// The distinction is the whole point; conflating them is why naive "liquidity" tools
+// buy every breakout of a high and get stopped by the retrace.
+if conf and i_poolOn and pools.size() > 0
+    for i = 0 to pools.size() - 1
+        Pool q = pools.get(i)
+        if not q.dead
+            if q.isHigh
+                if high > q.top
+                    float pen = (high - q.top) / unit
+                    if close < q.bot and pen >= i_swpMinP and pen <= i_swpMaxP
+                        q.dead  := true
+                        q.kind  := 1
+                        q.deadB := bar_index
+                        nSweep  := nSweep + 1
+                        float qq = sweepQuality(true, q.top, q.hits, q.grade)
+                        if qq > bus.upQ
+                            bus.upFire := true
+                            bus.upLvl  := q.top
+                            bus.upExt  := high
+                            bus.upQ    := qq
+                            bus.upSrc  := str.length(q.tag) > 0 ? q.tag : q.hits >= 2 ? "EQH×" + str.tostring(q.hits) : "SWING HIGH"
+                    else if close > q.top
+                        q.dead  := true
+                        q.kind  := 2
+                        q.deadB := bar_index
+            else
+                if low < q.bot
+                    float pen = (q.bot - low) / unit
+                    if close > q.top and pen >= i_swpMinP and pen <= i_swpMaxP
+                        q.dead  := true
+                        q.kind  := 1
+                        q.deadB := bar_index
+                        nSweep  := nSweep + 1
+                        float qq = sweepQuality(false, q.bot, q.hits, q.grade)
+                        if qq > bus.dnQ
+                            bus.dnFire := true
+                            bus.dnLvl  := q.bot
+                            bus.dnExt  := low
+                            bus.dnQ    := qq
+                            bus.dnSrc  := str.length(q.tag) > 0 ? q.tag : q.hits >= 2 ? "EQL×" + str.tostring(q.hits) : "SWING LOW"
+                    else if close < q.bot
+                        q.dead  := true
+                        q.kind  := 2
+                        q.deadB := bar_index
+
+// housekeeping: retire stale pools, then cap the map
+if conf and pools.size() > 0
+    for i = pools.size() - 1 to 0
+        Pool q = pools.get(i)
+        if q.dead and not na(q.deadB) and bar_index - q.deadB > i_poolKeep
+            if not na(q.ln)
+                q.ln.delete()
+            if not na(q.lb)
+                q.lb.delete()
+            pools.remove(i)
+    while pools.size() > i_poolMax
+        Pool old = pools.shift()
+        if not na(old.ln)
+            old.ln.delete()
+        if not na(old.lb)
+            old.lb.delete()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 25 · CONFIRMED PASS ④  —  liquidity trendlines
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rebuild notes vs. the original engine:
+//   • exact projection y = y1 + slope·(x − x1)   (no incremental drift)
+//   • slope clamp                                 (kills near-vertical junk lines)
+//   • min/max pivot span                          (kills 2-bar "trendlines")
+//   • retro-validation on CLOSES                  (the line must actually have held)
+//   • independent state per side                  (the original shared one `broken`
+//     flag between bullish and bearish lines, so a break on one side silently
+//     re-validated the other)
+//   • grab vs. break separation                   (wick-through ≠ close-through)
+if conf and i_tlOn and not na(phTl) and phL.size() >= 2
+    Lvl aN = phL.get(0)
+    Lvl aP = phL.get(1)
+    int   span = aN.bar - aP.bar
+    float drop = aP.price - aN.price
+    if span >= i_tlMinSpan and span <= i_tlMaxSpan and drop > unit * 0.10
+        float slp = (aN.price - aP.price) / span
+        if math.abs(slp) <= i_tlSlope * unit
+            float half = i_tlPad * 0.1 * unit
+            int   back = bar_index - aP.bar
+            bool  ok   = back >= 1 and back <= i_tlMaxSpan + tlLen + 2
+            if ok
+                for k = 0 to back - 1
+                    float y = aP.price + slp * (bar_index - k - aP.bar)
+                    if close[k] > y + half
+                        ok := false
+                        break
+            float yNow = aP.price + slp * (bar_index - aP.bar)
+            if ok and yNow > close
+                chans.push(Chan.new(bull = false, y1 = aP.price, x1 = aP.bar, slp = slp, half = half, bornB = bar_index, anchB = aN.bar))
+                nTL := nTL + 1
+
+if conf and i_tlOn and not na(plTl) and plL.size() >= 2
+    Lvl aN = plL.get(0)
+    Lvl aP = plL.get(1)
+    int   span = aN.bar - aP.bar
+    float rise = aN.price - aP.price
+    if span >= i_tlMinSpan and span <= i_tlMaxSpan and rise > unit * 0.10
+        float slp = (aN.price - aP.price) / span
+        if math.abs(slp) <= i_tlSlope * unit
+            float half = i_tlPad * 0.1 * unit
+            int   back = bar_index - aP.bar
+            bool  ok   = back >= 1 and back <= i_tlMaxSpan + tlLen + 2
+            if ok
+                for k = 0 to back - 1
+                    float y = aP.price + slp * (bar_index - k - aP.bar)
+                    if close[k] < y - half
+                        ok := false
+                        break
+            float yNow = aP.price + slp * (bar_index - aP.bar)
+            if ok and yNow < close
+                chans.push(Chan.new(bull = true, y1 = aP.price, x1 = aP.bar, slp = slp, half = half, bornB = bar_index, anchB = aN.bar))
+                nTL := nTL + 1
+
+// keep only the newest N live lines per side
+if conf and i_tlOn and chans.size() > 0
+    int liveUp = 0
+    int liveDn = 0
+    for i = chans.size() - 1 to 0
+        Chan c = chans.get(i)
+        if not c.dead
+            if c.bull
+                liveUp := liveUp + 1
+                if liveUp > i_tlMax
+                    c.dead  := true
+                    c.deadB := bar_index
+            else
+                liveDn := liveDn + 1
+                if liveDn > i_tlMax
+                    c.dead  := true
+                    c.deadB := bar_index
+
+// interaction: age-out, grab, break
+if conf and i_tlOn and chans.size() > 0
+    for i = 0 to chans.size() - 1
+        Chan c = chans.get(i)
+        if not c.dead
+            float yt = c.topAt(bar_index)
+            float yb = c.botAt(bar_index)
+            if bar_index - c.bornB > i_tlMaxAge
+                c.dead  := true
+                c.deadB := bar_index
+            else if not c.bull
+                // descending resistance band sitting above price
+                if high > yt and close < yb
+                    c.dead  := true
+                    c.deadB := bar_index
+                    nSweep  := nSweep + 1
+                    float qq = sweepQuality(true, yt, 2, 1)
+                    if qq > bus.upQ
+                        bus.upFire := true
+                        bus.upLvl  := yt
+                        bus.upExt  := high
+                        bus.upQ    := qq
+                        bus.upSrc  := "TRENDLINE GRAB"
+                else if close > yt
+                    c.dead    := true
+                    c.deadB   := bar_index
+                    bus.tlUp  := true
+            else
+                // ascending support band sitting below price
+                if low < yb and close > yt
+                    c.dead  := true
+                    c.deadB := bar_index
+                    nSweep  := nSweep + 1
+                    float qq = sweepQuality(false, yb, 2, 1)
+                    if qq > bus.dnQ
+                        bus.dnFire := true
+                        bus.dnLvl  := yb
+                        bus.dnExt  := low
+                        bus.dnQ    := qq
+                        bus.dnSrc  := "TRENDLINE GRAB"
+                else if close < yb
+                    c.dead   := true
+                    c.deadB  := bar_index
+                    bus.tlDn := true
+
+// dispose of dead channels once their markers have had time to be read
+if conf and chans.size() > 0
+    for i = chans.size() - 1 to 0
+        Chan c = chans.get(i)
+        if c.dead and not na(c.deadB) and bar_index - c.deadB > 25
+            if not na(c.lf)
+                c.lf.delete()
+            if not na(c.la)
+                c.la.delete()
+            if not na(c.lb)
+                c.lb.delete()
+            chans.remove(i)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 26 · CONFIRMED PASS ⑤  —  market structure
+// ═══════════════════════════════════════════════════════════════════════════════
+if conf
+    swDir := swS.advance(phSw, plSw, swLen, i_useClose)
+    inDir := inS.advance(phIn, plIn, inLen, i_useClose)
+
+    if i_showSw and swDir != 0 and not na(swS.lvlB)
+        pushLn(stLn, line.new(swS.lvlB, swS.lvl, bar_index, swS.lvl, color = swDir > 0 ? cUp : cDn, style = line.style_dashed), 20)
+        pushLb(stLb, label.new(int(math.avg(swS.lvlB, bar_index)), swS.lvl, swS.choch ? "CHoCH" : "BOS",
+             style     = swDir > 0 ? label.style_label_down : label.style_label_up,
+             color     = color.new(swDir > 0 ? cUp : cDn, 15),
+             textcolor = color.white, size = size.tiny), 20)
+
+    if i_showIn and inDir != 0 and not na(inS.lvlB)
+        pushLn(stLn, line.new(inS.lvlB, inS.lvl, bar_index, inS.lvl, color = color.new(inDir > 0 ? cUp : cDn, 45), style = line.style_dotted), 20)
+        pushLb(stLb, label.new(int(math.avg(inS.lvlB, bar_index)), inS.lvl, inS.choch ? "iCHoCH" : "iBOS",
+             style     = inDir > 0 ? label.style_label_down : label.style_label_up,
+             color     = color.new(inDir > 0 ? cUp : cDn, 55),
+             textcolor = color.white, size = size.tiny), 20)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 27 · CONFIRMED PASS ⑥  —  imbalance & order blocks
+// ═══════════════════════════════════════════════════════════════════════════════
+if conf and i_fvgOn and bar_index > 3
+    float gT  = na
+    float gB  = na
+    bool  gU  = false
+    bool  hit = false
+    if low > high[2] and (low - high[2]) >= i_fvgMin * unit
+        gT  := low
+        gB  := high[2]
+        gU  := true
+        hit := true
+    else if high < low[2] and (low[2] - high) >= i_fvgMin * unit
+        gT  := low[2]
+        gB  := high
+        gU  := false
+        hit := true
+    if hit
+        zones.push(Zone.new(bull = gU, kind = 0, top = gT, bot = gB, b0 = bar_index - 2, cb = bar_index))
+        fvgUpNow := gU
+        fvgDnNow := not gU
+
+if conf and i_obOn and inDir != 0 and barBod >= i_disp * unit
+    int fnd = 0
+    for k = 1 to i_obLook
+        if (inDir > 0 and close[k] < open[k]) or (inDir < 0 and close[k] > open[k])
+            fnd := k
+            break
+    if fnd > 0
+        float zt = i_obBody ? math.max(open[fnd], close[fnd]) : high[fnd]
+        float zb = i_obBody ? math.min(open[fnd], close[fnd]) : low[fnd]
+        zones.push(Zone.new(bull = inDir > 0, kind = 1, top = zt, bot = zb, b0 = bar_index - fnd, cb = bar_index))
+
+// mitigation + cap
+if conf and zones.size() > 0
+    for i = zones.size() - 1 to 0
+        Zone z = zones.get(i)
+        if bar_index > nz(z.cb, bar_index)
+            float mitLvl = i_fvgMit == "Full" ? (z.bull ? z.bot : z.top) : i_fvgMit == "50%" ? (z.top + z.bot) * 0.5 : (z.bull ? z.top : z.bot)
+            if (z.bull and low <= mitLvl) or (not z.bull and high >= mitLvl)
+                if not na(z.bx)
+                    z.bx.delete()
+                zones.remove(i)
+    while zones.size() > i_zoneMax
+        Zone oldz = zones.shift()
+        if not na(oldz.bx)
+            oldz.bx.delete()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 28 · CONFIRMED PASS ⑦  —  outcome tracking of the live trade
+// ═══════════════════════════════════════════════════════════════════════════════
+// First-touch simulation. If the stop and TP1 are both inside the same bar the trade is
+// booked as a LOSS — intrabar sequence is unknowable from bar data and pretending
+// otherwise is how backtests lie.
+if conf and cur.live and bar_index > cur.b0
+    float rk  = math.max(math.abs(cur.en - cur.sl), tick)
+    float fav = cur.dir > 0 ? (high - cur.en) / rk : (cur.en - low) / rk
+    cur.mfe := math.max(cur.mfe, fav)
+    bool hitSL = cur.dir > 0 ? low  <= cur.sl : high >= cur.sl
+    bool hitT1 = cur.dir > 0 ? high >= cur.t1 : low  <= cur.t1
+    if hitSL
+        cur.live  := false
+        cur.state := -1
+        nTr       := nTr + 1
+        nLoss     := nLoss + 1
+        sumR      := sumR - 1.0
+        sumLoss   := sumLoss + 1.0
+    else if hitT1
+        float t1R = math.abs(cur.t1 - cur.en) / rk     // real R of TP1, not the assumed multiple
+        cur.live  := false
+        cur.state := 1
+        nTr       := nTr + 1
+        nWin      := nWin + 1
+        sumR      := sumR + t1R
+        sumWin    := sumWin + t1R
+    else if bar_index - cur.b0 >= i_maxHold
+        float rr = cur.dir > 0 ? (close - cur.en) / rk : (cur.en - close) / rk
+        cur.live  := false
+        cur.state := 2
+        nTr       := nTr + 1
+        sumR      := sumR + rr
+        if rr >= 0
+            nWin    := nWin + 1
+            sumWin  := sumWin + rr
+        else
+            nLoss   := nLoss + 1
+            sumLoss := sumLoss - rr
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 29 · CONFIRMED PASS ⑧  —  setup state machine & signal firing
+// ═══════════════════════════════════════════════════════════════════════════════
+// Nearest untouched opposing pool — the honest target, because that is where the
+// other side's stops (i.e. the liquidity your position needs to exit into) are sitting.
+nearestOpp(array<Pool> ps, bool wantHigh, float from, float minDist) =>
+    float best = na
+    if ps.size() > 0
+        for i = 0 to ps.size() - 1
+            Pool q = ps.get(i)
+            if not q.dead and q.isHigh == wantHigh
+                float lv = wantHigh ? q.bot : q.top
+                bool beyond = wantHigh ? lv >= from + minDist : lv <= from - minDist
+                if beyond and (na(best) or (wantHigh ? lv < best : lv > best))
+                    best := lv
+    best
+
+if conf and i_sigOn
+    // ① expire / invalidate
+    if setB.live and (bar_index - setB.b0 > i_confWin or close < setB.ext)
+        setB.live := false
+    if setS.live and (bar_index - setS.b0 > i_confWin or close > setS.ext)
+        setS.live := false
+
+    // ② arm from this bar's liquidity events
+    if bus.dnFire
+        setB.dir  := 1
+        setB.b0   := bar_index
+        setB.lvl  := bus.dnLvl
+        setB.ext  := bus.dnExt
+        setB.base := bus.dnQ
+        setB.src  := bus.dnSrc
+        setB.live := true
+    if bus.upFire
+        setS.dir  := -1
+        setS.b0   := bar_index
+        setS.lvl  := bus.upLvl
+        setS.ext  := bus.upExt
+        setS.base := bus.upQ
+        setS.src  := bus.upSrc
+        setS.live := true
+    if i_tlArm and bus.tlUp and not setB.live
+        setB.dir  := 1
+        setB.b0   := bar_index
+        setB.lvl  := close
+        setB.ext  := lo10
+        setB.base := 1.2
+        setB.src  := "TL BREAK"
+        setB.live := true
+    if i_tlArm and bus.tlDn and not setS.live
+        setS.dir  := -1
+        setS.b0   := bar_index
+        setS.lvl  := close
+        setS.ext  := hi10
+        setS.base := 1.2
+        setS.src  := "TL BREAK"
+        setS.live := true
+
+    // ③ hard gates
+    bool gateOK = kzOK and not na(atrRaw) and atrRaw >= i_minAtrU and atrRaw <= i_maxAtrU and (bar_index - lastSigB) >= i_cool and daySigs < i_maxDay and (not i_oneTrade or not cur.live)
+
+    // ④ LONG confirmation
+    if gateOK and setB.live and i_dirF != "Short only" and inDir == 1 and close > open
+        float  sc = setB.base
+        string tg = setB.src
+        sc := sc + (inS.choch ? 1.5 : 0.8)
+        tg := tg + (inS.choch ? " → CHoCH" : " → BOS")
+        if barBod >= i_disp * unit
+            sc := sc + 1.0
+            tg := tg + " · DISP"
+        if fvgUpNow
+            sc := sc + 0.8
+            tg := tg + " · FVG"
+        if htfDir == 1
+            sc := sc + 1.2
+            tg := tg + " · HTF↑"
+        else if htfDir == -1
+            sc := sc - 1.5
+        if inDisc
+            sc := sc + 0.8
+            tg := tg + " · DISCOUNT"
+        else if inPrem
+            sc := sc - 0.5
+        if inKZ
+            sc := sc + 0.7
+            tg := tg + " · " + sessName
+        if rvol >= i_volMult
+            sc := sc + 0.5
+        if swS.bias == 1
+            sc := sc + 0.5
+        if sc >= i_minScore and (not i_reqHtf or htfDir == 1)
+            float en = close
+            float sl = math.min(setB.ext, low) - math.max(i_slBuf * unit, i_slMinU)
+            float rk = en - sl
+            if rk >= i_slMinU and rk <= i_slMaxA * unit
+                float t1 = en + rk * i_rr1
+                float t2 = en + rk * i_rr2
+                float t3 = en + rk * i_rr3
+                if i_tpMode == "Opposing liquidity"
+                    float o1 = nearestOpp(pools, true, en, rk * 0.8)
+                    if not na(o1)
+                        t1 := o1
+                        float o2 = nearestOpp(pools, true, en, o1 - en + tick * 5)
+                        t2 := na(o2) ? en + rk * i_rr2 : o2
+                        t3 := math.max(t3, t2 + rk * 0.5)
+                if cur.live
+                    // rolling straight into a new signal: book the outstanding one at market
+                    // so the performance record never silently loses a trade
+                    float rkO = math.max(math.abs(cur.en - cur.sl), tick)
+                    float rrO = cur.dir > 0 ? (close - cur.en) / rkO : (cur.en - close) / rkO
+                    nTr  := nTr + 1
+                    sumR := sumR + rrO
+                    if rrO >= 0
+                        nWin   := nWin + 1
+                        sumWin := sumWin + rrO
+                    else
+                        nLoss   := nLoss + 1
+                        sumLoss := sumLoss - rrO
+                cur       := Trade.new(dir = 1, en = en, sl = sl, t1 = t1, t2 = t2, t3 = t3, b0 = bar_index, state = 0, score = sc, mfe = 0.0, tags = tg, live = true)
+                fireBuy   := true
+                lastSigB  := bar_index
+                daySigs   := daySigs + 1
+                lastDir   := 1
+                lastScore := sc
+                lastTags  := tg
+                setB.live := false
+                setS.live := false
+
+    // ⑤ SHORT confirmation
+    if gateOK and not fireBuy and setS.live and i_dirF != "Long only" and inDir == -1 and close < open
+        float  sc = setS.base
+        string tg = setS.src
+        sc := sc + (inS.choch ? 1.5 : 0.8)
+        tg := tg + (inS.choch ? " → CHoCH" : " → BOS")
+        if barBod >= i_disp * unit
+            sc := sc + 1.0
+            tg := tg + " · DISP"
+        if fvgDnNow
+            sc := sc + 0.8
+            tg := tg + " · FVG"
+        if htfDir == -1
+            sc := sc + 1.2
+            tg := tg + " · HTF↓"
+        else if htfDir == 1
+            sc := sc - 1.5
+        if inPrem
+            sc := sc + 0.8
+            tg := tg + " · PREMIUM"
+        else if inDisc
+            sc := sc - 0.5
+        if inKZ
+            sc := sc + 0.7
+            tg := tg + " · " + sessName
+        if rvol >= i_volMult
+            sc := sc + 0.5
+        if swS.bias == -1
+            sc := sc + 0.5
+        if sc >= i_minScore and (not i_reqHtf or htfDir == -1)
+            float en = close
+            float sl = math.max(setS.ext, high) + math.max(i_slBuf * unit, i_slMinU)
+            float rk = sl - en
+            if rk >= i_slMinU and rk <= i_slMaxA * unit
+                float t1 = en - rk * i_rr1
+                float t2 = en - rk * i_rr2
+                float t3 = en - rk * i_rr3
+                if i_tpMode == "Opposing liquidity"
+                    float o1 = nearestOpp(pools, false, en, rk * 0.8)
+                    if not na(o1)
+                        t1 := o1
+                        float o2 = nearestOpp(pools, false, en, en - o1 + tick * 5)
+                        t2 := na(o2) ? en - rk * i_rr2 : o2
+                        t3 := math.min(t3, t2 - rk * 0.5)
+                if cur.live
+                    // rolling straight into a new signal: book the outstanding one at market
+                    // so the performance record never silently loses a trade
+                    float rkO = math.max(math.abs(cur.en - cur.sl), tick)
+                    float rrO = cur.dir > 0 ? (close - cur.en) / rkO : (cur.en - close) / rkO
+                    nTr  := nTr + 1
+                    sumR := sumR + rrO
+                    if rrO >= 0
+                        nWin   := nWin + 1
+                        sumWin := sumWin + rrO
+                    else
+                        nLoss   := nLoss + 1
+                        sumLoss := sumLoss - rrO
+                cur       := Trade.new(dir = -1, en = en, sl = sl, t1 = t1, t2 = t2, t3 = t3, b0 = bar_index, state = 0, score = sc, mfe = 0.0, tags = tg, live = true)
+                fireSell  := true
+                lastSigB  := bar_index
+                daySigs   := daySigs + 1
+                lastDir   := -1
+                lastScore := sc
+                lastTags  := tg
+                setB.live := false
+                setS.live := false
+
+if conf
+    grabUp    := bus.upFire
+    grabDn    := bus.dnFire
+    tlBreakUp := bus.tlUp
+    tlBreakDn := bus.tlDn
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 30 · SIGNAL DRAWINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+sigRisk = math.abs(nz(cur.en, 0.0) - nz(cur.sl, 0.0))
+sigLots = sigRisk > 0 ? (i_acct * i_riskPct / 100.0) / math.max(sigRisk * i_ozLot, 0.0001) : 0.0
+
+if conf and (fireBuy or fireSell)
+    color cc = fireBuy ? cBuy : cSell
+    int   x2 = bar_index + i_lvlBars
+    if i_showLvl
+        pushLn(sgLn, line.new(bar_index, cur.en, x2, cur.en, color = cc, width = 2), i_keepTr * 5)
+        pushLn(sgLn, line.new(bar_index, cur.sl, x2, cur.sl, color = color.new(#ff1744, 15), style = line.style_dashed), i_keepTr * 5)
+        pushLn(sgLn, line.new(bar_index, cur.t1, x2, cur.t1, color = color.new(#00e676, 25), style = line.style_dotted), i_keepTr * 5)
+        pushLn(sgLn, line.new(bar_index, cur.t2, x2, cur.t2, color = color.new(#00e676, 45), style = line.style_dotted), i_keepTr * 5)
+        pushLn(sgLn, line.new(bar_index, cur.t3, x2, cur.t3, color = color.new(#00e676, 60), style = line.style_dotted), i_keepTr * 5)
+    string txt = (fireBuy ? "▲ BUY" : "▼ SELL") + (i_showScr ? "  ·  " + f2(cur.score) : "")
+         + "\n" + cur.tags
+         + "\nE " + fPx(cur.en) + "   SL " + fPx(cur.sl) + "  (risk $" + f2(math.abs(cur.en - cur.sl)) + ")"
+         + "\nT1 " + fPx(cur.t1) + "   T2 " + fPx(cur.t2) + "   T3 " + fPx(cur.t3)
+         + "\n" + f2(sigLots) + " lots  ·  " + f2(i_riskPct) + "% of " + str.tostring(i_acct, "#")
+    pushLb(sgLb, label.new(bar_index, fireBuy ? low - unit * 0.9 : high + unit * 0.9, txt,
+         style     = fireBuy ? label.style_label_up : label.style_label_down,
+         color     = color.new(cc, 6),
+         textcolor = color.white, size = size.small, textalign = text.align_left), i_keepTr)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 31 · VISUAL MAINTENANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+// Drawing objects are refreshed on every confirmed bar and on the live bar. Pine rolls
+// intrabar drawing state back on every tick, so this cosmetic layer can never leak into
+// the signal path above — the two are completely decoupled.
+drawNow = conf or barstate.islast
+
+if drawNow and i_poolOn and pools.size() > 0
+    for i = 0 to pools.size() - 1
+        Pool q = pools.get(i)
+        if q.hits >= i_poolMinH or q.grade > 0
+            float lv = q.isHigh ? q.top : q.bot
+            color pc = q.dead ? (q.kind == 1 ? cSwp : color.new(color.gray, 55)) : q.grade >= 2 ? cLiq : q.isHigh ? color.new(cDn, 20) : color.new(cUp, 20)
+            int   xe = q.dead ? q.deadB : bar_index + 3
+            if na(q.ln)
+                q.ln := line.new(q.b0, lv, xe, lv, color = pc, style = q.grade > 0 ? line.style_solid : line.style_dotted, width = q.grade >= 2 ? 2 : 1)
+            else
+                q.ln.set_xy1(q.b0, lv)
+                q.ln.set_xy2(xe, lv)
+                q.ln.set_color(pc)
+            if i_eqLbl
+                string t = q.dead and q.kind == 1 ? "SWEPT" : str.length(q.tag) > 0 ? q.tag : q.hits >= 2 ? (q.isHigh ? "EQH×" : "EQL×") + str.tostring(q.hits) : ""
+                if str.length(t) > 0
+                    if na(q.lb)
+                        q.lb := label.new(xe, lv, t, style = label.style_label_left, color = color.new(color.black, 100), textcolor = pc, size = size.tiny)
+                    else
+                        q.lb.set_xy(xe, lv)
+                        q.lb.set_text(t)
+                        q.lb.set_textcolor(pc)
+
+if drawNow and i_tlOn and chans.size() > 0
+    for i = 0 to chans.size() - 1
+        Chan c = chans.get(i)
+        int   xe  = c.dead ? c.deadB : bar_index + 2
+        float yt  = c.topAt(xe)
+        float yb  = c.botAt(xe)
+        float y1t = c.topAt(c.x1)
+        float y1b = c.botAt(c.x1)
+        color lc  = c.dead ? color.new(color.gray, 60) : c.bull ? cUp : cDn
+        if na(c.la)
+            c.la := line.new(c.x1, y1t, xe, yt, color = lc)
+            c.lb := line.new(c.x1, y1b, xe, yb, color = lc)
+            if i_tlFill
+                c.lf := linefill.new(c.la, c.lb, color.new(c.bull ? cUp : cDn, 88))
+        else
+            c.la.set_xy1(c.x1, y1t)
+            c.la.set_xy2(xe, yt)
+            c.la.set_color(lc)
+            c.lb.set_xy1(c.x1, y1b)
+            c.lb.set_xy2(xe, yb)
+            c.lb.set_color(lc)
+
+if drawNow and zones.size() > 0
+    for i = 0 to zones.size() - 1
+        Zone z = zones.get(i)
+        color zc = color.new(z.bull ? cUp : cDn, z.kind == 0 ? 85 : 72)
+        if na(z.bx)
+            z.bx := box.new(z.b0, z.top, bar_index + 2, z.bot, border_color = color.new(z.bull ? cUp : cDn, 60), bgcolor = zc, border_width = 1)
+        else
+            z.bx.set_right(bar_index + 2)
+
+// live day range — the two levels every intraday gold algo reaches for
+var line dayHiLn = na
+var line dayLoLn = na
+var int  dayB0   = 0
+if conf and newDay
+    dayB0 := bar_index
+if i_sesLine and barstate.islast and intra and not na(dHi)
+    if na(dayHiLn)
+        dayHiLn := line.new(dayB0, dHi, bar_index + 5, dHi, color = color.new(cLiq, 45), style = line.style_dashed)
+        dayLoLn := line.new(dayB0, dLo, bar_index + 5, dLo, color = color.new(cLiq, 45), style = line.style_dashed)
+    else
+        dayHiLn.set_xy1(dayB0, dHi)
+        dayHiLn.set_xy2(bar_index + 5, dHi)
+        dayLoLn.set_xy1(dayB0, dLo)
+        dayLoLn.set_xy2(bar_index + 5, dLo)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 32 · DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+dashPos = i_dashPos == "Top Right" ? position.top_right : i_dashPos == "Middle Right" ? position.middle_right : i_dashPos == "Bottom Right" ? position.bottom_right : i_dashPos == "Top Left" ? position.top_left : position.bottom_left
+dashSz  = i_dashSz == "Tiny" ? size.tiny : i_dashSz == "Normal" ? size.normal : size.small
+
+var table dash = table.new(dashPos, 2, 17, bgcolor = color.new(cBg, 8), border_color = color.new(cTxt, 82), border_width = 1, frame_color = color.new(cTxt, 70), frame_width = 1)
+
+cellK(int r, string s) => table.cell(dash, 0, r, s, text_color = color.new(cTxt, 35), text_size = dashSz, text_halign = text.align_left)
+cellV(int r, string s, color c) => table.cell(dash, 1, r, s, text_color = c, text_size = dashSz, text_halign = text.align_right)
+
+if i_dash and barstate.islast
+    float liqUp = nearestOpp(pools, true,  close, 0.0)
+    float liqDn = nearestOpp(pools, false, close, 0.0)
+    float rngPct = na(swHi.price) or na(swLo.price) or swHi.price <= swLo.price ? float(na) : 100.0 * (close - swLo.price) / (swHi.price - swLo.price)
+    int   liveTl = 0
+    if chans.size() > 0
+        for i = 0 to chans.size() - 1
+            Chan cD = chans.get(i)
+            if not cD.dead
+                liveTl := liveTl + 1
+    int livePool = 0
+    if pools.size() > 0
+        for i = 0 to pools.size() - 1
+            Pool pD = pools.get(i)
+            if not pD.dead
+                livePool := livePool + 1
+
+    string tradeSt = cur.live ? "RUNNING" : cur.state == 1 ? "TP1 HIT" : cur.state == -1 ? "STOPPED" : cur.state == 2 ? "TIME EXIT" : "—"
+    color  tradeCol= cur.live ? cLiq : cur.state == 1 ? cBuy : cur.state == -1 ? cSell : color.new(cTxt, 40)
+    string setupSt = setB.live ? "ARMED LONG (" + str.tostring(i_confWin - (bar_index - setB.b0)) + ")" : setS.live ? "ARMED SHORT (" + str.tostring(i_confWin - (bar_index - setS.b0)) + ")" : "—"
+    color  setupCol= setB.live ? cBuy : setS.live ? cSell : color.new(cTxt, 45)
+    float  winPct  = nTr > 0 ? 100.0 * nWin / nTr : float(na)
+    float  avgR    = nTr > 0 ? sumR / nTr : float(na)
+    float  pf      = sumLoss > 0 ? sumWin / sumLoss : float(na)
+    string regime  = na(atrRaw) ? "—" : atrRaw < i_minAtrU ? "DEAD" : atrRaw > i_maxAtrU ? "NEWS / CHAOS" : atrRaw > i_maxAtrU * 0.5 ? "EXPANDED" : "NORMAL"
+    color  regCol  = na(atrRaw) ? cTxt : (atrRaw < i_minAtrU or atrRaw > i_maxAtrU) ? cSell : cBuy
+
+    table.cell(dash, 0, 0, "AYA · XAU LIQUIDITY ENGINE", text_color = cLiq, text_size = dashSz, text_halign = text.align_left)
+    table.cell(dash, 1, 0, isM1 ? "M1" : "M5", text_color = cLiq, text_size = dashSz, text_halign = text.align_right)
+
+    cellK(1, "Instrument")
+    cellV(1, syminfo.ticker + " · " + timeframe.period, cTxt)
+    cellK(2, "Volatility")
+    cellV(2, "$" + f2(nz(atrRaw, 0)) + " · " + regime, regCol)
+    cellK(3, "Session")
+    cellV(3, sessName + (inKZ ? "  ◉KZ" : ""), inKZ ? cLiq : color.new(cTxt, 40))
+    cellK(4, "HTF bias " + i_htf + "/" + i_htf2)
+    cellV(4, htfDir > 0 ? "BULLISH ▲" : htfDir < 0 ? "BEARISH ▼" : "NEUTRAL ·", htfDir > 0 ? cBuy : htfDir < 0 ? cSell : cTxt)
+    cellK(5, "Swing structure")
+    cellV(5, swS.bias > 0 ? "BULLISH ▲" : swS.bias < 0 ? "BEARISH ▼" : "—", swS.bias > 0 ? cBuy : swS.bias < 0 ? cSell : cTxt)
+    cellK(6, "Internal structure")
+    cellV(6, inS.bias > 0 ? "BULLISH ▲" : inS.bias < 0 ? "BEARISH ▼" : "—", inS.bias > 0 ? cBuy : inS.bias < 0 ? cSell : cTxt)
+    cellK(7, "Dealing range")
+    cellV(7, na(rngPct) ? "—" : (inPrem ? "PREMIUM " : "DISCOUNT ") + str.tostring(rngPct, "#") + "%", inPrem ? cSell : cBuy)
+    cellK(8, "Liquidity above")
+    cellV(8, na(liqUp) ? "—" : fPx(liqUp) + "  (+$" + f2(liqUp - close) + ")", color.new(cDn, 10))
+    cellK(9, "Liquidity below")
+    cellV(9, na(liqDn) ? "—" : fPx(liqDn) + "  (−$" + f2(close - liqDn) + ")", color.new(cUp, 10))
+    cellK(10, "Map / trendlines")
+    cellV(10, str.tostring(livePool) + " pools · " + str.tostring(liveTl) + " live", cTxt)
+    cellK(11, "Grabs · lines built")
+    cellV(11, str.tostring(nSweep) + " · " + str.tostring(nTL), cSwp)
+    cellK(12, "Setup")
+    cellV(12, setupSt, setupCol)
+    cellK(13, "Last signal")
+    table.cell(dash, 1, 13, lastDir == 0 ? "—" : (lastDir > 0 ? "BUY " : "SELL ") + f2(lastScore) + " · " + tradeSt,
+         text_color = tradeCol, text_size = dashSz, text_halign = text.align_right,
+         tooltip = lastDir == 0 ? "No signal yet on this chart." : lastTags + "\nMFE so far: " + f2(cur.mfe) + "R")
+    cellK(14, "Position size")
+    cellV(14, lastDir == 0 ? "—" : f2(sigLots) + " lots · " + f2(sigRisk / pipSz) + "p · $" + f2(i_acct * i_riskPct / 100.0), cTxt)
+    cellK(15, i_stats ? "Record (first touch)" : "Record")
+    cellV(15, not i_stats or nTr == 0 ? "—" : str.tostring(nTr) + " · " + str.tostring(winPct, "#") + "% win", nTr == 0 ? cTxt : winPct >= 50 ? cBuy : cSell)
+    cellK(16, "Expectancy")
+    cellV(16, not i_stats or nTr == 0 ? "—" : str.tostring(avgR, "+0.00;-0.00") + "R · PF " + (na(pf) ? "∞" : f2(pf)), nTr == 0 ? cTxt : nz(avgR, 0) >= 0 ? cBuy : cSell)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⌗ 33 · PLOTS, BACKGROUNDS, ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(i_showPD ? eqLvl : na, "Equilibrium (50%)", color = color.new(cTxt, 55), style = plot.style_linebr)
+bgcolor(i_kzBg and inKZ ? color.new(cLiq, 95) : na, title = "Killzone shading")
+
+plotshape(fireBuy,                     "BUY",              shape.triangleup,   location.belowbar, cBuy,               size = size.tiny)
+plotshape(fireSell,                    "SELL",             shape.triangledown, location.abovebar, cSell,              size = size.tiny)
+plotshape(grabUp,                      "Liquidity grab ↑", shape.xcross,       location.abovebar, cSwp,               size = size.tiny)
+plotshape(grabDn,                      "Liquidity grab ↓", shape.xcross,       location.belowbar, cSwp,               size = size.tiny)
+plotshape(i_tlBreaks and tlBreakUp,    "Trendline break ↑",shape.triangleup,   location.belowbar, color.new(cUp, 35), size = size.tiny)
+plotshape(i_tlBreaks and tlBreakDn,    "Trendline break ↓",shape.triangledown, location.abovebar, color.new(cDn, 35), size = size.tiny)
+
+alertMsg(bool isBuy) =>
+    (isBuy ? "BUY " : "SELL ") + syminfo.ticker + " " + timeframe.period
+     + " | entry " + fPx(cur.en)
+     + " | SL " + fPx(cur.sl)
+     + " | TP1 " + fPx(cur.t1) + " TP2 " + fPx(cur.t2) + " TP3 " + fPx(cur.t3)
+     + " | risk $" + f2(math.abs(cur.en - cur.sl)) + " (" + f2(sigLots) + " lots)"
+     + " | score " + f2(cur.score)
+     + " | " + cur.tags
+
+if conf and fireBuy
+    alert(alertMsg(true), alert.freq_once_per_bar_close)
+if conf and fireSell
+    alert(alertMsg(false), alert.freq_once_per_bar_close)
+if conf and (grabUp or grabDn)
+    alert((grabUp ? "Liquidity GRAB above " : "Liquidity GRAB below ") + syminfo.ticker + " " + timeframe.period + " @ " + fPx(grabUp ? bus.upLvl : bus.dnLvl) + " (" + (grabUp ? bus.upSrc : bus.dnSrc) + ")", alert.freq_once_per_bar_close)
+
+alertcondition(fireBuy,             "AYA · BUY signal",       "AYA XAU Liquidity Engine: BUY confirmed")
+alertcondition(fireSell,            "AYA · SELL signal",      "AYA XAU Liquidity Engine: SELL confirmed")
+alertcondition(fireBuy or fireSell, "AYA · Any signal",       "AYA XAU Liquidity Engine: signal confirmed")
+alertcondition(grabUp,              "AYA · Sell-side grab",   "AYA XAU Liquidity Engine: highs swept")
+alertcondition(grabDn,              "AYA · Buy-side grab",    "AYA XAU Liquidity Engine: lows swept")
+alertcondition(tlBreakUp,           "AYA · Trendline break ↑","AYA XAU Liquidity Engine: liquidity trendline broken upward")
+alertcondition(tlBreakDn,           "AYA · Trendline break ↓","AYA XAU Liquidity Engine: liquidity trendline broken downward")
