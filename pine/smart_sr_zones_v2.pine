@@ -1,0 +1,1160 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// Smart SR Zones v2 — tracker-based rewrite
+// Derived from "Smart SR Zones [JOAT]" © officialjackofalltrades (MPL-2.0).
+// Original: https://www.tradingview.com/script/NXuV5E1i-Smart-SR-Zones-JOAT/
+//
+// v2 replaces the clear-and-rebuild clustering engine with a persistent
+// multi-object tracker modelled on an autonomy perception stack:
+//
+//   PERCEPTION   pivots -> feature vectors (volume, wick, post-pivot impulse),
+//                measured in the volatility units of their OWN bar
+//   ASSOCIATION  gated nearest-neighbour match of each detection to an
+//                existing track; recursive weighted-mean state update
+//   FUSION       feature prior + Laplace-smoothed outcome evidence, combined
+//                in log-odds space -> a calibrated P(hold)
+//   DECISION     hysteresis break logic (buffer + N-bar confirmation),
+//                polarity flip instead of blacklist, IoU non-max suppression
+//   VALIDATION   on-chart reliability diagram: predicted vs realised hold rate
+//
+//@version=6
+indicator(title       = "Smart SR Zones v2",
+          shorttitle  = "SSR v2",
+          overlay     = true,
+          max_lines_count  = 500,
+          max_boxes_count  = 500,
+          max_labels_count = 500,
+          max_bars_back    = 5000)
+
+
+// =====================================================================
+//  SECTION 1 - INPUTS
+// =====================================================================
+grpEngine  = "1 · Engine"
+grpPivot   = "2 · Detector (Custom preset)"
+grpTrack   = "3 · Tracker"
+grpBreak   = "4 · Break / test logic"
+grpScore   = "5 · Scoring weights"
+grpCtx     = "6 · Context (volume profile / HTF)"
+grpZOI     = "7 · Zone of Interest"
+grpStyle   = "8 · Style"
+grpDash    = "9 · Dashboard & validation"
+
+// --- Engine ---------------------------------------------------------
+preset = input.string("Auto", "Strength preset",
+     options = ["Auto", "Scalp", "Local", "Swing", "Major", "Custom"], group = grpEngine,
+     tooltip = "Auto scales the detector to the chart timeframe.\nScalp/Local/Swing/Major are fixed profiles.\nCustom exposes the detector parameters below.")
+
+noRepaint = input.bool(true, "Honest mode (draw zones from confirmation bar)", group = grpEngine,
+     tooltip = "ON  : a zone's box starts at the bar the pivot was CONFIRMED, which is what you could actually have traded.\nOFF : the box starts at the pivot bar itself, which looks better in hindsight but back-dates information you did not have.")
+
+confirmBarsOnly = input.bool(true, "Evaluate signals on closed bars only", group = grpEngine,
+     tooltip = "ON prevents intrabar flicker: tests, breaks and alerts only resolve on bar close.")
+
+zonesPerSide = input.int(5, "Zones drawn per side", minval = 1, maxval = 8, group = grpEngine,
+     tooltip = "Display limit only. The tracker keeps every level alive internally, so a zone falling off the list is no longer treated as 'dropped'.")
+
+minProb = input.float(0.0, "Hide zones below P(hold)", minval = 0.0, maxval = 0.9, step = 0.05, group = grpEngine,
+     tooltip = "Absolute quality gate. 0 shows everything the tracker holds; 0.6 shows only zones the model rates above a 60% hold probability.")
+
+hideFarAtr = input.float(14.0, "Hide zones farther than (x ATR)", minval = 0.0, maxval = 60.0, step = 1.0, group = grpEngine,
+     tooltip = "Distance gate in volatility units instead of percent, so it behaves the same on a $4 stock and on BTC. 0 disables.")
+
+// --- Detector (Custom) ----------------------------------------------
+pivLeftIn    = input.int(15,  "Left bars",  minval = 2, maxval = 100, group = grpPivot)
+pivRightIn   = input.int(8,   "Right bars", minval = 2, maxval = 50,  group = grpPivot)
+clusterTolIn = input.float(0.9, "Association gate (x ATR)", minval = 0.2, maxval = 3.0, step = 0.1, group = grpPivot,
+     tooltip = "Maximum distance, in ATR at the pivot's own bar, for a new pivot to be matched to an existing zone.")
+minSpacingIn = input.int(20,  "Minimum bars between touches", minval = 0, maxval = 200, group = grpPivot,
+     tooltip = "Pivots closer together than this are folded into ONE touch event. Unlike v1 they are still absorbed by the zone, so a level is never split in two by rapid re-tests.")
+
+// --- Tracker --------------------------------------------------------
+maxTracks   = input.int(36, "Track pool size", minval = 8, maxval = 60, group = grpTrack,
+     tooltip = "Total levels held in memory across both sides. When full, the weakest dead track is recycled first.")
+minPivots   = input.int(2,  "Minimum pivots to publish a zone", minval = 1, maxval = 8, group = grpTrack)
+staleBars   = input.int(400, "Retire after (bars with no evidence)", minval = 50, maxval = 3000, group = grpTrack,
+     tooltip = "A track with no new pivot and no test for this many bars is retired.")
+kSigma      = input.float(2.0, "Zone width (x sigma of members)", minval = 0.5, maxval = 4.0, step = 0.25, group = grpTrack,
+     tooltip = "Zone thickness is derived from how tightly its own pivots agree, not from a fixed ATR pad. Tight clusters draw thin zones; smeared clusters draw wide ones.")
+minPadAtr   = input.float(0.12, "Minimum half-width (x ATR)", minval = 0.02, maxval = 1.0, step = 0.02, group = grpTrack)
+maxPadAtr   = input.float(0.60, "Maximum half-width (x ATR)", minval = 0.10, maxval = 3.0, step = 0.05, group = grpTrack)
+mergeIoU    = input.float(0.55, "Merge zones above IoU", minval = 0.1, maxval = 0.95, step = 0.05, group = grpTrack,
+     tooltip = "Non-max suppression. Two same-side zones overlapping by more than this fraction are fused into one, summing their evidence.")
+
+// --- Break / test logic ---------------------------------------------
+breakAtr      = input.float(0.25, "Break buffer (x ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = grpBreak,
+     tooltip = "Close must clear the far edge by this much before a break is even considered. Kills the single-tick stop-run kill that v1 suffered from.")
+breakConfirm  = input.int(2, "Break confirmation bars", minval = 1, maxval = 10, group = grpBreak,
+     tooltip = "Consecutive closes beyond the buffered edge required to confirm a break.")
+breakVolMult  = input.float(1.0, "Break volume requirement (x average)", minval = 0.0, maxval = 4.0, step = 0.1, group = grpBreak,
+     tooltip = "Relative volume required on at least one bar of the break. 0 disables the volume filter.")
+holdAtr       = input.float(0.35, "Hold confirmation (x ATR away)", minval = 0.05, maxval = 3.0, step = 0.05, group = grpBreak,
+     tooltip = "After touching a zone, price must retreat this far from it to score the test as HELD.")
+resolveBars   = input.int(20, "Test resolution window (bars)", minval = 3, maxval = 200, group = grpBreak,
+     tooltip = "A test that neither holds nor breaks inside this window is scored as UNRESOLVED and contributes no evidence.")
+testCooldown  = input.int(5, "Bars between separate tests", minval = 0, maxval = 100, group = grpBreak)
+maxFlips      = input.int(2, "Retire after N polarity flips", minval = 1, maxval = 6, group = grpBreak,
+     tooltip = "A broken zone flips role (resistance <-> support) instead of being blacklisted. After this many flips the level is considered noise and retired.")
+flipDecay     = input.float(0.55, "Evidence kept through a flip", minval = 0.1, maxval = 1.0, step = 0.05, group = grpBreak)
+
+// --- Scoring weights ------------------------------------------------
+wCount   = input.float(1.0, "Weight · pivot count",       minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wVol     = input.float(1.2, "Weight · relative volume",   minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wWick    = input.float(0.8, "Weight · rejection wick",    minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wImp     = input.float(1.0, "Weight · post-pivot impulse",minval = 0, maxval = 3, step = 0.1, group = grpScore,
+     tooltip = "How violently price left the level after it printed. The single most predictive pivot feature and the one v1 had no notion of.")
+wTight   = input.float(0.7, "Weight · cluster tightness",  minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wRecent  = input.float(0.8, "Weight · recency",            minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wHVN     = input.float(1.0, "Weight · volume-profile node",minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wHTF     = input.float(0.9, "Weight · higher-TF confluence",minval = 0, maxval = 3, step = 0.1, group = grpScore)
+wRound   = input.float(0.3, "Weight · round number",       minval = 0, maxval = 3, step = 0.1, group = grpScore)
+
+logitK   = input.float(4.2, "Prior sharpness", minval = 0.5, maxval = 12.0, step = 0.2, group = grpScore,
+     tooltip = "How strongly the feature score is converted into log-odds. Higher = more opinionated priors.")
+logitMid = input.float(0.42, "Prior neutral point", minval = 0.1, maxval = 0.9, step = 0.02, group = grpScore,
+     tooltip = "Feature score that maps to a 50/50 prior.")
+evW      = input.float(0.9, "Evidence weight", minval = 0.0, maxval = 3.0, step = 0.1, group = grpScore,
+     tooltip = "How much realised held/broke outcomes on THIS level move the probability. 0 = pure feature model.")
+evAlpha  = input.float(1.0, "Evidence smoothing (Laplace alpha)", minval = 0.25, maxval = 5.0, step = 0.25, group = grpScore)
+
+// --- Context --------------------------------------------------------
+vpEnable  = input.bool(true, "Use volume profile", group = grpCtx,
+     tooltip = "Levels sitting on a high-volume node carry real inventory. Pivot geometry alone does not know this.")
+vpLook    = input.int(400, "Profile lookback (bars)", minval = 60, maxval = 1000, group = grpCtx)
+vpBinsN   = input.int(60,  "Profile bins", minval = 20, maxval = 150, group = grpCtx)
+vpRefresh = input.int(25,  "Profile refresh (bars)", minval = 5, maxval = 200, group = grpCtx,
+     tooltip = "Rebuild cadence. Lower is fresher and slower.")
+
+htfEnable = input.bool(true, "Use higher-timeframe confluence", group = grpCtx)
+htfInput  = input.timeframe("", "Higher timeframe (blank = auto)", group = grpCtx)
+htfL      = input.int(8, "HTF left bars",  minval = 2, maxval = 30, group = grpCtx)
+htfR      = input.int(4, "HTF right bars", minval = 2, maxval = 30, group = grpCtx)
+htfTolAtr = input.float(0.8, "HTF match tolerance (x ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpCtx)
+
+roundEnable = input.bool(true, "Use round-number magnetism", group = grpCtx)
+
+// --- Zone of Interest -----------------------------------------------
+zoiEnable = input.bool(true, "Enable Zone of Interest highlight", group = grpZOI)
+zoiMinProb= input.float(0.62, "Minimum P(hold)", minval = 0.3, maxval = 0.95, step = 0.02, group = grpZOI,
+     tooltip = "v1 required touches == minTouches exactly, so a strong 5-touch level could never qualify. v2 gates on the calibrated probability instead.")
+zoiMaxTests = input.int(1, "Maximum resolved tests", minval = 0, maxval = 6, group = grpZOI,
+     tooltip = "The 'untouched' half of the idea: how many times the level may already have been traded and still count as unspent.")
+zoiQuiet  = input.int(20, "Minimum bars since last touch", minval = 0, maxval = 400, group = grpZOI)
+zoiHVN    = input.float(0.45, "Minimum volume-profile node score", minval = 0.0, maxval = 1.0, step = 0.05, group = grpZOI)
+zoiGlowCol= input.color(#DEB887, "Glow color", group = grpZOI)
+zoiBorderW= input.int(2, "Glow border width", minval = 1, maxval = 4, group = grpZOI)
+zoiLabel  = input.bool(true, "Show 'ZOI' tag", group = grpZOI)
+
+// --- Style ----------------------------------------------------------
+useThemeColors = input.bool(true, "Use theme colors", group = grpStyle)
+resColorIn = input.color(color.rgb(244, 67, 79),  "Resistance color (manual)", group = grpStyle)
+supColorIn = input.color(color.rgb(38, 166, 154), "Support color (manual)",    group = grpStyle)
+showLabels = input.bool(true,  "Show zone label", group = grpStyle)
+showProb   = input.bool(true,  "Show P(hold) in label", group = grpStyle)
+showVolText= input.bool(true,  "Show volume in label", group = grpStyle)
+singleLine = input.bool(false, "Single line label", group = grpStyle)
+zoneOpacity= input.int(84, "Base zone opacity", minval = 55, maxval = 96, group = grpStyle,
+     tooltip = "Opacity of the weakest drawn zone. Stronger zones become progressively more solid, driven by calibrated probability rather than raw volume.")
+showHistory= input.bool(false, "Show retired zones", group = grpStyle)
+showFlips  = input.bool(true,  "Mark polarity flips", group = grpStyle)
+showTests  = input.bool(false, "Mark resolved tests", group = grpStyle)
+brokenBull = input.color(color.rgb(105, 140, 125), "Retired support color", group = grpStyle)
+brokenBear = input.color(color.rgb(165, 105, 110), "Retired resistance color", group = grpStyle)
+brokenOp   = input.int(88, "Retired zone opacity", minval = 30, maxval = 95, group = grpStyle)
+
+// --- Dashboard ------------------------------------------------------
+showDash   = input.bool(true, "Show dashboard", group = grpDash)
+dashPosStr = input.string("Top Right", "Dashboard position",
+     options = ["Top Right","Top Left","Top Center","Middle Right","Middle Left","Middle Center","Bottom Right","Bottom Left","Bottom Center"], group = grpDash)
+dashSizeStr= input.string("Small", "Dashboard text size",
+     options = ["Tiny","Small","Normal","Large","Huge"], group = grpDash)
+showCalib  = input.bool(true, "Show reliability (predicted vs realised)", group = grpDash,
+     tooltip = "Shadow-mode validation. Every resolved test is logged into the probability bucket it was predicted from, and the panel reports how often those predictions actually held. If predicted and realised drift apart, the model is miscalibrated on this symbol and you should trust the stars less.")
+
+
+// =====================================================================
+//  SECTION 2 - PALETTE
+// =====================================================================
+const color C_BULL   = #8FBC8F
+const color C_BEAR   = #A0522D
+const color C_ACCENT = #DEB887
+const color C_BG     = #2E8B57
+const color C_FRAME  = #1F4A38
+
+color resColor = useThemeColors ? C_BEAR : resColorIn
+color supColor = useThemeColors ? C_BULL : supColorIn
+
+
+// =====================================================================
+//  SECTION 3 - PURE HELPERS
+// =====================================================================
+f_clampF(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+f_clampI(int   x, int   lo, int   hi) => math.max(lo, math.min(hi, x))
+
+// Saturating 0..1 transfer. k is the value at which the feature reaches ~63%.
+f_sat(float x, float k) =>
+    v = na(x) or x <= 0 ? 0.0 : x
+    kk = k <= 0 ? 1.0 : k
+    1.0 - math.exp(-v / kk)
+
+f_sigmoid(float z) =>
+    zz = f_clampF(z, -30.0, 30.0)
+    1.0 / (1.0 + math.exp(-zz))
+
+// Interval intersection-over-union in price space (the NMS metric).
+f_iou(float aLo, float aHi, float bLo, float bHi) =>
+    inter = math.max(0.0, math.min(aHi, bHi) - math.max(aLo, bLo))
+    uni   = math.max(aHi, bHi) - math.min(aLo, bLo)
+    uni <= 0 ? 0.0 : inter / uni
+
+strToPos(string s) =>
+    switch s
+        "Top Right"     => position.top_right
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Middle Right"  => position.middle_right
+        "Middle Left"   => position.middle_left
+        "Middle Center" => position.middle_center
+        =>                 position.top_right
+
+strToSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        =>          size.small
+
+formatVolume(float v) =>
+    string o = ""
+    if na(v)
+        o := "-"
+    else if v >= 1e9
+        o := str.tostring(v / 1e9, "#.##") + "B"
+    else if v >= 1e6
+        o := str.tostring(v / 1e6, "#.##") + "M"
+    else if v >= 1e3
+        o := str.tostring(v / 1e3, "#.##") + "K"
+    else
+        o := str.tostring(v, "#.##")
+    o
+
+// Absolute star bands. v1 rated relative to the strongest zone on screen,
+// so a chart of nothing but junk still showed three stars.
+probStars(float p) =>
+    na(p) ? "-" : p >= 0.70 ? "★★★" : p >= 0.55 ? "★★" : "★"
+
+safeStartBar(int b) =>
+    minSafe = bar_index - 4800
+    na(b) ? bar_index : (b < minSafe ? minSafe : b)
+
+distancePct(float centerPx, float refPx) =>
+    refPx == 0.0 or na(refPx) or na(centerPx) ? na : math.abs(centerPx - refPx) / refPx * 100.0
+
+
+// =====================================================================
+//  SECTION 4 - CONTEXT: volatility regime, volume availability, presets
+// =====================================================================
+int tfSec = timeframe.in_seconds()
+
+atrSlow = ta.atr(50)
+atrFast = ta.atr(14)
+volSma  = ta.sma(volume, 50)
+
+// Does this instrument actually report volume? Forex/CFD/index feeds often
+// do not, and v1 silently degraded to "every pivot weighs 1.0" while still
+// advertising a volume-based score.
+bool volFeedOk = not na(volSma) and volSma > 0
+
+// Fallback participation proxy when there is no volume: normalised true range.
+float partNow  = volFeedOk ? volume : (high - low)
+float partBase = volFeedOk ? volSma : ta.sma(high - low, 50)
+
+// Volatility regime, used to widen/tighten the tracker in fast markets.
+float atrPct    = close > 0 and not na(atrSlow) ? atrSlow / close * 100.0 : na
+float regimeRat = not na(atrFast) and not na(atrSlow) and atrSlow > 0 ? atrFast / atrSlow : 1.0
+string regimeTxt = na(regimeRat) ? "-" : regimeRat > 1.25 ? "Expanding" : regimeRat < 0.8 ? "Compressing" : "Neutral"
+
+// --- Auto preset: scale the detector to the chart's bar rate ---------
+int   autoLeft  = tfSec <= 300 ? 6   : tfSec <= 3600 ? 10  : tfSec <= 14400 ? 14 : 20
+int   autoRight = tfSec <= 300 ? 3   : tfSec <= 3600 ? 5   : tfSec <= 14400 ? 7  : 10
+float autoTol   = tfSec <= 300 ? 0.45: tfSec <= 3600 ? 0.65: tfSec <= 14400 ? 0.85: 1.1
+int   autoSpace = tfSec <= 300 ? 6   : tfSec <= 3600 ? 12  : tfSec <= 14400 ? 18 : 30
+
+int pivLeft    = preset == "Auto" ? autoLeft  : preset == "Scalp" ? 4   : preset == "Local" ? 6   : preset == "Swing" ? 15  : preset == "Major" ? 35  : pivLeftIn
+int pivRight   = preset == "Auto" ? autoRight : preset == "Scalp" ? 2   : preset == "Local" ? 4   : preset == "Swing" ? 8   : preset == "Major" ? 15  : pivRightIn
+float clusterTol = preset == "Auto" ? autoTol : preset == "Scalp" ? 0.4 : preset == "Local" ? 0.5 : preset == "Swing" ? 0.9 : preset == "Major" ? 1.4 : clusterTolIn
+int minSpacing = preset == "Auto" ? autoSpace : preset == "Scalp" ? 4   : preset == "Local" ? 8   : preset == "Swing" ? 20  : preset == "Major" ? 50  : minSpacingIn
+
+// Recency half-life scaled to the detector, not a hardcoded 200 bars.
+float decayBars = math.max(60.0, pivLeft * 18.0)
+
+bool dataReady = not na(atrSlow) and atrSlow > 0
+bool barOk     = confirmBarsOnly ? barstate.isconfirmed : true
+
+
+// =====================================================================
+//  SECTION 5 - CONTEXT LAYER A: rolling volume profile
+// ---------------------------------------------------------------------
+//  Pivot geometry tells you where price TURNED. It says nothing about
+//  where size actually changed hands. A level that coincides with a
+//  high-volume node has real inventory parked on it and behaves very
+//  differently from an identical-looking swing high in thin air.
+// =====================================================================
+var array<float> vpBins = array.new<float>(vpBinsN, 0.0)
+var float vpLo   = na
+var float vpHi   = na
+var float vpMax  = 0.0
+var float vpBinW = na
+
+bool vpDue = vpEnable and dataReady and bar_index > vpLook + 5 and (na(vpLo) or bar_index % vpRefresh == 0)
+
+if vpDue
+    float hiR = ta.highest(high, vpLook)
+    float loR = ta.lowest(low,  vpLook)
+    if not na(hiR) and not na(loR) and hiR > loR
+        vpLo   := loR
+        vpHi   := hiR
+        vpBinW := (hiR - loR) / vpBinsN
+        for b = 0 to vpBinsN - 1
+            vpBins.set(b, 0.0)
+        // Each bar contributes its participation to three price points
+        // (high / low / close). Cheap stand-in for a full range spread and
+        // stable enough for a node score.
+        for i = 0 to vpLook - 1
+            float w = nz(volFeedOk ? volume[i] : (high[i] - low[i]), 0.0) / 3.0
+            if w > 0
+                int bH = f_clampI(int((high[i]  - vpLo) / vpBinW), 0, vpBinsN - 1)
+                int bL = f_clampI(int((low[i]   - vpLo) / vpBinW), 0, vpBinsN - 1)
+                int bC = f_clampI(int((close[i] - vpLo) / vpBinW), 0, vpBinsN - 1)
+                vpBins.set(bH, vpBins.get(bH) + w)
+                vpBins.set(bL, vpBins.get(bL) + w)
+                vpBins.set(bC, vpBins.get(bC) + w)
+        float mx = 0.0
+        for b = 0 to vpBinsN - 1
+            mx := math.max(mx, vpBins.get(b))
+        vpMax := mx
+
+// Node score in 0..1 for an arbitrary price. Smoothed across the
+// neighbouring bins so a zone straddling a bin edge is not penalised.
+hvnAt(float px) =>
+    float outv = 0.0
+    if vpEnable and not na(vpLo) and not na(vpBinW) and vpBinW > 0 and vpMax > 0 and not na(px)
+        int   b  = f_clampI(int((px - vpLo) / vpBinW), 0, vpBinsN - 1)
+        int   bm = f_clampI(b - 1, 0, vpBinsN - 1)
+        int   bp = f_clampI(b + 1, 0, vpBinsN - 1)
+        float v  = vpBins.get(b) * 0.5 + vpBins.get(bm) * 0.25 + vpBins.get(bp) * 0.25
+        outv := f_clampF(v / vpMax, 0.0, 1.0)
+    outv
+
+
+// =====================================================================
+//  SECTION 6 - CONTEXT LAYER B: higher-timeframe confluence
+// =====================================================================
+string autoHtf = tfSec <= 60 ? "15" : tfSec <= 300 ? "60" : tfSec <= 900 ? "240" : tfSec <= 3600 ? "D" : tfSec <= 14400 ? "D" : tfSec <= 86400 ? "W" : "M"
+string htfPick = htfInput == "" ? autoHtf : htfInput
+string htfTf   = timeframe.in_seconds(htfPick) >= tfSec ? htfPick : autoHtf
+
+[htfPH, htfPL] = request.security(syminfo.tickerid, htfTf,
+     [ta.pivothigh(high, htfL, htfR), ta.pivotlow(low, htfL, htfR)],
+     lookahead = barmerge.lookahead_off)
+
+var array<float> htfLevels = array.new<float>()
+
+pushHtf(float px) =>
+    bool added = false
+    if htfEnable and not na(px) and px > 0
+        bool dup = false
+        if htfLevels.size() > 0
+            float tol = nz(atrSlow, 0.0) * 0.25
+            for i = 0 to htfLevels.size() - 1
+                if math.abs(htfLevels.get(i) - px) <= tol
+                    dup := true
+                    break
+        if not dup
+            htfLevels.push(px)
+            if htfLevels.size() > 40
+                htfLevels.shift()
+            added := true
+    added
+
+if barstate.isconfirmed
+    bool _pH = pushHtf(htfPH)
+    bool _pL = pushHtf(htfPL)
+
+// 1.0 on an exact HTF level, decaying linearly to 0 at the tolerance edge.
+htfConfAt(float px) =>
+    float best = 0.0
+    if htfEnable and htfLevels.size() > 0 and not na(px)
+        float tol = nz(atrSlow, 0.0) * htfTolAtr
+        if tol > 0
+            for i = 0 to htfLevels.size() - 1
+                float d = math.abs(htfLevels.get(i) - px)
+                if d <= tol
+                    best := math.max(best, 1.0 - d / tol)
+    best
+
+
+// =====================================================================
+//  SECTION 7 - CONTEXT LAYER C: round-number magnetism
+// =====================================================================
+roundScoreAt(float px) =>
+    float outv = 0.0
+    if roundEnable and not na(px) and px > 0 and not na(atrSlow) and atrSlow > 0
+        float mag  = math.pow(10.0, math.floor(math.log10(px)))
+        float step = mag / 4.0
+        if step > 0
+            float d   = math.abs(px - math.round(px / step) * step)
+            float tol = atrSlow * 0.35
+            outv := tol > 0 ? f_clampF(1.0 - d / tol, 0.0, 1.0) : 0.0
+    outv
+
+
+// =====================================================================
+//  SECTION 8 - PERCEPTION: pivot detection with a feature vector
+// ---------------------------------------------------------------------
+//  Every detection carries the volatility of its OWN bar. v1 clustered
+//  ten-year-old pivots using today's ATR, so a level formed in a quiet
+//  regime got re-measured with a wide ruler after a volatility expansion
+//  (and vice versa). Scale must travel with the measurement.
+// =====================================================================
+int pr1 = math.max(1, pivRight)
+
+phPx = ta.pivothigh(high, pivLeft, pivRight)
+plPx = ta.pivotlow(low,   pivLeft, pivRight)
+
+float atrAtPiv = nz(atrSlow[pr1], atrSlow)
+
+// Participation over a 3-bar window centred on the pivot, normalised by the
+// baseline as it stood THEN. v1 used a single bar's raw volume.
+float partWin  = nz(partNow[pr1 + 1], 0.0) + nz(partNow[pr1], 0.0) + nz(partNow[pr1 - 1], 0.0)
+float partRef  = nz(partBase[pr1], 0.0) * 3.0
+float relVolPv = partRef > 0 ? partWin / partRef : 1.0
+
+float upWickPv = nz(high[pr1] - math.max(open[pr1], close[pr1]), 0.0)
+float dnWickPv = nz(math.min(open[pr1], close[pr1]) - low[pr1], 0.0)
+
+// Post-pivot impulse: how hard price left the level over the confirmation
+// window, in ATR units. This is the feature that separates a level price
+// fled from (real) from a level price drifted past (noise). v1 had nothing
+// equivalent - it scored the candle, never the reaction.
+float awayLow  = ta.lowest(low,   pr1)
+float awayHigh = ta.highest(high, pr1)
+
+
+// =====================================================================
+//  SECTION 9 - TRACK MODEL
+// ---------------------------------------------------------------------
+//  A level is a persistent object with its own state, not a row that gets
+//  wiped and re-derived on every pivot. Role (support vs resistance) is a
+//  DERIVED property of where price currently sits, so a broken resistance
+//  becomes a tracked support automatically instead of being blacklisted.
+// =====================================================================
+type Zone
+    int   id
+    float center
+    float halfW
+    float m2         // weighted sum of squared deviations (Welford)
+    float wsum       // total member weight
+    int   hits       // distinct touch events that seeded it
+    int   firstBar
+    int   confBar
+    int   lastPivBar
+    int   lastTouch
+    float volSum
+    float fVol       // weighted mean relative volume
+    float fWick      // weighted mean wick / ATR
+    float fImp       // weighted mean post-pivot impulse / ATR
+    bool  isRes      // derived each bar
+    int   tState     // 0 idle, 1 test in progress
+    int   tStart
+    int   brkRun
+    bool  tFromBelow
+    bool  tVolOk
+    float tProb      // probability predicted at the moment the test began
+    int   nHeldRes
+    int   nBrokeRes
+    int   nHeldSup
+    int   nBrokeSup
+    int   nUnres
+    int   realTouch
+    int   lastTestBar
+    bool  alive
+    int   diedBar
+    bool  wasBroken
+    int   flips
+    int   lastFlipBar
+    float score
+    float prob
+    bool  isZOI
+    int   zoiSince
+    float hvn
+    float htf
+    float rnd
+
+var array<Zone> pool   = array.new<Zone>()
+var array<int>  idReg  = array.new<int>(1, 0)
+
+// Reliability diagram: five predicted-probability buckets, each counting
+// how many tests were logged and how many actually held.
+var array<int> calN   = array.new<int>(5, 0)
+var array<int> calHit = array.new<int>(5, 0)
+
+// Quality weight of a single detection. Bounded so one freak candle cannot
+// dominate a level's entire state.
+pivWeight(float relVol, float wickR, float imp) =>
+    float w = 0.5 + nz(relVol, 1.0) * 0.5 + f_clampF(nz(wickR, 0.0), 0.0, 3.0) * 0.3 + f_clampF(nz(imp, 0.0), 0.0, 6.0) * 0.3
+    f_clampF(w, 0.2, 4.0)
+
+// Recompute the drawn width from the dispersion of the level's own members,
+// clamped into a sane ATR band. Tight agreement draws a thin zone; a smeared
+// cluster honestly draws a wide one. v1 gave every zone the same 0.5*ATR box.
+refreshWidth(Zone z, float atrRef) =>
+    float v  = z.wsum > 0 ? math.max(0.0, z.m2 / z.wsum) : 0.0
+    float sd = math.sqrt(v)
+    float lo = minPadAtr * atrRef
+    float hi = math.max(lo, maxPadAtr * atrRef)
+    z.halfW := f_clampF(kSigma * sd, lo, hi)
+    z.halfW
+
+mkZone(float px, int bar, int cbar, float atrAt, float relVol, float wickR, float imp, float rawVol) =>
+    int nid = idReg.get(0) + 1
+    idReg.set(0, nid)
+    float w = pivWeight(relVol, wickR, imp)
+    Zone z = Zone.new(id = nid, center = px, halfW = minPadAtr * atrAt, m2 = 0.0, wsum = w,
+         hits = 1, firstBar = bar, confBar = cbar, lastPivBar = bar, lastTouch = na,
+         volSum = nz(rawVol, 0.0), fVol = nz(relVol, 1.0), fWick = nz(wickR, 0.0), fImp = nz(imp, 0.0),
+         isRes = px > close, tState = 0, tStart = na, brkRun = 0, tFromBelow = false, tVolOk = false, tProb = na,
+         nHeldRes = 0, nBrokeRes = 0, nHeldSup = 0, nBrokeSup = 0, nUnres = 0, realTouch = 0, lastTestBar = na,
+         alive = true, diedBar = na, wasBroken = false, flips = 0, lastFlipBar = na,
+         score = 0.0, prob = 0.5, isZOI = false, zoiSince = na, hvn = 0.0, htf = 0.0, rnd = 0.0)
+    float _w0 = refreshWidth(z, atrAt)
+    z
+
+// Recursive weighted-mean + Welford variance update. O(1) per detection,
+// against v1's full O(n^2) re-cluster of the entire pivot buffer.
+absorb(Zone z, float px, int bar, float atrRef, float relVol, float wickR, float imp, float rawVol, bool newEvent) =>
+    float w     = pivWeight(relVol, wickR, imp)
+    float wNew  = z.wsum + w
+    float delta = px - z.center
+    z.center := z.center + (w / wNew) * delta
+    z.m2     := z.m2 + w * delta * (px - z.center)
+    z.wsum   := wNew
+    z.fVol   := z.fVol + (w / wNew) * (nz(relVol, 1.0) - z.fVol)
+    z.fWick  := z.fWick + (w / wNew) * (nz(wickR, 0.0) - z.fWick)
+    z.fImp   := z.fImp + (w / wNew) * (nz(imp, 0.0) - z.fImp)
+    z.volSum := z.volSum + nz(rawVol, 0.0)
+    z.lastPivBar := bar
+    if newEvent
+        z.hits := z.hits + 1
+    float _w1 = refreshWidth(z, atrRef)
+    z.center
+
+// Pool insertion with recycling: dead tracks go first, then the weakest
+// live one. v1's FIFO shift dropped the OLDEST history regardless of value.
+poolAdd(Zone z) =>
+    int slot = -1
+    if pool.size() < maxTracks
+        pool.push(z)
+        slot := pool.size() - 1
+    else
+        int   worst = -1
+        float worstV = 1e18
+        for i = 0 to pool.size() - 1
+            Zone c = pool.get(i)
+            float v = c.alive ? (c.prob * 100.0 + c.wsum) : -1.0 * (bar_index - nz(c.diedBar, 0))
+            if v < worstV
+                worstV := v
+                worst := i
+        if worst >= 0
+            pool.set(worst, z)
+            slot := worst
+    slot
+
+// Gated nearest-neighbour association. The gate widens with the track's own
+// width so a level that legitimately spans a band keeps collecting its
+// pivots instead of spawning a duplicate next to itself.
+associate(float px, float atrAt) =>
+    int   best  = -1
+    float bestD = 1e18
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone c = pool.get(i)
+            if c.alive
+                float gate = math.max(atrAt * clusterTol, c.halfW * 1.5)
+                float d    = math.abs(c.center - px)
+                if d <= gate and d < bestD
+                    bestD := d
+                    best  := i
+    best
+
+// --- Detection ingest ------------------------------------------------
+bool newPivot = false
+
+if dataReady and barOk
+    if not na(phPx) and phPx > 0
+        float impH = atrAtPiv > 0 ? (phPx - nz(awayLow, phPx)) / atrAtPiv : 0.0
+        float wkH  = atrAtPiv > 0 ? upWickPv / atrAtPiv : 0.0
+        float rvH  = nz(volFeedOk ? volume[pr1] : (high[pr1] - low[pr1]), 0.0)
+        int   idxH = associate(phPx, atrAtPiv)
+        if idxH >= 0
+            Zone tH = pool.get(idxH)
+            bool newEvtH = na(tH.lastPivBar) or (bar_index - pr1 - tH.lastPivBar) >= minSpacing
+            float _aH = absorb(tH, phPx, bar_index - pr1, nz(atrSlow, atrAtPiv), relVolPv, wkH, impH, rvH, newEvtH)
+        else
+            int _sH = poolAdd(mkZone(phPx, bar_index - pr1, bar_index, atrAtPiv, relVolPv, wkH, impH, rvH))
+        newPivot := true
+
+    if not na(plPx) and plPx > 0
+        float impL = atrAtPiv > 0 ? (nz(awayHigh, plPx) - plPx) / atrAtPiv : 0.0
+        float wkL  = atrAtPiv > 0 ? dnWickPv / atrAtPiv : 0.0
+        float rvL  = nz(volFeedOk ? volume[pr1] : (high[pr1] - low[pr1]), 0.0)
+        int   idxL = associate(plPx, atrAtPiv)
+        if idxL >= 0
+            Zone tL = pool.get(idxL)
+            bool newEvtL = na(tL.lastPivBar) or (bar_index - pr1 - tL.lastPivBar) >= minSpacing
+            float _aL = absorb(tL, plPx, bar_index - pr1, nz(atrSlow, atrAtPiv), relVolPv, wkL, impL, rvL, newEvtL)
+        else
+            int _sL = poolAdd(mkZone(plPx, bar_index - pr1, bar_index, atrAtPiv, relVolPv, wkL, impL, rvL))
+        newPivot := true
+
+
+// =====================================================================
+//  SECTION 10 - FUSION: feature prior + outcome evidence -> P(hold)
+// ---------------------------------------------------------------------
+//  v1's "strength" was a raw weighted sum, and its stars were assigned
+//  RELATIVE to the strongest zone currently on screen. A chart containing
+//  nothing but weak levels still displayed three stars. Here the score is
+//  mapped into log-odds, combined with the level's realised track record
+//  through a Laplace-smoothed likelihood ratio, and reported as an
+//  absolute probability with fixed star bands.
+// =====================================================================
+float atrRef = nz(atrSlow, 0.0)
+
+rescore(Zone z) =>
+    z.isRes := z.center > close
+    z.hvn := hvnAt(z.center)
+    z.htf := htfConfAt(z.center)
+    z.rnd := roundScoreAt(z.center)
+
+    float sd     = z.wsum > 0 ? math.sqrt(math.max(0.0, z.m2 / z.wsum)) : 0.0
+    float tolAbs = atrRef * clusterTol
+    float fTight = tolAbs > 0 ? f_clampF(1.0 - sd / tolAbs, 0.0, 1.0) : 0.5
+
+    int   refBar = int(math.max(nz(z.lastPivBar, z.firstBar), nz(z.lastTouch, nz(z.lastPivBar, z.firstBar))))
+    float age    = math.max(0.0, bar_index - refBar)
+    float fRec   = 1.0 / (1.0 + age / decayBars)
+
+    float fCount = f_sat(z.hits - 1, 1.8)
+    float fVolS  = volFeedOk ? f_sat(z.fVol, 1.2) : 0.5
+    float fWickS = f_sat(z.fWick, 0.6)
+    float fImpS  = f_sat(z.fImp, 1.5)
+
+    float sumW = wCount + wVol + wWick + wImp + wTight + wRecent + wHVN + wHTF + wRound
+    float acc  = wCount * fCount + wVol * fVolS + wWick * fWickS + wImp * fImpS + wTight * fTight + wRecent * fRec + wHVN * z.hvn + wHTF * z.htf + wRound * z.rnd
+    z.score := sumW > 0 ? f_clampF(acc / sumW, 0.0, 1.0) : 0.5
+
+    // Evidence for the role the level is currently playing, plus a half
+    // weight on the opposite role - a level that never breaks in either
+    // direction is genuinely more trustworthy than one that only holds
+    // from one side.
+    float h = z.isRes ? (z.nHeldRes  + 0.5 * z.nHeldSup)  : (z.nHeldSup  + 0.5 * z.nHeldRes)
+    float b = z.isRes ? (z.nBrokeRes + 0.5 * z.nBrokeSup) : (z.nBrokeSup + 0.5 * z.nBrokeRes)
+    float evLogit = math.log((h + evAlpha) / (b + evAlpha))
+
+    z.prob := f_sigmoid(logitK * (z.score - logitMid) + evW * evLogit)
+    z.prob
+
+// Reliability logging: bucket the prediction that was live when the test
+// STARTED, then record what actually happened. This is the whole point -
+// a score nobody ever checks is decoration.
+calLog(float p, bool hit) =>
+    bool done = false
+    if not na(p)
+        int bIdx = f_clampI(int(p * 5.0), 0, 4)
+        calN.set(bIdx, calN.get(bIdx) + 1)
+        if hit
+            calHit.set(bIdx, calHit.get(bIdx) + 1)
+        done := true
+    done
+
+
+// =====================================================================
+//  SECTION 11 - DECISION: test / break state machine with hysteresis
+// ---------------------------------------------------------------------
+//  v1 killed a zone the instant one close printed past its edge. One
+//  stop-run wick-and-close destroyed the level permanently, and the level
+//  could never come back because it was blacklisted. Here a break needs a
+//  buffer, N consecutive confirming closes and (optionally) participation,
+//  and a level that does break FLIPS role rather than dying.
+// =====================================================================
+bool evHeldRes  = false
+bool evHeldSup  = false
+bool evBrokeRes = false
+bool evBrokeSup = false
+bool evFlip     = false
+
+float relVolNow = nz(partBase, 0.0) > 0 ? nz(partNow, 0.0) / partBase : 1.0
+float breakBuf  = atrRef * breakAtr
+float holdBuf   = atrRef * holdAtr
+
+if dataReady and barOk and pool.size() > 0
+    for i = 0 to pool.size() - 1
+        Zone z = pool.get(i)
+        if z.alive
+            float _p = rescore(z)
+            float top = z.center + z.halfW
+            float bot = z.center - z.halfW
+            bool  inZ = high >= bot and low <= top
+
+            if z.tState == 0
+                if inZ and (na(z.lastTestBar) or (bar_index - z.lastTestBar) >= testCooldown)
+                    z.tState     := 1
+                    z.tStart     := bar_index
+                    z.tFromBelow := nz(close[1], close) < z.center
+                    z.tProb      := z.prob
+                    z.brkRun     := 0
+                    z.tVolOk     := breakVolMult <= 0
+                if inZ
+                    z.lastTouch := bar_index
+            else
+                if inZ
+                    z.lastTouch := bar_index
+                if relVolNow >= breakVolMult
+                    z.tVolOk := true
+
+                bool beyond = z.tFromBelow ? (close > top + breakBuf) : (close < bot - breakBuf)
+                bool back   = z.tFromBelow ? (close < bot - holdBuf)  : (close > top + holdBuf)
+                z.brkRun := beyond ? z.brkRun + 1 : 0
+
+                if z.brkRun >= breakConfirm and z.tVolOk
+                    // --- BROKEN -------------------------------------
+                    z.realTouch := z.realTouch + 1
+                    if z.tFromBelow
+                        z.nBrokeRes := z.nBrokeRes + 1
+                        evBrokeRes  := true
+                    else
+                        z.nBrokeSup := z.nBrokeSup + 1
+                        evBrokeSup  := true
+                    bool _cB = calLog(z.tProb, false)
+                    z.wasBroken   := true
+                    z.flips       := z.flips + 1
+                    z.lastFlipBar := bar_index
+                    z.lastTestBar := bar_index
+                    z.tState      := 0
+                    z.brkRun      := 0
+                    evFlip        := true
+                    // Uncertainty injection: the level survives, but its
+                    // history is discounted because its character changed.
+                    z.nHeldRes  := int(math.round(z.nHeldRes  * flipDecay))
+                    z.nHeldSup  := int(math.round(z.nHeldSup  * flipDecay))
+                    z.nBrokeRes := int(math.round(z.nBrokeRes * flipDecay))
+                    z.nBrokeSup := int(math.round(z.nBrokeSup * flipDecay))
+                    z.wsum      := math.max(0.2, z.wsum * flipDecay)
+                    if z.flips > maxFlips
+                        z.alive   := false
+                        z.diedBar := bar_index
+                else if back
+                    // --- HELD ---------------------------------------
+                    z.realTouch := z.realTouch + 1
+                    if z.tFromBelow
+                        z.nHeldRes := z.nHeldRes + 1
+                        evHeldRes  := true
+                    else
+                        z.nHeldSup := z.nHeldSup + 1
+                        evHeldSup  := true
+                    bool _cH = calLog(z.tProb, true)
+                    z.lastTestBar := bar_index
+                    z.tState      := 0
+                    z.brkRun      := 0
+                else if (bar_index - z.tStart) > resolveBars
+                    // --- UNRESOLVED: price is sitting inside the zone.
+                    // Neither outcome happened, so it contributes no
+                    // evidence rather than being silently scored as a win.
+                    z.nUnres      := z.nUnres + 1
+                    z.realTouch   := z.realTouch + 1
+                    z.lastTestBar := bar_index
+                    z.tState      := 0
+                    z.brkRun      := 0
+
+            // --- Retirement: no pivot and no interaction for a long time
+            int lastEv = int(math.max(nz(z.lastPivBar, z.firstBar), nz(z.lastTouch, nz(z.lastPivBar, z.firstBar))))
+            if (bar_index - lastEv) > staleBars
+                z.alive   := false
+                z.diedBar := bar_index
+
+
+// =====================================================================
+//  SECTION 12 - NON-MAX SUPPRESSION
+// ---------------------------------------------------------------------
+//  Duplicate tracks on the same physical level are fused, summing their
+//  evidence, using interval IoU as the overlap metric. v1 had no such
+//  step: its greedy seed-anchored clustering routinely split one level
+//  into two neighbours that then competed for the same top-N slot.
+// =====================================================================
+mergeInto(Zone a, Zone b) =>
+    float aw   = a.wsum
+    float bw   = b.wsum
+    float w    = aw + bw
+    float mean = w > 0 ? (a.center * aw + b.center * bw) / w : a.center
+    a.m2     := a.m2 + b.m2 + aw * math.pow(a.center - mean, 2) + bw * math.pow(b.center - mean, 2)
+    a.fVol   := w > 0 ? (a.fVol * aw + b.fVol * bw) / w : a.fVol
+    a.center := mean
+    a.wsum   := w
+    a.hits   := a.hits + b.hits
+    a.volSum := a.volSum + b.volSum
+    a.fWick  := math.max(a.fWick, b.fWick)
+    a.fImp   := math.max(a.fImp,  b.fImp)
+    a.firstBar   := int(math.min(nz(a.firstBar, bar_index), nz(b.firstBar, bar_index)))
+    a.confBar    := int(math.min(nz(a.confBar, bar_index),  nz(b.confBar, bar_index)))
+    a.lastPivBar := int(math.max(nz(a.lastPivBar, 0), nz(b.lastPivBar, 0)))
+    a.lastTouch  := int(math.max(nz(a.lastTouch, 0), nz(b.lastTouch, 0)))
+    a.nHeldRes   := a.nHeldRes  + b.nHeldRes
+    a.nHeldSup   := a.nHeldSup  + b.nHeldSup
+    a.nBrokeRes  := a.nBrokeRes + b.nBrokeRes
+    a.nBrokeSup  := a.nBrokeSup + b.nBrokeSup
+    a.realTouch  := a.realTouch + b.realTouch
+    a.flips      := int(math.max(a.flips, b.flips))
+    float _rw = refreshWidth(a, atrRef)
+    b.alive   := false
+    b.diedBar := bar_index
+    a.center
+
+if newPivot and pool.size() > 1
+    for i = 0 to pool.size() - 2
+        Zone a = pool.get(i)
+        if a.alive
+            for j = i + 1 to pool.size() - 1
+                Zone b = pool.get(j)
+                if b.alive
+                    float ov = f_iou(a.center - a.halfW, a.center + a.halfW, b.center - b.halfW, b.center + b.halfW)
+                    if ov >= mergeIoU
+                        if a.wsum >= b.wsum
+                            mergeInto(a, b)
+                        else
+                            mergeInto(b, a)
+
+
+// =====================================================================
+//  SECTION 13 - ZONE OF INTEREST
+// ---------------------------------------------------------------------
+//  v1 gated on `touches == minTouches` exactly, which made every zone with
+//  more than the minimum number of pivots permanently ineligible. v2 gates
+//  on calibrated probability, unspent-ness (resolved tests), quiet time and
+//  volume-node participation.
+// =====================================================================
+bool zoiActivated = false
+
+if pool.size() > 0
+    for i = 0 to pool.size() - 1
+        Zone z = pool.get(i)
+        if z.alive
+            bool quiet  = na(z.lastTouch) or (bar_index - z.lastTouch) >= zoiQuiet
+            bool q = zoiEnable and z.hits >= minPivots and z.prob >= zoiMinProb and z.realTouch <= zoiMaxTests and quiet and z.hvn >= zoiHVN
+            if q and not z.isZOI
+                z.isZOI    := true
+                z.zoiSince := bar_index
+                zoiActivated := true
+            else if not q and z.isZOI
+                z.isZOI    := false
+                z.zoiSince := na
+
+
+// =====================================================================
+//  SECTION 14 - SELECTION
+// ---------------------------------------------------------------------
+//  Display gating is now separate from existence. A level falling off the
+//  top-N list is simply not drawn; it is NOT archived as "dropped" and its
+//  history is not thrown away, which is what made v1's zone set flicker.
+// =====================================================================
+// Role is derived from where price sits right now, not from a field that
+// only refreshes on confirmed bars.
+isResNow(Zone z) => z.center > close
+
+isFar(float px) =>
+    hideFarAtr <= 0 or atrRef <= 0 ? false : math.abs(px - close) > hideFarAtr * atrRef
+
+drawable(Zone z) =>
+    z.alive and z.hits >= minPivots and z.prob >= minProb and not na(z.center) and z.halfW > 0 and not isFar(z.center)
+
+selectTop(bool wantRes, int keep) =>
+    array<int> picked = array.new<int>()
+    array<int> cand   = array.new<int>()
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone z = pool.get(i)
+            if drawable(z) and isResNow(z) == wantRes
+                cand.push(i)
+    if cand.size() > 0
+        int lim = math.min(keep, cand.size())
+        for k = 1 to lim
+            int   bi = -1
+            float bv = -1.0
+            for c = 0 to cand.size() - 1
+                Zone zc = pool.get(cand.get(c))
+                if zc.prob > bv
+                    bv := zc.prob
+                    bi := c
+            if bi >= 0
+                picked.push(cand.get(bi))
+                cand.remove(bi)
+    picked
+
+nearestOf(bool wantRes) =>
+    Zone found = na
+    float bestD = 1e18
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone z = pool.get(i)
+            if drawable(z) and isResNow(z) == wantRes
+                float d = math.abs(z.center - close)
+                if d < bestD
+                    bestD := d
+                    found := z
+    found
+
+countSide(bool wantRes) =>
+    int n = 0
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone z = pool.get(i)
+            if z.alive and z.hits >= minPivots and isResNow(z) == wantRes
+                n += 1
+    n
+
+
+// =====================================================================
+//  SECTION 15 - RENDERING
+// =====================================================================
+var array<box>   bxBuf  = array.new<box>()
+var array<line>  lnBuf  = array.new<line>()
+var array<label> lbBuf  = array.new<label>()
+
+clearBuffers() =>
+    if bxBuf.size() > 0
+        for i = 0 to bxBuf.size() - 1
+            box.delete(bxBuf.get(i))
+    if lnBuf.size() > 0
+        for i = 0 to lnBuf.size() - 1
+            line.delete(lnBuf.get(i))
+    if lbBuf.size() > 0
+        for i = 0 to lbBuf.size() - 1
+            label.delete(lbBuf.get(i))
+    bxBuf.clear()
+    lnBuf.clear()
+    lbBuf.clear()
+    bxBuf.size()
+
+zoneLabelText(Zone z) =>
+    string stars = probStars(z.prob)
+    string pTxt  = showProb ? str.tostring(math.round(z.prob * 100)) + "%" : ""
+    string vTxt  = showVolText ? (volFeedOk ? formatVolume(z.volSum) : "n/a") : ""
+    string tTxt  = str.tostring(z.hits) + "p"
+    if z.realTouch > 0
+        tTxt := tTxt + "/" + str.tostring(z.realTouch) + "t"
+    string tag = z.isZOI and zoiLabel ? "  ZOI" : ""
+    string flip = z.flips > 0 ? "  F" + str.tostring(z.flips) : ""
+    string row1 = stars + (pTxt == "" ? "" : "  " + pTxt) + "  " + tTxt + flip + tag
+    string outv = row1
+    if showVolText
+        outv := singleLine ? row1 + "  -  Vol: " + vTxt : "Vol: " + vTxt + "\n" + row1
+    outv
+
+drawZone(Zone z) =>
+    color baseCol = isResNow(z) ? resColor : supColor
+    int   rightX  = bar_index + 25
+    // Honest mode anchors the box to the CONFIRMATION bar, not the pivot
+    // bar. The zone did not exist until pivRight bars after the high or
+    // low printed, and drawing it earlier back-dates information.
+    int   startX  = safeStartBar(noRepaint ? nz(z.confBar, z.firstBar) : nz(z.firstBar, z.confBar))
+    // Opacity is driven by calibrated probability, not by raw volume rank.
+    int   solid   = int(f_clampF((z.prob - 0.4) / 0.45, 0.0, 1.0) * 30.0)
+    int   fillOp  = f_clampI(zoneOpacity - solid, 45, 96)
+    color fill    = color.new(baseCol, fillOp)
+    color edge    = color.new(baseCol, f_clampI(int(35 - solid * 0.5), 0, 90))
+    color border  = z.isZOI ? color.new(zoiGlowCol, 0) : color.new(baseCol, 100)
+    int   bw      = z.isZOI ? zoiBorderW : 1
+    bxBuf.push(box.new(startX, z.center + z.halfW, rightX, z.center - z.halfW,
+         border_color = border, border_width = bw, bgcolor = fill))
+    lnBuf.push(line.new(startX, z.center, rightX, z.center, color = edge, style = line.style_dashed, width = 1))
+    if showLabels
+        color lbBg = z.isZOI ? color.new(zoiGlowCol, 65) : color.new(baseCol, 75)
+        lbBuf.push(label.new(rightX, z.center, zoneLabelText(z), style = label.style_label_left,
+             color = lbBg, textcolor = chart.fg_color, size = size.small))
+    if showFlips and z.flips > 0 and not na(z.lastFlipBar)
+        lbBuf.push(label.new(safeStartBar(z.lastFlipBar), z.center, "flip",
+             style = label.style_label_center, color = color.new(zoiGlowCol, 40),
+             textcolor = color.black, size = size.tiny))
+    z.center
+
+drawRetired(Zone z) =>
+    if not na(z.center) and z.halfW > 0 and not isFar(z.center)
+        color useCol = z.isRes ? brokenBear : brokenBull  // frozen at retirement
+        int   startX = safeStartBar(nz(z.confBar, z.firstBar))
+        int   endX   = safeStartBar(nz(z.diedBar, bar_index))
+        if endX > startX
+            bxBuf.push(box.new(startX, z.center + z.halfW, endX, z.center - z.halfW,
+                 border_color = na, bgcolor = color.new(useCol, brokenOp)))
+    z.center
+
+if barstate.islast and dataReady
+    clearBuffers()
+    array<int> selRes = selectTop(true,  zonesPerSide)
+    array<int> selSup = selectTop(false, zonesPerSide)
+    if selRes.size() > 0
+        for i = 0 to selRes.size() - 1
+            float _d1 = drawZone(pool.get(selRes.get(i)))
+    if selSup.size() > 0
+        for i = 0 to selSup.size() - 1
+            float _d2 = drawZone(pool.get(selSup.get(i)))
+    if showHistory and pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone z = pool.get(i)
+            if not z.alive
+                float _d3 = drawRetired(z)
+
+plotshape(showTests and evHeldSup,  "Support held",       shape.circle,  location.belowbar, color.new(supColor, 0), size = size.tiny)
+plotshape(showTests and evHeldRes,  "Resistance held",    shape.circle,  location.abovebar, color.new(resColor, 0), size = size.tiny)
+plotshape(showTests and evBrokeSup, "Support broken",     shape.xcross,  location.belowbar, color.new(resColor, 0), size = size.tiny)
+plotshape(showTests and evBrokeRes, "Resistance broken",  shape.xcross,  location.abovebar, color.new(supColor, 0), size = size.tiny)
+
+
+// =====================================================================
+//  SECTION 16 - VALIDATION PANEL
+// ---------------------------------------------------------------------
+//  Shadow mode. Every resolved test is filed into the probability bucket
+//  it was predicted from; the panel reports predicted vs realised hold
+//  rate over the whole chart. If the two diverge, the model is
+//  miscalibrated HERE and the stars should be discounted accordingly.
+//  This is the check v1 never had - and without it a "strength score" is
+//  an opinion, not a measurement.
+// =====================================================================
+calPredicted() =>
+    float num = 0.0
+    int   den = 0
+    for b = 0 to 4
+        int n = calN.get(b)
+        num += n * (b * 0.2 + 0.1)
+        den += n
+    den > 0 ? num / den : na
+
+calRealised() =>
+    int hit = 0
+    int den = 0
+    for b = 0 to 4
+        hit += calHit.get(b)
+        den += calN.get(b)
+    den > 0 ? hit / float(den) : na
+
+calCount() =>
+    int den = 0
+    for b = 0 to 4
+        den += calN.get(b)
+    den
+
+
+// =====================================================================
+//  SECTION 17 - DASHBOARD
+// =====================================================================
+var table dashTbl = na
+
+if showDash and barstate.islast and dataReady
+    if not na(dashTbl)
+        table.delete(dashTbl)
+    dashTbl := table.new(strToPos(dashPosStr), 2, 8,
+         bgcolor = color.new(C_BG, 82), frame_color = color.new(C_FRAME, 35), frame_width = 1,
+         border_color = color.new(C_FRAME, 75), border_width = 1)
+    sizeRes = strToSize(dashSizeStr)
+    color hdrBg = color.new(C_ACCENT, 60)
+    color rowBg = color.new(C_BG, 90)
+
+    table.cell(dashTbl, 0, 0, "SR ZONES", text_color = color.white, bgcolor = hdrBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 0, "v2", text_color = color.white, bgcolor = hdrBg, text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    table.cell(dashTbl, 0, 1, "Regime", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 1, regimeTxt + "  " + (na(atrPct) ? "-" : str.tostring(atrPct, "#.##") + "%"),
+         text_color = chart.fg_color, bgcolor = rowBg, text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    table.cell(dashTbl, 0, 2, "Levels R/S", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 2, str.tostring(countSide(true)) + " / " + str.tostring(countSide(false)),
+         text_color = chart.fg_color, bgcolor = rowBg, text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    Zone nR = nearestOf(true)
+    string nRTxt = "-"
+    if not na(nR)
+        nRTxt := str.tostring(nR.center, format.mintick) + "  " + str.tostring(math.round(nR.prob * 100)) + "%  " + probStars(nR.prob)
+    table.cell(dashTbl, 0, 3, "Next R", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 3, nRTxt, text_color = resColor, bgcolor = color.new(resColor, 82), text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    Zone nS = nearestOf(false)
+    string nSTxt = "-"
+    if not na(nS)
+        nSTxt := str.tostring(nS.center, format.mintick) + "  " + str.tostring(math.round(nS.prob * 100)) + "%  " + probStars(nS.prob)
+    table.cell(dashTbl, 0, 4, "Next S", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 4, nSTxt, text_color = supColor, bgcolor = color.new(supColor, 82), text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    string distTxt = "-"
+    if not na(nR) and not na(nS)
+        float dR = distancePct(nR.center, close)
+        float dS = distancePct(nS.center, close)
+        distTxt := (na(dS) ? "-" : str.tostring(dS, "#.##")) + "% / " + (na(dR) ? "-" : str.tostring(dR, "#.##")) + "%"
+    table.cell(dashTbl, 0, 5, "Dist S/R", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 5, distTxt, text_color = chart.fg_color, bgcolor = rowBg, text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    int zoiN = 0
+    if pool.size() > 0
+        for i = 0 to pool.size() - 1
+            Zone z = pool.get(i)
+            if z.alive and z.isZOI
+                zoiN += 1
+    table.cell(dashTbl, 0, 6, "ZOI", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 6, zoiN > 0 ? str.tostring(zoiN) + " active" : "-",
+         text_color = zoiGlowCol, bgcolor = color.new(zoiGlowCol, 82), text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+    string calTxt = "off"
+    color  calCol = chart.fg_color
+    if showCalib
+        int   n = calCount()
+        float p = calPredicted()
+        float r = calRealised()
+        if n < 12 or na(p) or na(r)
+            calTxt := "n=" + str.tostring(n) + " (warming up)"
+        else
+            float gap = math.abs(p - r)
+            calTxt := str.tostring(math.round(p * 100)) + "% vs " + str.tostring(math.round(r * 100)) + "%  n=" + str.tostring(n)
+            calCol := gap <= 0.07 ? supColor : gap <= 0.15 ? C_ACCENT : resColor
+    table.cell(dashTbl, 0, 7, "Reliability", text_color = chart.fg_color, bgcolor = rowBg, text_size = sizeRes, text_font_family = font.family_monospace)
+    table.cell(dashTbl, 1, 7, calTxt, text_color = calCol, bgcolor = rowBg, text_halign = text.align_right, text_size = sizeRes, text_font_family = font.family_monospace)
+
+
+// =====================================================================
+//  SECTION 18 - ALERTS
+// =====================================================================
+Zone aR = nearestOf(true)
+Zone aS = nearestOf(false)
+
+bool touchRes = not na(aR) and high >= aR.center - aR.halfW and low <= aR.center + aR.halfW
+bool touchSup = not na(aS) and high >= aS.center - aS.halfW and low <= aS.center + aS.halfW
+bool nearHiR = not na(aR) and aR.prob >= zoiMinProb and math.abs(aR.center - close) <= atrRef
+bool nearHiS = not na(aS) and aS.prob >= zoiMinProb and math.abs(aS.center - close) <= atrRef
+bool hiProbNear = nearHiR or nearHiS
+
+alertcondition(touchRes,      "Resistance touched",          "Price reached a tracked resistance zone")
+alertcondition(touchSup,      "Support touched",             "Price reached a tracked support zone")
+alertcondition(evHeldRes,     "Resistance test held",        "A resistance test resolved as HELD")
+alertcondition(evHeldSup,     "Support test held",           "A support test resolved as HELD")
+alertcondition(evBrokeRes,    "Resistance break confirmed",  "A resistance broke with buffer and confirmation")
+alertcondition(evBrokeSup,    "Support break confirmed",     "A support broke with buffer and confirmation")
+alertcondition(evFlip,        "Zone polarity flip",          "A tracked level flipped role after a confirmed break")
+alertcondition(zoiActivated,  "Zone of Interest activated",  "A high-probability, unspent level was flagged")
+alertcondition(hiProbNear,    "High-probability zone approached", "Price is within 1 ATR of a high-probability zone")
+alertcondition(newPivot,      "New pivot ingested",          "A new pivot was confirmed and the tracker updated")
+
+
+// =====================================================================
+//  END - Smart SR Zones v2
+// =====================================================================

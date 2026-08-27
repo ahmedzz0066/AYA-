@@ -1,0 +1,1109 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator(title="Smart SR Zones [JOAT]", shorttitle="SSR [JOAT]", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000)
+
+
+// =====================================================================
+//  SECTION 1 - INPUTS
+// =====================================================================
+
+// --- Group titles ---
+grpStrength  = "Zone Strength"
+grpPivot     = "Custom Parameters"
+grpCluster   = "Zones"
+grpHistory   = "Broken Zones"
+grpSignals   = "Signals (optional)"
+grpStyle     = "Style"
+grpZOI       = "Zone of Interest"
+grpDash      = "Dashboard"
+grpAlerts    = "Alerts"
+
+// --- Zone Strength preset selector ---
+preset = input.string("Swing", "Strength preset",
+     options=["Scalp", "Local", "Swing", "Major", "Custom"], group=grpStrength,
+     tooltip="Scalp: very tight zones for 1-5m timeframes.\nLocal: tight zones from recent pivots.\nSwing: balanced zones.\nMajor: wide zones from significant macro pivots.\nCustom: manually define pivot lengths below.")
+
+// --- Custom parameters (used when preset == Custom) ---
+pivLeftIn    = input.int(15, "Left bars",  minval=2, maxval=100, group=grpPivot,
+     tooltip="Number of bars to the left required to confirm a custom pivot.")
+pivRightIn   = input.int(8,  "Right bars", minval=2, maxval=50,  group=grpPivot,
+     tooltip="Number of bars to the right required to confirm a custom pivot.")
+clusterTolIn = input.float(0.9, "Cluster tolerance (x ATR)", minval=0.2, maxval=3.0, step=0.1, group=grpPivot,
+     tooltip="Multiplier based on ATR. Higher values merge pivots that are further apart into a single, wider zone.")
+minSpacingIn = input.int(20, "Minimum bars between touches", minval=0, maxval=200, group=grpPivot,
+     tooltip="Minimum number of bars required between price touches for them to be counted as separate, valid touches.")
+pivBuffer    = input.int(80, "Pivot memory", minval=20, maxval=200, group=grpPivot,
+     tooltip="Maximum number of historical pivots kept in memory to build zones. Higher values look further back in time.")
+
+// --- Zones config ---
+zoneCount  = input.int(6,    "Active zones per side", minval=1, maxval=8,  group=grpCluster,
+     tooltip="Maximum number of active Support and Resistance zones displayed on the chart simultaneously.")
+minTouches = input.int(2,    "Minimum touches",       minval=2, maxval=10, group=grpCluster,
+     tooltip="Minimum number of pivot touches required to form and display a valid zone.")
+fadeAge    = input.int(120,  "Fade after (bars)",     minval=0, maxval=500, group=grpCluster,
+     tooltip="Number of bars after which a zone starts to become more transparent if it hasn't been touched. Set to 0 to disable fading.")
+hideFar    = input.float(60.0, "Hide zones farther than (%)", minval=0.0, maxval=200.0, step=5.0, group=grpCluster,
+     tooltip="Hides zones whose center price is further than this percentage away from the current price. Set to 0 to always show all zones.")
+
+// --- Broken zones group ---
+showBroken  = input.bool(false, "Show confirmed broken zones", group=grpHistory,
+     tooltip="Displays historical zones that were physically broken by the closing price.")
+showDropped = input.bool(false, "Show dropped zones", group=grpHistory,
+     tooltip="Displays zones that were removed from the active list because newer, stronger pivots reorganized the clusters.")
+brokenBull  = input.color(color.rgb(105, 140, 125), "Broken support color", group=grpHistory,
+     tooltip="Color applied to historical/broken support zones.")
+brokenBear  = input.color(color.rgb(165, 105, 110), "Broken resistance color", group=grpHistory,
+     tooltip="Color applied to historical/broken resistance zones.")
+brokenOp    = input.int(85, "Broken zone opacity", minval=30, maxval=95, group=grpHistory,
+     tooltip="Base transparency for historical/broken zones. Lower values make them more transparent.")
+
+// --- Signals group ---
+showTest     = input.bool(false, "Show successful test markers", group=grpSignals,
+     tooltip="Displays a circle when the price touches an active zone and successfully bounces/rejects off it.")
+showRetest   = input.bool(false, "Show retest markers",          group=grpSignals,
+     tooltip="Displays a diamond when the price returns to test a previously broken zone from the opposite side.")
+showReaction = input.bool(false, "Show zone reaction marks",     group=grpSignals,
+     tooltip="Displays a small diamond when price touches an active zone but holds (does not close beyond it), and text labels when a zone is physically broken.")
+sigCooldown  = input.int(20, "Cooldown bars",      minval=0, maxval=100, group=grpSignals,
+     tooltip="Minimum number of bars that must pass before a zone can trigger another bounce/retest signal.")
+retestWindow = input.int(50, "Retest window (bars)", minval=5, maxval=200, group=grpSignals,
+     tooltip="Maximum number of bars after a breakout during which a return to the zone is still considered a valid retest.")
+
+// --- Style group ---
+useThemeColors = input.bool(true, "Use theme colors for active zones", group=grpStyle,
+     tooltip="When enabled, theme bull/bear palette overrides manual Resistance/Support colors below.")
+resColorIn  = input.color(color.rgb(244, 67, 79),  "Resistance color (manual)", group=grpStyle,
+     tooltip="Color for active Resistance zones (used only when theme override is OFF).")
+supColorIn  = input.color(color.rgb(38, 166, 154), "Support color (manual)",    group=grpStyle,
+     tooltip="Color for active Support zones (used only when theme override is OFF).")
+useVolColor = input.bool(true,  "Color zones by volume",   group=grpStyle,
+     tooltip="Automatically makes zones with higher cumulative volume more vivid and lowers opacity for low-volume zones.")
+showLabels  = input.bool(true,  "Show zone strength label", group=grpStyle,
+     tooltip="Displays the text label containing star rating, number of touches, and volume score.")
+showVolText = input.bool(true,  "Show volume score",        group=grpStyle,
+     tooltip="Displays the volume score text inside the zone label.")
+volFormat   = input.string("Absolute", "Volume format", options=["Absolute", "Percentage"], group=grpStyle,
+     tooltip="Absolute: Shows values like 1.2M or 450K.\nPercentage: Shows relative strength (1-100%) compared to the strongest active zone.")
+singleLine  = input.bool(false, "Single line label",        group=grpStyle,
+     tooltip="Places the volume score and star rating on the same single line instead of two separate lines.")
+zoneOpacity = input.int(82, "Zone opacity (low volume)", minval=60, maxval=95, group=grpStyle,
+     tooltip="Base transparency for zones with low volume. If 'Color zones by volume' is enabled, high-volume zones will automatically become less transparent.")
+
+// --- NEW: Zone of Interest group ---
+zoiEnable   = input.bool(true,  "Enable Zone of Interest highlight", group=grpZOI,
+     tooltip="Highlights zones with minimum touches AND high volume that have not been re-tested. Often the next significant level.")
+zoiVolPct   = input.float(70.0, "Volume threshold (% of strongest)", minval=20.0, maxval=100.0, step=5.0, group=grpZOI,
+     tooltip="A zone qualifies as Zone of Interest only if its volume share vs. the strongest active zone exceeds this percentage.")
+zoiQuiet    = input.int(20, "Min bars since last touch", minval=0, maxval=400, group=grpZOI,
+     tooltip="Minimum bars that must pass since the zone's most recent touch (proxy for 'never tested again').")
+zoiGlowCol  = input.color(#DEB887, "Glow color", group=grpZOI,
+     tooltip="Border / glow color used to mark a Zone of Interest. Defaults to burlywood Earth-palette accent.")
+zoiBorderW  = input.int(2, "Glow border width", minval=1, maxval=4, group=grpZOI,
+     tooltip="Width (px) of the bright border drawn around a Zone of Interest.")
+zoiPulse    = input.bool(true, "Animated pulse", group=grpZOI,
+     tooltip="Subtly modulates the inner glow opacity each bar to give the impression of a pulsing border.")
+zoiLabel    = input.bool(true, "Show 'ZOI' tag", group=grpZOI,
+     tooltip="Adds a small ZOI tag near the zone label when active.")
+
+// --- Dashboard group ---
+showDash    = input.bool(true, "Show dashboard", group=grpDash,
+     tooltip="Toggles the floating S/R diagnostic table.")
+dashPosStr  = input.string("Top Right", "Dashboard position",
+     options=["Top Right","Top Left","Top Center","Middle Right","Middle Left","Middle Center","Bottom Right","Bottom Left","Bottom Center"],
+     group=grpDash, tooltip="Anchor for the dashboard table.")
+dashSizeStr = input.string("Small", "Dashboard text size",
+     options=["Tiny","Small","Normal","Large","Huge"], group=grpDash,
+     tooltip="Text scale for dashboard cells.")
+dashCompact = input.bool(false, "Compact dashboard (no descriptions)", group=grpDash,
+     tooltip="Shrinks labels for narrow chart layouts.")
+
+// --- Alerts group ---
+alertsZOI   = input.bool(true, "Enable Zone of Interest activation alert", group=grpAlerts,
+     tooltip="Adds an alertcondition that fires the bar a Zone of Interest is first detected.")
+
+// --- Preset resolution (KB 8.3) ---
+pivLeft    = preset == "Scalp" ?  4   : preset == "Local" ?  6   : preset == "Swing" ? 15  : preset == "Major" ? 35  : pivLeftIn
+pivRight   = preset == "Scalp" ?  2   : preset == "Local" ?  4   : preset == "Swing" ?  8  : preset == "Major" ? 15  : pivRightIn
+clusterTol = preset == "Scalp" ? 0.4  : preset == "Local" ? 0.5  : preset == "Swing" ? 0.9 : preset == "Major" ? 1.4 : clusterTolIn
+minSpacing = preset == "Scalp" ?  4   : preset == "Local" ?  8   : preset == "Swing" ? 20  : preset == "Major" ? 50  : minSpacingIn
+
+
+// =====================================================================
+//  SECTION 2 - COLOR PALETTE  (Earth - locked)
+// =====================================================================
+// Curated palette - sage support, sienna resistance, burlywood ZOI accent
+// on a deep sea-green ground.
+const color C_BULL   = #8FBC8F   // sage (support)
+const color C_BEAR   = #A0522D   // sienna (resistance)
+const color C_ACCENT = #DEB887   // burlywood (ZOI accent)
+const color C_BG     = #2E8B57   // sea green (dashboard bg)
+const color C_FRAME  = #1F4A38   // deep forest (dashboard frame)
+
+// Downstream aliases (preserve original symbol names)
+color themeBull   = C_BULL
+color themeBear   = C_BEAR
+color themeBg     = C_BG
+color themeAccent = C_ACCENT
+
+// Final active S/R colors (theme override OR manual)
+color resColor = useThemeColors ? C_BEAR : resColorIn
+color supColor = useThemeColors ? C_BULL : supColorIn
+
+
+// =====================================================================
+//  SECTION 3 - HELPER FUNCTIONS  (extracted from KB 2.x)
+// =====================================================================
+
+// 2.4 Position-string resolver
+strToPos(string s) =>
+    switch s
+        "Top Right"     => position.top_right
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Middle Right"  => position.middle_right
+        "Middle Left"   => position.middle_left
+        "Middle Center" => position.middle_center
+        =>               position.bottom_right
+
+// 2.4 (cont) Size-string resolver
+strToSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        =>          size.normal
+
+// 2.6 Format volume to K/M/B
+formatVolume(float v) =>
+    if v >= 1000000000
+        str.tostring(v / 1000000000, "#.##") + "B"
+    else if v >= 1000000
+        str.tostring(v / 1000000, "#.##") + "M"
+    else if v >= 1000
+        str.tostring(v / 1000, "#.##") + "K"
+    else
+        str.tostring(v, "#.##")
+
+// 2.7 Star rating from ratio
+strengthStars(float s, float maxS) =>
+    ratio = maxS > 0 ? s / maxS : 0.0
+    ratio >= 0.85 ? "★★★" : ratio >= 0.55 ? "★★" : "★"
+
+// 2.9 Safe start bar for box.new history (Pine max_bars_back guard)
+safeStartBar(int b) =>
+    minSafe = bar_index - 4900
+    b < minSafe ? minSafe : b
+
+// 2.3 Clamp helper
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+
+// 2.1 RGB linear-interpolation gradient
+f_colorGradient(float ratio, color colA, color colB) =>
+    rA = color.r(colA), gA = color.g(colA), bA = color.b(colA)
+    rB = color.r(colB), gB = color.g(colB), bB = color.b(colB)
+    rr = rA + int((rB - rA) * ratio)
+    rg = gA + int((gB - gA) * ratio)
+    rb = bA + int((bB - bA) * ratio)
+    color.rgb(rr, rg, rb, 0)
+
+// 5.7 Subtle grad helper for dashboard rows
+grad(color base, int row, int rows, int minT, int maxT) =>
+    float t = rows <= 1 ? minT : (minT + (maxT - minT) * (row / float(rows - 1)))
+    color.new(base, int(t))
+
+// Safe percentage distance from current price
+distancePct(float center, float ref) =>
+    ref == 0.0 or na(ref) or na(center) ? na : math.abs(center - ref) / ref * 100.0
+
+
+// =====================================================================
+//  SECTION 4 - CORE CALCULATIONS  (sources, pivots, weighting)
+// =====================================================================
+
+// Long-window volatility / volume baselines for normalization.
+atr   = ta.atr(50)
+volMa = ta.sma(volume, 50)
+
+// Pivots driven by the resolved (preset or custom) left/right widths.
+phPx = ta.pivothigh(high, pivLeft, pivRight)
+plPx = ta.pivotlow(low,   pivLeft, pivRight)
+
+// Wick + safe volume helpers used to compute pivot quality scores.
+upperWick(int idx) => high[idx] - math.max(open[idx], close[idx])
+lowerWick(int idx) => math.min(open[idx], close[idx]) - low[idx]
+safeVolume(int idx) =>
+    v = volume[idx]
+    na(v) or v <= 0 ? 1.0 : v
+
+
+// =====================================================================
+//  SECTION 5 - STATE / TRACKING  (UDTs from KB 7.2)
+// =====================================================================
+
+// UDT - one historical pivot (a candidate seed for a zone)
+type Pivot
+    float price
+    int   bar
+    float vol
+    float wick
+
+// UDT - a clustered zone with full lifecycle metadata
+type Zone
+    float top
+    float bot
+    float center
+    float strength
+    float volSum
+    int   touches
+    int   firstBar
+    int   lastTouch
+    int   diedBar
+    bool  isResistance
+    bool  wasBroken
+    bool  isLiveBreak
+    bool  isZOI
+    int   zoiSinceBar
+
+// Persistent pivot pools.
+var array<Pivot> highPivots = array.new<Pivot>()
+var array<Pivot> lowPivots  = array.new<Pivot>()
+
+// Are we ready to start producing zones?
+dataReady = not na(atr) and atr > 0
+newHighPivot = false
+newLowPivot  = false
+
+// Push new pivots into the pools and trim to memory cap.
+if not na(phPx) and phPx > 0 and dataReady
+    highPivots.push(Pivot.new(phPx, bar_index - pivRight, safeVolume(pivRight), upperWick(pivRight)))
+    if highPivots.size() > pivBuffer
+        highPivots.shift()
+    newHighPivot := true
+
+if not na(plPx) and plPx > 0 and dataReady
+    lowPivots.push(Pivot.new(plPx, bar_index - pivRight, safeVolume(pivRight), lowerWick(pivRight)))
+    if lowPivots.size() > pivBuffer
+        lowPivots.shift()
+    newLowPivot := true
+
+
+// =====================================================================
+//  SECTION 5b - CLUSTERING ENGINE
+// =====================================================================
+
+// Composite pivot weight (KB 3.6):
+//   weight = (1 + 0.5 * volume_ratio + 0.5 * wick_ratio) * decay(age)
+//   - volume_ratio = pivot vol / SMA(vol, 50)            : heavier candles weigh more
+//   - wick_ratio   = rejection wick / ATR(50)            : longer rejection wicks weigh more
+//   - decay        = 1 / (1 + age_in_bars / 200)         : older pivots gradually fade
+// The weighted sum across cluster members gives center (volume-weighted)
+// and the strength score used for ranking.
+pivotWeight(Pivot p, float a, float vAvg) =>
+    safeVol  = na(p.vol)  or p.vol  <= 0 ? 0.0 : p.vol
+    safeWick = na(p.wick) or p.wick <  0 ? 0.0 : p.wick
+    age      = math.max(1, bar_index - p.bar)
+    decay    = 1.0 / (1.0 + age / 200.0)
+    volNorm  = vAvg > 0 ? safeVol / vAvg : 1.0
+    wickNorm = a > 0 ? safeWick / a : 0.0
+    (1.0 + volNorm * 0.5 + wickNorm * 0.5) * decay
+
+// Build zones from a pivot pool. Greedy clustering with ATR tolerance
+// and minimum-spacing dedupe so consecutive same-bar pivots don't double
+// count. Each cluster yields one zone with weighted center.
+buildZones(array<Pivot> src, bool resistance, float a, float vAvg) =>
+    out = array.new<Zone>()
+    if src.size() >= minTouches and a > 0
+        used = array.new<bool>()
+        for i = 0 to src.size() - 1
+            used.push(false)
+        tol = a * clusterTol
+        for i = 0 to src.size() - 1
+            if not used.get(i)
+                seed    = src.get(i)
+                members = array.new<Pivot>()
+                members.push(seed)
+                used.set(i, true)
+                if i + 1 <= src.size() - 1
+                    for j = i + 1 to src.size() - 1
+                        if not used.get(j)
+                            cand = src.get(j)
+                            if math.abs(cand.price - seed.price) <= tol
+                                farEnough = true
+                                if minSpacing > 0
+                                    for k = 0 to members.size() - 1
+                                        if math.abs(cand.bar - members.get(k).bar) < minSpacing
+                                            farEnough := false
+                                            break
+                                if farEnough
+                                    members.push(cand)
+                                    used.set(j, true)
+                if members.size() >= minTouches
+                    priceSum  = 0.0
+                    weightSum = 0.0
+                    volSum    = 0.0
+                    earliest  = members.get(0).bar
+                    latest    = members.get(0).bar
+                    for k = 0 to members.size() - 1
+                        m = members.get(k)
+                        w = pivotWeight(m, a, vAvg)
+                        priceSum  += m.price * w
+                        weightSum += w
+                        volSum    += na(m.vol) ? 0.0 : m.vol
+                        earliest  := math.min(earliest, m.bar)
+                        latest    := math.max(latest,   m.bar)
+                    if weightSum > 0
+                        center = priceSum / weightSum
+                        pad    = a * 0.25
+                        out.push(Zone.new(center + pad, center - pad, center, weightSum, volSum, members.size(), earliest, latest, na, resistance, false, false, false, na))
+    out
+
+// Trim a list of zones to the top-N by strength (insertion-style selection
+// to avoid mutating the source).
+trimToTopN(array<Zone> zones, int keep) =>
+    out = array.new<Zone>()
+    if zones.size() > 0
+        copy = zones.copy()
+        limit = math.min(keep, copy.size())
+        for i = 0 to limit - 1
+            if copy.size() == 0
+                break
+            bestIdx = 0
+            bestVal = copy.get(0).strength
+            if copy.size() > 1
+                for j = 1 to copy.size() - 1
+                    if copy.get(j).strength > bestVal
+                        bestVal := copy.get(j).strength
+                        bestIdx := j
+            out.push(copy.get(bestIdx))
+            copy.remove(bestIdx)
+    out
+
+
+// =====================================================================
+//  SECTION 5c - ZONE STATE & ARCHIVING
+// =====================================================================
+var array<Zone> resZones    = array.new<Zone>()
+var array<Zone> supZones    = array.new<Zone>()
+var array<Zone> brokenZones = array.new<Zone>()
+
+// Archive a zone into broken / dropped history. De-dupes by center
+// proximity so the same physical level isn't archived twice.
+archiveIfNew(Zone z, float a) =>
+    duplicate = false
+    if brokenZones.size() > 0
+        tol = a * clusterTol * 0.7
+        for i = 0 to brokenZones.size() - 1
+            existing = brokenZones.get(i)
+            if existing.isResistance == z.isResistance and math.abs(existing.center - z.center) <= tol
+                duplicate := true
+                if z.wasBroken and not existing.wasBroken
+                    existing.wasBroken   := true
+                    existing.diedBar     := z.diedBar
+                    existing.isLiveBreak := z.isLiveBreak
+                    brokenZones.set(i, existing)
+                break
+    if not duplicate
+        brokenZones.push(z)
+        if brokenZones.size() > 100
+            brokenZones.shift()
+    duplicate
+
+// Live-break check (KB 8.4 self-mitigation tracking, 'Close' rule):
+// A break only counts if price was on the correct side of the zone on
+// the previous close. Filters retroactive zone formations during sharp
+// moves (the "born-dead" case).
+if resZones.size() > 0
+    for i = 0 to resZones.size() - 1
+        z = resZones.get(i)
+        if na(z.diedBar) and close > z.top
+            z.diedBar     := bar_index
+            z.wasBroken   := true
+            z.isLiveBreak := close[1] <= z.top
+            resZones.set(i, z)
+            archiveIfNew(z, atr)
+
+if supZones.size() > 0
+    for i = 0 to supZones.size() - 1
+        z = supZones.get(i)
+        if na(z.diedBar) and close < z.bot
+            z.diedBar     := bar_index
+            z.wasBroken   := true
+            z.isLiveBreak := close[1] >= z.bot
+            supZones.set(i, z)
+            archiveIfNew(z, atr)
+
+// Touch tracking - record the bar each time a live zone is touched,
+// so age-decay / quiet-period detection works.
+if resZones.size() > 0
+    for i = 0 to resZones.size() - 1
+        z = resZones.get(i)
+        if na(z.diedBar) and high >= z.bot and low <= z.top
+            z.lastTouch := bar_index
+            resZones.set(i, z)
+
+if supZones.size() > 0
+    for i = 0 to supZones.size() - 1
+        z = supZones.get(i)
+        if na(z.diedBar) and high >= z.bot and low <= z.top
+            z.lastTouch := bar_index
+            supZones.set(i, z)
+
+// Survival check used during pool reorganisation.
+zoneSurvives(Zone old, array<Zone> newSet, float a) =>
+    survived = false
+    if newSet.size() > 0
+        tol = a * clusterTol
+        for i = 0 to newSet.size() - 1
+            nzz = newSet.get(i)
+            if math.abs(nzz.center - old.center) <= tol
+                survived := true
+                break
+    survived
+
+// Already-broken filter so we don't resurrect a level that's already
+// in the history book.
+isAlreadyBroken(Zone z, float a) =>
+    broken = false
+    if brokenZones.size() > 0
+        tol = a * clusterTol * 0.7
+        for i = 0 to brokenZones.size() - 1
+            bz = brokenZones.get(i)
+            if bz.isResistance == z.isResistance and bz.wasBroken and math.abs(bz.center - z.center) <= tol
+                broken := true
+                break
+    broken
+
+// Inherit lastTouch and ZOI flags from a matching old zone so age-decay
+// is continuous across pool rebuilds (KB 8.5).
+inheritState(Zone newZ, array<Zone> oldZones, float a) =>
+    inherited = newZ
+    if oldZones.size() > 0
+        tol = a * clusterTol
+        for i = 0 to oldZones.size() - 1
+            oldZ = oldZones.get(i)
+            if math.abs(oldZ.center - newZ.center) <= tol
+                inherited.lastTouch   := oldZ.lastTouch
+                inherited.isZOI       := oldZ.isZOI
+                inherited.zoiSinceBar := oldZ.zoiSinceBar
+                break
+    inherited
+
+// Pool reorganisation when a fresh pivot arrives.
+if newHighPivot or newLowPivot
+    newRes = trimToTopN(buildZones(highPivots, true,  atr, volMa), zoneCount)
+    newSup = trimToTopN(buildZones(lowPivots,  false, atr, volMa), zoneCount)
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            old = resZones.get(i)
+            if na(old.diedBar) and old.touches >= minTouches and not zoneSurvives(old, newRes, atr)
+                old.diedBar   := bar_index
+                old.wasBroken := false
+                archiveIfNew(old, atr)
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            old = supZones.get(i)
+            if na(old.diedBar) and old.touches >= minTouches and not zoneSurvives(old, newSup, atr)
+                old.diedBar   := bar_index
+                old.wasBroken := false
+                archiveIfNew(old, atr)
+    oldResCopy = resZones.copy()
+    oldSupCopy = supZones.copy()
+    resZones.clear()
+    if newRes.size() > 0
+        for i = 0 to newRes.size() - 1
+            nzz = newRes.get(i)
+            if not isAlreadyBroken(nzz, atr)
+                inh = inheritState(nzz, oldResCopy, atr)
+                resZones.push(inh)
+    supZones.clear()
+    if newSup.size() > 0
+        for i = 0 to newSup.size() - 1
+            nzz = newSup.get(i)
+            if not isAlreadyBroken(nzz, atr)
+                inh = inheritState(nzz, oldSupCopy, atr)
+                supZones.push(inh)
+
+
+// =====================================================================
+//  SECTION 6 - SIGNAL ENGINE  (cooldowns, retest detection)
+// =====================================================================
+var array<float> sigZoneCenters = array.new<float>()
+var array<int>   sigZoneBars    = array.new<int>()
+
+// Cooldown gate per-zone (KB 6.1): suppress repeat signals within N bars.
+cooldownOk(float center) =>
+    ok = true
+    if sigZoneCenters.size() > 0
+        for i = 0 to sigZoneCenters.size() - 1
+            if math.abs(sigZoneCenters.get(i) - center) <= atr * clusterTol
+                if bar_index - sigZoneBars.get(i) < sigCooldown
+                    ok := false
+                    break
+    ok
+
+recordSignal(float center) =>
+    sigZoneCenters.push(center)
+    sigZoneBars.push(bar_index)
+    if sigZoneCenters.size() > 50
+        sigZoneCenters.shift()
+        sigZoneBars.shift()
+    center
+
+zoneRenderable(Zone z) =>
+    na(z.diedBar) and z.touches >= minTouches and not na(z.top) and not na(z.bot) and z.top > 0 and z.bot > 0 and z.bot < z.top
+
+// Successful support test - pierced low + close held above bottom + bullish bar.
+checkSupBounce() =>
+    fired = false
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if zoneRenderable(z)
+                pierced = low <= z.top
+                heldUp  = close >= z.bot and close >= open
+                if pierced and heldUp and cooldownOk(z.center)
+                    recordSignal(z.center)
+                    fired := true
+                    break
+    fired
+
+// Successful resistance reject - pierced high + close held below top + bearish bar.
+checkResReject() =>
+    fired = false
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if zoneRenderable(z)
+                pierced = high >= z.bot
+                heldDn  = close <= z.top and close <= open
+                if pierced and heldDn and cooldownOk(z.center)
+                    recordSignal(z.center)
+                    fired := true
+                    break
+    fired
+
+// Bullish retest of a broken resistance from above (now-support).
+checkRetestBull() =>
+    fired = false
+    if brokenZones.size() > 0
+        for i = 0 to brokenZones.size() - 1
+            z = brokenZones.get(i)
+            if z.isResistance and z.wasBroken and not na(z.diedBar)
+                age = bar_index - z.diedBar
+                if age > 0 and age <= retestWindow
+                    if low <= z.top and close >= z.bot and close >= open
+                        fired := true
+                        break
+    fired
+
+// Bearish retest of a broken support from below (now-resistance).
+checkRetestBear() =>
+    fired = false
+    if brokenZones.size() > 0
+        for i = 0 to brokenZones.size() - 1
+            z = brokenZones.get(i)
+            if not z.isResistance and z.wasBroken and not na(z.diedBar)
+                age = bar_index - z.diedBar
+                if age > 0 and age <= retestWindow
+                    if high >= z.bot and close <= z.top and close <= open
+                        fired := true
+                        break
+    fired
+
+bounceUp   = checkSupBounce()
+bounceDown = checkResReject()
+retestUp   = checkRetestBull()
+retestDown = checkRetestBear()
+
+
+// =====================================================================
+//  SECTION 6b - ZONE OF INTEREST DETECTION
+// =====================================================================
+// A zone qualifies as Zone of Interest when:
+//   - touches == minTouches (was tested only the minimum required times)
+//   - cumulative volume > zoiVolPct % of strongest active zone
+//   - it has been quiet for at least zoiQuiet bars since lastTouch
+// These three together flag levels that absorbed strong volume on
+// formation and have NOT been rebuffered since - i.e. the next likely
+// reaction zone if price returns there.
+maxVolAcrossActive() =>
+    m = 0.0
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.volSum)
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.volSum)
+    m
+
+var bool zoiNewlyActivated = false
+zoiNewlyActivated := false
+
+// Detect ZOI on each side; mark zone metadata and emit a one-shot pulse
+// the bar it is first activated.
+classifyZOI(array<Zone> zs, float maxVol) =>
+    activated = false
+    if zoiEnable and zs.size() > 0 and maxVol > 0
+        for i = 0 to zs.size() - 1
+            z = zs.get(i)
+            if zoneRenderable(z)
+                volPct       = z.volSum / maxVol * 100.0
+                quietEnough  = na(z.lastTouch) ? true : (bar_index - z.lastTouch) >= zoiQuiet
+                touchOk      = z.touches == minTouches
+                qualifies    = touchOk and volPct >= zoiVolPct and quietEnough
+                if qualifies and not z.isZOI
+                    z.isZOI       := true
+                    z.zoiSinceBar := bar_index
+                    activated := true
+                    zs.set(i, z)
+                else if not qualifies and z.isZOI
+                    z.isZOI       := false
+                    z.zoiSinceBar := na
+                    zs.set(i, z)
+    activated
+
+zoiResAct = classifyZOI(resZones, maxVolAcrossActive())
+zoiSupAct = classifyZOI(supZones, maxVolAcrossActive())
+zoiNewlyActivated := zoiResAct or zoiSupAct
+
+
+// =====================================================================
+//  SECTION 7 - SIGNAL PLOTSHAPES
+// =====================================================================
+plotshape(showTest   and bounceUp,   "Successful test up",   shape.circle,  location.belowbar, color.new(supColor,  0), size=size.tiny)
+plotshape(showTest   and bounceDown, "Successful test down", shape.circle,  location.abovebar, color.new(resColor,  0), size=size.tiny)
+plotshape(showRetest and retestUp,   "Retest support",       shape.diamond, location.belowbar, color.new(supColor,  0), size=size.tiny)
+plotshape(showRetest and retestDown, "Retest resistance",    shape.diamond, location.abovebar, color.new(resColor,  0), size=size.tiny)
+
+// Reaction holds (zone touched but no clean signal).
+resHold = false
+supHold = false
+if resZones.size() > 0
+    for i = 0 to resZones.size() - 1
+        z = resZones.get(i)
+        if zoneRenderable(z)
+            if high >= z.bot and close < z.top
+                resHold := true
+                break
+if supZones.size() > 0
+    for i = 0 to supZones.size() - 1
+        z = supZones.get(i)
+        if zoneRenderable(z)
+            if low <= z.top and close > z.bot
+                supHold := true
+                break
+
+plotshape(showReaction and supHold, "Support hold",    shape.diamond, location.belowbar, color.new(supColor, 30), size=size.tiny)
+plotshape(showReaction and resHold, "Resistance hold", shape.diamond, location.abovebar, color.new(resColor, 30), size=size.tiny)
+
+
+// =====================================================================
+//  SECTION 8 - DRAWING (boxes, lines, labels - barstate.islast)
+// =====================================================================
+var array<box>   bxBuf  = array.new<box>()
+var array<line>  lnBuf  = array.new<line>()
+var array<label> lbBuf  = array.new<label>()
+var array<box>   zoiBuf = array.new<box>()
+var array<label> zoiLbl = array.new<label>()
+
+clearBuffers() =>
+    if bxBuf.size() > 0
+        for i = 0 to bxBuf.size() - 1
+            box.delete(bxBuf.get(i))
+    if lnBuf.size() > 0
+        for i = 0 to lnBuf.size() - 1
+            line.delete(lnBuf.get(i))
+    if lbBuf.size() > 0
+        for i = 0 to lbBuf.size() - 1
+            label.delete(lbBuf.get(i))
+    if zoiBuf.size() > 0
+        for i = 0 to zoiBuf.size() - 1
+            box.delete(zoiBuf.get(i))
+    if zoiLbl.size() > 0
+        for i = 0 to zoiLbl.size() - 1
+            label.delete(zoiLbl.get(i))
+    bxBuf.clear()
+    lnBuf.clear()
+    lbBuf.clear()
+    zoiBuf.clear()
+    zoiLbl.clear()
+    bxBuf.size()
+
+ageFade(int lastTouch) =>
+    if fadeAge <= 0 or na(lastTouch)
+        0
+    else
+        age = bar_index - lastTouch
+        age <= 0 ? 0 : math.min(15, int(age * 15.0 / fadeAge))
+
+isFar(float zoneCenter) =>
+    if hideFar <= 0 or close <= 0
+        false
+    else
+        distPct = math.abs(zoneCenter - close) / close * 100.0
+        distPct > hideFar
+
+// Animated pulse modulator - returns 0..15 added to the glow opacity so
+// the border gently breathes each bar without flooding draw limits.
+zoiPulseAdj() =>
+    if not zoiPulse
+        0
+    else
+        // Sine wave on bar_index, period ~ 8 bars.
+        float phase = bar_index % 8
+        float v     = math.sin(phase / 8.0 * 2.0 * 3.14159)
+        int(math.round((v + 1.0) * 0.5 * 12.0))
+
+// Render an alive zone (filled box + dashed center + label).
+drawAlive(Zone z, color baseCol, float maxS, float maxVol) =>
+    if not na(z.top) and not na(z.bot) and not na(z.center) and z.top > 0 and z.bot > 0 and z.bot < z.top and not isFar(z.center)
+        rightX  = bar_index + 25
+        startX  = safeStartBar(z.firstBar)
+        extra   = ageFade(z.lastTouch)
+        volBoost = 0
+        if useVolColor and maxVol > 0
+            volRatio = math.min(1.0, z.volSum / maxVol)
+            volBoost := int(volRatio * 35)
+        fillOp = math.max(40, math.min(95, zoneOpacity + extra - volBoost))
+        fill   = color.new(baseCol, fillOp)
+        edge   = color.new(baseCol, math.min(95, 35 + extra - volBoost / 2))
+        bxBuf.push(box.new(startX, z.top, rightX, z.bot, border_color=na, bgcolor=fill))
+        lnBuf.push(line.new(startX, z.center, rightX, z.center, color=edge, style=line.style_dashed, width=1))
+        if showLabels
+            string txt = ""
+            stars = strengthStars(z.strength, maxS)
+            zoiTag = (z.isZOI and zoiLabel) ? "  ZOI" : ""
+            if showVolText and maxVol > 0
+                string volVal = ""
+                if volFormat == "Percentage"
+                    volPct = int((z.volSum / maxVol) * 100)
+                    volVal := str.tostring(volPct) + "%"
+                else
+                    volVal := formatVolume(z.volSum)
+                if singleLine
+                    txt := stars + "  " + str.tostring(z.touches) + "x" + "  -  Vol: " + volVal + zoiTag
+                else
+                    txt := "Vol: " + volVal + "\n" + stars + "  " + str.tostring(z.touches) + "x" + zoiTag
+            else
+                txt := stars + "  " + str.tostring(z.touches) + "x" + zoiTag
+            labelBg = z.isZOI ? color.new(zoiGlowCol, 70) : color.new(baseCol, 75)
+            lbBuf.push(label.new(rightX, z.center, txt, style=label.style_label_left, color=labelBg, textcolor=chart.fg_color, size=size.small))
+    z.center
+
+// Render a broken / dropped zone in muted colors.
+drawBroken(Zone z) =>
+    if not na(z.top) and not na(z.bot) and z.top > 0 and z.bot > 0 and z.bot < z.top and not isFar(z.center)
+        useCol  = z.isResistance ? brokenBear : brokenBull
+        fill    = color.new(useCol, brokenOp)
+        edge    = color.new(useCol, math.min(90, brokenOp + 10))
+        startX  = safeStartBar(z.firstBar)
+        endBar  = na(z.diedBar) ? bar_index : safeStartBar(z.diedBar)
+        bxBuf.push(box.new(startX, z.top, endBar, z.bot, border_color=na, bgcolor=fill))
+        lnBuf.push(line.new(startX, z.center, endBar, z.center, color=edge, style=line.style_dashed, width=1))
+        if showReaction and z.wasBroken and not na(z.diedBar) and z.isLiveBreak
+            lblY     = z.isResistance ? z.top : z.bot
+            lblStyle = z.isResistance ? label.style_label_down : label.style_label_up
+            lblTxt   = z.isResistance ? "Break R" : "Break S"
+            lblColor = z.isResistance ? color.rgb(200, 60, 60) : color.rgb(40, 160, 120)
+            lbBuf.push(label.new(safeStartBar(z.diedBar), lblY, lblTxt, style=lblStyle, color=lblColor, textcolor=color.white, size=size.small))
+    z.center
+
+// Render the Zone of Interest glow overlay - bright bordered box drawn
+// on top of the existing zone fill, slightly larger than the zone itself
+// so the bright border peeks out around the edges. With pulse enabled,
+// the inner fill modulates each bar.
+drawZOIGlow(Zone z) =>
+    if not na(z.top) and not na(z.bot) and not isFar(z.center)
+        rightX = bar_index + 25
+        startX = safeStartBar(z.firstBar)
+        // Outer border halo
+        haloPad  = atr * 0.12
+        haloTop  = z.top + haloPad
+        haloBot  = z.bot - haloPad
+        pulseAdd = zoiPulseAdj()
+        fillOp   = math.min(95, 80 + pulseAdd)
+        zoiFill  = color.new(zoiGlowCol, fillOp)
+        zoiEdge  = color.new(zoiGlowCol, 0)
+        zoiBuf.push(box.new(startX, haloTop, rightX, haloBot, border_color=zoiEdge, border_width=zoiBorderW, bgcolor=zoiFill))
+        if zoiLabel
+            tagY    = z.isResistance ? haloTop : haloBot
+            tagSty  = z.isResistance ? label.style_label_down : label.style_label_up
+            zoiLbl.push(label.new(safeStartBar(z.firstBar) + 2, tagY, "ZOI", style=tagSty, color=color.new(zoiGlowCol, 25), textcolor=color.black, size=size.tiny))
+    z.center
+
+// Aggregate strength / volume across active zones for normalization.
+maxStrengthAcross() =>
+    m = 0.0
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.strength)
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.strength)
+    m
+
+maxVolAcross() =>
+    m = 0.0
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.volSum)
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar)
+                m := math.max(m, z.volSum)
+    m
+
+// Find the strongest (highest volume) active resistance / support.
+findTopActiveRes() =>
+    var Zone none = na
+    found = none
+    bestV = -1.0
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar) and z.volSum > bestV
+                bestV := z.volSum
+                found := z
+    found
+
+findTopActiveSup() =>
+    var Zone none = na
+    found = none
+    bestV = -1.0
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar) and z.volSum > bestV
+                bestV := z.volSum
+                found := z
+    found
+
+// Distance to nearest active zone (above OR below current price).
+nearestActiveZone() =>
+    var Zone none = na
+    nearest = none
+    bestD   = 1e15
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar)
+                d = math.abs(z.center - close)
+                if d < bestD
+                    bestD := d
+                    nearest := z
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar)
+                d = math.abs(z.center - close)
+                if d < bestD
+                    bestD := d
+                    nearest := z
+    nearest
+
+// Count active zones per side.
+countActive(array<Zone> zs) =>
+    n = 0
+    if zs.size() > 0
+        for i = 0 to zs.size() - 1
+            z = zs.get(i)
+            if na(z.diedBar)
+                n += 1
+    n
+
+// Has there been a recent break (within retestWindow)?
+recentBreakStatus() =>
+    string status = "-"
+    int    recBar = -1
+    if brokenZones.size() > 0
+        for i = 0 to brokenZones.size() - 1
+            z = brokenZones.get(i)
+            if z.wasBroken and z.isLiveBreak and not na(z.diedBar)
+                if z.diedBar > recBar
+                    recBar := z.diedBar
+                    status := z.isResistance ? "Bear R broken" : "Bull S broken"
+    if recBar >= 0 and (bar_index - recBar) > retestWindow
+        status := "-"
+    status
+
+// Drawing dispatch on the last bar only - keeps drawing budget bounded.
+if barstate.islast
+    clearBuffers()
+    mx = maxStrengthAcross()
+    mv = maxVolAcross()
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar)
+                drawAlive(z, resColor, mx, mv)
+                if z.isZOI
+                    drawZOIGlow(z)
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar)
+                drawAlive(z, supColor, mx, mv)
+                if z.isZOI
+                    drawZOIGlow(z)
+    if (showBroken or showDropped) and brokenZones.size() > 0
+        for i = 0 to brokenZones.size() - 1
+            z = brokenZones.get(i)
+            shouldShow = (z.wasBroken and showBroken) or (not z.wasBroken and showDropped)
+            if shouldShow
+                drawBroken(z)
+
+
+// =====================================================================
+//  SECTION 9 - DASHBOARD  (NEW vs original; 7 rows positionable)
+// =====================================================================
+var table dashTbl = na
+
+if showDash and barstate.islast
+    if not na(dashTbl)
+        table.delete(dashTbl)
+    dashTbl := table.new(strToPos(dashPosStr), 2, 8,
+         bgcolor=color.new(C_BG, 80),
+         frame_color=color.new(C_FRAME, 35),
+         frame_width=1,
+         border_color=color.new(C_FRAME, 75),
+         border_width=1)
+
+    int  dashRows = 8
+    int  hdrAlpha = 60
+    color hdrBg   = color.new(themeAccent, hdrAlpha)
+    color rBg     = color.new(resColor, 80)
+    color sBg     = color.new(supColor, 80)
+    color zBg     = color.new(zoiGlowCol, 80)
+    color rowBgA  = grad(themeBg, 0, dashRows, 86, 95)
+    string fSize  = dashSizeStr
+    sizeRes       = strToSize(fSize)
+
+    // -------- Header --------
+    table.cell(dashTbl, 0, 0, dashCompact ? "S/R" : "S/R ZONES", text_color=color.white, bgcolor=hdrBg, text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 0, "[JOAT]", text_color=color.white, bgcolor=hdrBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Active Resistance count --------
+    int resN = countActive(resZones)
+    table.cell(dashTbl, 0, 1, dashCompact ? "Res" : "Active Resistance", text_color=chart.fg_color, bgcolor=grad(themeBg, 1, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 1, str.tostring(resN), text_color=resColor, bgcolor=rBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Active Support count --------
+    int supN = countActive(supZones)
+    table.cell(dashTbl, 0, 2, dashCompact ? "Sup" : "Active Support", text_color=chart.fg_color, bgcolor=grad(themeBg, 2, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 2, str.tostring(supN), text_color=supColor, bgcolor=sBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Top Resistance (price + star) --------
+    Zone topR = findTopActiveRes()
+    string topRStr = "-"
+    if not na(topR)
+        topRStr := str.tostring(topR.center, format.mintick) + "  " + strengthStars(topR.strength, maxStrengthAcross())
+    table.cell(dashTbl, 0, 3, dashCompact ? "Top R" : "Top Resistance", text_color=chart.fg_color, bgcolor=grad(themeBg, 3, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 3, topRStr, text_color=resColor, bgcolor=rBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Top Support (price + star) --------
+    Zone topS = findTopActiveSup()
+    string topSStr = "-"
+    if not na(topS)
+        topSStr := str.tostring(topS.center, format.mintick) + "  " + strengthStars(topS.strength, maxStrengthAcross())
+    table.cell(dashTbl, 0, 4, dashCompact ? "Top S" : "Top Support", text_color=chart.fg_color, bgcolor=grad(themeBg, 4, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 4, topSStr, text_color=supColor, bgcolor=sBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Distance to Nearest --------
+    Zone near = nearestActiveZone()
+    string nearStr = "-"
+    color  nearCol = chart.fg_color
+    if not na(near)
+        float dPct = distancePct(near.center, close)
+        if not na(dPct)
+            string dir = near.center >= close ? "v" : "^"
+            nearStr := str.tostring(near.center, format.mintick) + "  (" + str.tostring(dPct, "#.##") + "% " + dir + ")"
+            nearCol := near.isResistance ? resColor : supColor
+    table.cell(dashTbl, 0, 5, dashCompact ? "Near" : "Distance to Nearest", text_color=chart.fg_color, bgcolor=grad(themeBg, 5, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 5, nearStr, text_color=nearCol, bgcolor=color.new(themeAccent, 90), text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Recent Break --------
+    string brStat = recentBreakStatus()
+    color  brCol  = brStat == "Bear R broken" ? resColor : brStat == "Bull S broken" ? supColor : chart.fg_color
+    color  brBg   = brStat == "-"             ? color.new(themeBg, 92)
+         : brStat == "Bear R broken"          ? color.new(resColor, 70)
+         :                                      color.new(supColor, 70)
+    table.cell(dashTbl, 0, 6, dashCompact ? "Brk" : "Recent Break", text_color=chart.fg_color, bgcolor=grad(themeBg, 6, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 6, brStat, text_color=brCol, bgcolor=brBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+    // -------- Zone of Interest count --------
+    int zoiN = 0
+    if resZones.size() > 0
+        for i = 0 to resZones.size() - 1
+            z = resZones.get(i)
+            if na(z.diedBar) and z.isZOI
+                zoiN += 1
+    if supZones.size() > 0
+        for i = 0 to supZones.size() - 1
+            z = supZones.get(i)
+            if na(z.diedBar) and z.isZOI
+                zoiN += 1
+    table.cell(dashTbl, 0, 7, dashCompact ? "ZOI" : "Zone of Interest", text_color=chart.fg_color, bgcolor=grad(themeBg, 7, dashRows, 86, 95), text_size=sizeRes, text_font_family=font.family_monospace)
+    table.cell(dashTbl, 1, 7, zoiN > 0 ? str.tostring(zoiN) + " active" : "-", text_color=zoiGlowCol, bgcolor=zBg, text_halign=text.align_right, text_size=sizeRes, text_font_family=font.family_monospace)
+
+
+// =====================================================================
+//  SECTION 10 - ALERTS
+// =====================================================================
+priceTouchesAlive(array<Zone> zs) =>
+    hit = false
+    if zs.size() > 0
+        for i = 0 to zs.size() - 1
+            z = zs.get(i)
+            if na(z.diedBar) and z.touches >= minTouches and high >= z.bot and low <= z.top
+                hit := true
+                break
+    hit
+
+touchedRes = priceTouchesAlive(resZones)
+touchedSup = priceTouchesAlive(supZones)
+
+brokeRes = false
+brokeSup = false
+if resZones.size() > 0
+    for i = 0 to resZones.size() - 1
+        z = resZones.get(i)
+        if not na(z.diedBar) and z.diedBar == bar_index and z.touches >= minTouches and z.isLiveBreak
+            brokeRes := true
+if supZones.size() > 0
+    for i = 0 to supZones.size() - 1
+        z = supZones.get(i)
+        if not na(z.diedBar) and z.diedBar == bar_index and z.touches >= minTouches and z.isLiveBreak
+            brokeSup := true
+
+alertcondition(touchedRes,                   "Resistance touched",        "Price reached an active resistance zone")
+alertcondition(touchedSup,                   "Support touched",           "Price reached an active support zone")
+alertcondition(brokeRes,                     "Resistance broken",         "Price closed above a resistance zone")
+alertcondition(brokeSup,                     "Support broken",            "Price closed below a support zone")
+alertcondition(bounceUp,                     "Successful support test",   "Bullish reaction at support zone")
+alertcondition(bounceDown,                   "Successful resistance test","Bearish reaction at resistance zone")
+alertcondition(retestUp,                     "Bullish retest",            "Price retested a broken resistance from above")
+alertcondition(retestDown,                   "Bearish retest",            "Price retested a broken support from below")
+alertcondition(newHighPivot or newLowPivot,  "New pivot",                 "A new pivot was confirmed and zones updated")
+alertcondition(alertsZOI and zoiNewlyActivated, "Zone of Interest activated", "A new Zone of Interest has been detected")
+
+
+// =====================================================================
+//  END OF FILE - Smart SR Zones [JOAT]
+// =====================================================================
