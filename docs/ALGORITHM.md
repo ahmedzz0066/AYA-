@@ -119,7 +119,8 @@ score = Σ wᵢ·fᵢ / Σ wᵢ            fᵢ ∈ [0,1]
 - cluster tightness `1 − σ/(ATR·clusterTol)`
 - recency `1/(1 + age/decayBars)`, where `decayBars` scales with the
   detector width instead of v1's hardcoded 200 (fixes **S5**)
-- volume-profile node score (§5)
+- volumetric prior — the pre-touch field score (§5); the only feature that
+  can carry a zone on its own
 - higher-timeframe confluence (§6)
 - round-number proximity
 
@@ -171,19 +172,20 @@ Everything resolves on closed bars when `confirmBarsOnly` is on. Fixes **S6**.
 
 ---
 
-## 5. Volume profile
+## 5. Volumetric prior field — the pre-touch layer
 
-A rolling histogram over `vpLook` bars, `vpBinsN` bins, rebuilt every
-`vpRefresh` bars, each bar contributing its participation to the bins of its
-high, low and close. A level's node score is the smoothed bin value at its
-centre, normalised to the profile maximum.
+An ego-shifting occupancy grid over price carrying volume, signed delta,
+time-at-price and unconsumed inventory ("fuel") per bin. Four terms — shelf,
+velocity, trapped inventory, void adjacency — compose into a prior that needs
+**no pivot, no touch and no outcome history**, so a Zone of Interest can be
+published before price ever reaches it. Local maxima of the field are seeded
+as tracks with `hits = 0`, and the sign of the stranded cohort predicts
+whether the level will act as support or resistance on return.
 
-Pivot geometry tells you where price *turned*. It says nothing about where
-size actually changed hands. A level coinciding with a high-volume node has
-real inventory parked on it; an identical-looking swing high in thin air does
-not.
+Scored separately from the P(hold) calibration by an ex-ante ledger: of the
+calls made *before* price arrived, how many produced the predicted reaction.
 
----
+Full derivation, parameters and limits: **[`VOLUMETRIC_PRIOR.md`](VOLUMETRIC_PRIOR.md)**.
 
 ## 6. Higher-timeframe confluence
 
@@ -246,8 +248,9 @@ hindsight-flattering rendering. Addresses **M6**.
 | Break | Max flips | 2 | Retire after this many role changes |
 | Scoring | Evidence weight β | 0.9 | 0 = pure feature model |
 | Scoring | Laplace α | 1.0 | Smoothing on held/broke counts |
-| ZOI | Min P(hold) | 0.62 | Replaces v1's `touches == minTouches` (**C6**) |
-| ZOI | Max resolved tests | 1 | The "unspent" half of the idea |
+| ZOI | Min volumetric prior | 0.55 | Pre-touch gate; replaces v1's `touches == minTouches` (**C6**) |
+| ZOI | Min fuel | 0.60 | Unconsumed inventory required to stay armed |
+| ZOI | Min distance | 1.0 ATR | A level you are standing in is not a forward target |
 
 ---
 

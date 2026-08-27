@@ -12,6 +12,7 @@ probability, and an on-chart reliability check.
 |---|---|
 | `docs/AUDIT.md` | What v1 gets right, and 7 critical + 8 significant defects with line references |
 | `docs/ALGORITHM.md` | The v2 pipeline, the maths, parameter reference, tuning notes, known limits |
+| `docs/VOLUMETRIC_PRIOR.md` | The a-priori field: how a Zone of Interest is found **before** it is touched |
 | `pine/smart_sr_zones_v2.pine` | The v2 indicator, ready to paste into the Pine editor |
 | `reference/smart_sr_zones_v1_original.pine` | Verbatim v1 source, so every citation is checkable |
 
@@ -35,16 +36,38 @@ that is relative to whatever else happens to be on screen.
 | **Touch count** | Pivots in the cluster | Pivots *and* resolved tests, shown separately |
 | **Break** | One close past the edge, then blacklisted | ATR buffer + N confirming closes + volume, then **flips role** |
 | **Score** | Weighted sum, stars relative to the best on screen | Feature prior + Laplace-smoothed outcome evidence → absolute `P(hold)` |
-| **Context** | — | Volume profile node, higher-TF confluence, round numbers |
+| **Context** | — | Volumetric prior field, higher-TF confluence, round numbers |
+| **ZOI** | `touches == minTouches` — retrospective, and structurally excluded any zone with more than the minimum pivots | Pure prior: stranded inventory + fuel + distance. No touch, no pivot, no outcome history |
 | **Repainting** | Undisclosed | Honest mode draws from the confirmation bar |
 | **Validation** | None | On-chart reliability: predicted vs realised hold rate, with `n` |
+
+## Finding a zone before it is touched
+
+The second pass adds a **volumetric prior**: an ego-shifting occupancy grid
+carrying volume, signed delta, time-at-price and unconsumed inventory per
+price bin.
+
+An untested level is not interesting because of its geometry — it is
+interesting because a known cohort is stranded there. Volume says they exist,
+signed delta says which side, and the distance price has since travelled says
+how much pain they are in. When price returns to their breakeven they get out,
+and that *is* the reaction.
+
+So a zone can be published with **zero pivots and zero touches**, with a
+predicted role (`R`/`S`) and a fuel gauge showing how much of the stored
+inventory is still unspent. It is scored by its own ex-ante ledger: of the
+calls made before price arrived, how many produced the predicted reaction.
+
+Details in [`docs/VOLUMETRIC_PRIOR.md`](docs/VOLUMETRIC_PRIOR.md).
 
 ## The reliability row
 
 The dashboard's bottom row is the point of the whole exercise:
 
 ```
-Reliability   68% vs 64%   n=143
+Next ZOI            4218.50  R  84%  2.1 ATR
+Prior (pre-touch)   61%  n=37
+Reliability         68% vs 64%  n=143
 ```
 
 Every resolved test is filed into the probability bucket that was live *before*
