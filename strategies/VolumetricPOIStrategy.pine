@@ -1,0 +1,738 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VOLUMETRIC POI STRATEGY  —  استراتيجية نقاط الاهتمام الحجمية         Pine v6
+// ───────────────────────────────────────────────────────────────────────────────
+//  الفكرة | Thesis
+//    نقطة الاهتمام (POI) ليست شمعة ولا خطاً، بل هي *أثر* تركه أمر مؤسسي كبير
+//    لم يُنفَّذ بالكامل، فاندفع السعر مبتعداً عنه. لذلك لا نؤهّل المنطقة بشكل
+//    السوينغ، بل ببصمتها الحجمية: فوليوم الاندفاع، سرعته، ميل الدلتا، كفاءة
+//    القاعدة، وطزاجة المنطقة.
+//
+//    A POI is not a candle and not a line — it is the residue of a large,
+//    partially-unfilled institutional order that price fled from. We therefore
+//    qualify it by the VOLUME SIGNATURE of the departure, never by swing shape.
+//
+//  خط الأنابيب | Pipeline
+//    ①  كشف الاندفاع (Displacement) + شمعة الأصل (Origin) → POI خام.
+//    ②  تقييم حجمي 0-100 من خمسة مكوّنات موزونة.
+//    ③  انحياز الفريم الأعلى (غير مُعيد للرسم) يفلتر الاتجاه المسموح.
+//    ④  دخول بأمر معلّق عند الحافة القريبة، أو بشمعة تأكيد بعد اللمس.
+//    ⑤  إدارة مخاطر: حجم بالمخاطرة %, تعادل, جني جزئي, تتبّع ATR.
+//    ⑥  حراسة الحساب: خسارة يومية قصوى, عدد صفقات, جلسة تداول, تبريد.
+//
+//  عدم إعادة الرسم | Non-repainting
+//    كل منطقة تُنشأ على شمعة مغلقة فقط (barstate.isconfirmed)، وبيانات الفريم
+//    الأعلى تُسحب بـ lookahead_off مع إزاحة [1]. لا شيء يتغيّر بأثر رجعي.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+strategy("Volumetric POI Strategy | استراتيجية نقاط الاهتمام الحجمية",
+     shorttitle              = "VolPOI",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     slippage                = 2,
+     max_boxes_count         = 500,
+     max_labels_count        = 500,
+     max_lines_count         = 500,
+     max_bars_back           = 1000)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPES  |  الأنواع
+// ═══════════════════════════════════════════════════════════════════════════════
+type POI
+    float top          // الحافة العليا | upper bound
+    float bot          // الحافة السفلى | lower bound
+    int   left         // بار الأصل | origin bar index
+    int   dir          //  1 = طلب Demand   |  -1 = عرض Supply
+    float score        // التقييم الحجمي الحالي 0-100
+    float score0       // التقييم عند الولادة
+    int   touches      // عدد اللمسات
+    bool  broken       // هل استُهلكت بإغلاق معاكس؟
+    bool  htf          // متداخلة مع انحياز الفريم الأعلى؟
+    bool  inside       // مزلاج اللمسة (كان السعر داخلها في الشمعة السابقة)
+    box   bx
+    label lb
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS  |  الإعدادات
+// ═══════════════════════════════════════════════════════════════════════════════
+const string G1 = "①  تأهيل الاندفاع | Displacement Qualification"
+const string G2 = "②  بناء المنطقة | POI Construction"
+const string G3 = "③  التقييم الحجمي | Volumetric Scoring"
+const string G4 = "④  الانحياز والفلاتر | Bias & Filters"
+const string G5 = "⑤  الدخول | Entry"
+const string G6 = "⑥  المخاطرة والخروج | Risk & Exits"
+const string G7 = "⑦  حراسة الحساب | Account Guards"
+const string G8 = "⑧  العرض | Visuals & Dashboard"
+
+// ── ① تأهيل الاندفاع
+volLen    = input.int(20,   "طول متوسط الفوليوم | Volume MA length",   minval = 2,   maxval = 500, group = G1, tooltip = "النافذة المتحرّكة التي يُقاس عليها فوليوم شمعة الاندفاع.")
+volMult   = input.float(2.0,"فوليوم الاندفاع (× المتوسط) | Displacement volume", minval = 1.0, step = 0.1, group = G1, tooltip = "يجب أن يكون فوليوم شمعة الاندفاع مضاعفاً للمتوسط بهذا القدر — إثبات مشاركة حقيقية لا انجراف.")
+bodyRatio = input.float(0.55,"نسبة الجسم/المدى | Min body ÷ range",    minval = 0.1, maxval = 1.0, step = 0.05, group = G1, tooltip = "يفلتر الشموع ذات الظلال الطويلة والتردّد. قيمة عالية = شمعة حاسمة.")
+dispAtr   = input.float(1.2,"سرعة الاندفاع (الجسم × ATR) | Displacement speed", minval = 0.1, step = 0.1, group = G1, tooltip = "جسم شمعة الاندفاع يجب أن يتجاوز هذا المضاعف من ATR — أي أن السعر *هرب* ولم يزحف.")
+atrLen    = input.int(14,   "طول ATR | ATR length",                    minval = 1,   maxval = 500, group = G1)
+needBos   = input.bool(true,"اشتراط كسر هيكل | Require structure break", group = G1, tooltip = "لا تُقبل المنطقة إلا إذا أغلق الاندفاع فوق أعلى/أدنى آخر N شمعة.")
+bosLen    = input.int(10,   "مدى كسر الهيكل | Structure lookback",      minval = 2,   maxval = 200, group = G1)
+
+// ── ② بناء المنطقة
+originLB  = input.int(8,    "بحث شمعة الأصل | Origin search depth",     minval = 1,   maxval = 30, group = G2, tooltip = "كم شمعة نرجع للخلف بحثاً عن آخر شمعة معاكسة اللون (أصل الأمر المؤسسي).")
+mergeBase = input.bool(true,"ضمّ شموع القاعدة | Merge base candles",    group = G2, tooltip = "يوسّع المنطقة لتشمل شموع التجميع الصغيرة الملاصقة لشمعة الأصل.")
+baseBody  = input.float(0.5,"أقصى جسم لشمعة قاعدة | Max base body ratio", minval = 0.05, maxval = 1.0, step = 0.05, group = G2)
+maxBase   = input.int(3,    "أقصى عدد شموع قاعدة | Max base candles",   minval = 1,   maxval = 8, group = G2)
+bodyZone  = input.bool(false,"المنطقة من الأجسام لا الظلال | Body-only POI", group = G2, tooltip = "تشغيل = حدود المنطقة من open/close (دخول أضيق وأدق). إطفاء = من high/low.")
+maxHeight = input.float(2.5,"أقصى ارتفاع للمنطقة (× ATR) | Max POI height", minval = 0.2, step = 0.1, group = G2, tooltip = "المناطق الأعرض من ذلك تُقصّ مع الحفاظ على الحافة القريبة من السعر (حافة الدخول).")
+maxPOI    = input.int(25,   "أقصى عدد مناطق لكل جهة | Max POIs per side", minval = 3, maxval = 200, group = G2)
+keepDead  = input.bool(false,"إبقاء المناطق المكسورة | Keep broken POIs", group = G2)
+
+// ── ③ التقييم الحجمي
+wVol      = input.float(30, "وزن · فوليوم الاندفاع | Weight · volume",   minval = 0, group = G3)
+wSpeed    = input.float(20, "وزن · سرعة الاندفاع | Weight · speed",      minval = 0, group = G3)
+wDelta    = input.float(20, "وزن · ميل الدلتا | Weight · delta imbalance", minval = 0, group = G3)
+wBase     = input.float(15, "وزن · كفاءة القاعدة | Weight · base efficiency", minval = 0, group = G3)
+wFresh    = input.float(15, "وزن · الطزاجة | Weight · freshness",        minval = 0, group = G3)
+htfBoost  = input.float(10, "مكافأة توافق الفريم الأعلى | HTF alignment boost", minval = 0, group = G3)
+minDraw   = input.int(40,   "أدنى تقييم للرسم | Min score to keep",      minval = 0, maxval = 100, group = G3, tooltip = "المناطق الأضعف من ذلك تُهمل عند الولادة.")
+decayTap  = input.float(20, "خصم التقييم لكل لمسة | Score decay per tap", minval = 0, group = G3, tooltip = "يُحاكي استهلاك الأوامر الراكدة داخل المنطقة مع كل إعادة اختبار.")
+breakVol  = input.float(1.2,"فوليوم الكسر (× المتوسط) | Break volume",   minval = 0.1, step = 0.1, group = G3, tooltip = "الإغلاق خلف المنطقة لا يُعدّ كسراً إلا بفوليوم حقيقي — امتصاص لا وخز.")
+
+// ── ④ الانحياز والفلاتر
+biasMode  = input.string("HTF + Structure", "وضع الانحياز | Bias mode", options = ["Off", "HTF EMA", "Structure", "HTF + Structure"], group = G4, tooltip = "يحدّد الاتجاه المسموح بالتداول فيه. Off = تداول الجهتين دائماً.")
+htfTf     = input.timeframe("240", "الفريم الأعلى | Higher timeframe",   group = G4)
+biasFast  = input.int(21,   "EMA سريع | Fast EMA",                       minval = 1, group = G4, inline = "ema")
+biasSlow  = input.int(55,   "بطيء | Slow",                               minval = 2, group = G4, inline = "ema")
+structLen = input.int(10,   "حساسية الهيكل | Structure pivot length",     minval = 2, maxval = 100, group = G4)
+useSess   = input.bool(false,"فلتر جلسة التداول | Session filter",        group = G4, inline = "sess")
+sessSpec  = input.session("0800-1700", "", group = G4, inline = "sess")
+sessTz    = input.string("UTC", "المنطقة الزمنية | Timezone", options = ["UTC", "Exchange", "America/New_York", "Europe/London", "Asia/Tokyo"], group = G4)
+
+// ── ⑤ الدخول
+entryMode = input.string("Limit at POI", "طريقة الدخول | Entry mode", options = ["Limit at POI", "Confirmation candle"], group = G5, tooltip = "Limit = أمر معلّق عند حافة المنطقة. Confirmation = ننتظر لمس المنطقة ثم شمعة ارتداد مغلقة خارجها.")
+minEntry  = input.int(60,   "أدنى تقييم للدخول | Min score to trade",     minval = 0, maxval = 100, group = G5)
+maxTouch  = input.int(0,    "أقصى لمسات مسموحة | Max prior touches",      minval = 0, maxval = 5,   group = G5, tooltip = "0 = مناطق طازجة فقط (لم تُلمس بعد).")
+entryDep  = input.float(0.0,"عمق الدخول داخل المنطقة | Entry depth", minval = 0.0, maxval = 1.0, step = 0.05, group = G5, tooltip = "0 = الحافة القريبة. 0.5 = منتصف المنطقة (تعبئة أقل لكن مخاطرة أصغر).")
+maxDist   = input.float(4.0,"أقصى بُعد عن السعر (× ATR) | Max distance",  minval = 0.2, step = 0.1, group = G5, tooltip = "تجاهل المناطق البعيدة جداً حتى لا يبقى أمر معلّق بلا معنى.")
+expireBar = input.int(30,   "عمر الأمر المعلّق (شمعة) | Pending order life", minval = 1, maxval = 500, group = G5)
+useCvd    = input.bool(false,"اشتراط توافق الدلتا التراكمية | Require CVD agreement", group = G5, tooltip = "لا تُسلَّح صفقة شراء إلا والدلتا التراكمية فوق متوسّطها (والعكس للبيع) — تدفّق أوامر يدعم الاتجاه لا يعاكسه.")
+cvdLen    = input.int(34,   "تنعيم الدلتا التراكمية | CVD smoothing", minval = 2, maxval = 500, group = G5)
+
+// ── ⑥ المخاطرة والخروج
+riskPct   = input.float(1.0,"المخاطرة لكل صفقة % | Risk per trade %",     minval = 0.01, maxval = 100, step = 0.05, group = G6)
+maxPosPct = input.float(100,"أقصى حجم مركز % من رأس المال | Max position % of equity", minval = 1, maxval = 1000, group = G6, tooltip = "سقف على القيمة الاسمية للمركز حتى لا يُنتج وقفٌ ضيّق حجماً مبالغاً فيه.")
+slBuf     = input.float(0.25,"هامش الوقف خلف المنطقة (× ATR) | Stop buffer", minval = 0.0, step = 0.05, group = G6)
+minStop   = input.float(0.3,"أدنى مسافة وقف (× ATR) | Min stop distance",  minval = 0.0, step = 0.05, group = G6)
+maxStop   = input.float(4.0,"أقصى مسافة وقف (× ATR) | Max stop distance",  minval = 0.2, step = 0.1,  group = G6, tooltip = "الإعدادات التي تُنتج وقفاً أوسع من ذلك تُرفض بدل تصغير الحجم إلى ما لا معنى له.")
+tpMode    = input.string("R-Multiple", "وضع الهدف | Target mode", options = ["R-Multiple", "Opposing POI"], group = G6)
+tp1R      = input.float(1.0,"الهدف الأول (R) | Target 1",                  minval = 0.1, step = 0.1, group = G6)
+tp2R      = input.float(2.5,"الهدف الثاني (R) | Target 2",                 minval = 0.1, step = 0.1, group = G6)
+partPct   = input.float(50, "نسبة الجني عند الهدف الأول % | Partial at TP1", minval = 0, maxval = 100, step = 5, group = G6)
+beEnable  = input.bool(true,"نقل الوقف للتعادل | Move stop to breakeven",   group = G6, inline = "be")
+beTrigR   = input.float(1.0,"عند (R)", minval = 0.1, step = 0.1, group = G6, inline = "be")
+beOffR    = input.float(0.05,"إزاحة التعادل (R) | BE offset",              minval = 0.0, maxval = 1.0, step = 0.05, group = G6, tooltip = "يضع الوقف فوق/تحت الدخول قليلاً لتغطية العمولة والانزلاق.")
+trlEnable = input.bool(true,"تتبّع الوقف بـ ATR | ATR trailing stop",       group = G6, inline = "trl")
+trlStartR = input.float(1.5,"يبدأ عند (R)", minval = 0.1, step = 0.1, group = G6, inline = "trl")
+trlMult   = input.float(2.0,"مضاعف التتبّع × ATR | Trail multiplier",      minval = 0.2, step = 0.1, group = G6)
+
+// ── ⑦ حراسة الحساب
+maxTrades = input.int(3,    "أقصى صفقات في اليوم | Max trades per day",    minval = 1, maxval = 50, group = G7)
+dayLoss   = input.float(3.0,"أقصى خسارة يومية % | Max daily loss %",       minval = 0.1, maxval = 100, step = 0.1, group = G7, tooltip = "عند بلوغها يتوقّف فتح صفقات جديدة حتى بداية اليوم التالي.")
+coolBars  = input.int(3,    "تبريد بعد الخروج (شمعة) | Cooldown bars",     minval = 0, maxval = 200, group = G7)
+allowLong = input.bool(true,"السماح بالشراء | Allow longs",  group = G7, inline = "side")
+allowShrt = input.bool(true,"السماح بالبيع | Allow shorts",  group = G7, inline = "side")
+
+// ── ⑧ العرض
+showPOI   = input.bool(true,"رسم المناطق | Draw POIs",        group = G8)
+showLbl   = input.bool(true,"وسوم التقييم | Score labels",    group = G8)
+showLvls  = input.bool(true,"رسم مستويات الصفقة | Draw trade levels", group = G8)
+showDash  = input.bool(true,"لوحة الأداء | Dashboard",        group = G8)
+dashPosIn = input.string("top_right", "موقع اللوحة | Position", options = ["top_right", "middle_right", "bottom_right", "top_left", "bottom_left"], group = G8)
+cDemWeak  = input.color(color.new(#26A69A, 82), "طلب · ضعيف | Demand weak", group = G8, inline = "dc")
+cDemStrong= input.color(color.new(#1B5E20, 40), "قوي | strong",             group = G8, inline = "dc")
+cSupWeak  = input.color(color.new(#EF5350, 82), "عرض · ضعيف | Supply weak", group = G8, inline = "sc")
+cSupStrong= input.color(color.new(#B71C1C, 40), "قوي | strong",             group = G8, inline = "sc")
+cHtfTint  = input.color(color.new(color.yellow, 55), "تلوين توافق الفريم الأعلى | HTF tint", group = G8)
+
+dashPos = dashPosIn == "top_right"    ? position.top_right    :
+          dashPosIn == "middle_right" ? position.middle_right :
+          dashPosIn == "bottom_right" ? position.bottom_right :
+          dashPosIn == "top_left"     ? position.top_left     : position.bottom_left
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CORE SERIES  |  السلاسل الأساسية
+// ═══════════════════════════════════════════════════════════════════════════════
+atr     = nz(ta.atr(atrLen), ta.tr)
+rng     = high - low
+bodySz  = math.abs(close - open)
+bodyPct = rng > 0 ? bodySz / rng : 0.0
+volMA   = ta.sma(nz(volume), volLen)
+relVol  = volMA > 0 ? nz(volume) / volMA : 0.0
+
+// ── وكيل الدلتا من تشريح الشمعة | candle-anatomy delta proxy
+//    buy  ≈ الفوليوم موزوناً بمكان الإغلاق من المدى، و sell هو المكمّل.
+//    تقريب خام لكنه رتيب (monotonic) ولا يُعيد الرسم إطلاقاً.
+buyShare  = rng > 0 ? (close - low) / rng : 0.5
+sellShare = rng > 0 ? (high - close) / rng : 0.5
+barDelta  = nz(volume) * (buyShare - sellShare)
+cumDelta  = ta.cum(barDelta)
+cvdEma    = ta.ema(cumDelta, cvdLen)
+
+// تدفّق الأوامر يوافق الاتجاه؟ | does cumulative delta agree with the trade side?
+f_cvdOk(int dir) => not useCvd or (dir == 1 ? cumDelta > cvdEma : cumDelta < cvdEma)
+
+// ── سجلّات المناطق | POI registries (declared early: helpers reference them)
+var array<POI> demandPOI = array.new<POI>()
+var array<POI> supplyPOI = array.new<POI>()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BIAS  |  الانحياز (غير مُعيد للرسم)
+// ═══════════════════════════════════════════════════════════════════════════════
+// الإزاحة [1] مطبَّقة داخل الدالة على متغيّر محلّي — أوضح وأأمن من فهرسة
+// نتيجة استدعاء الدالة من الخارج.
+f_htfBias() =>
+    ef = ta.ema(close, biasFast)
+    es = ta.ema(close, biasSlow)
+    b  = ef > es ? 1 : ef < es ? -1 : 0
+    b[1]
+
+// [1] + lookahead_off = قيمة الفريم الأعلى المغلقة فقط، بلا تسريب مستقبلي.
+htfBiasRaw = request.security(syminfo.tickerid, htfTf, f_htfBias(), lookahead = barmerge.lookahead_off)
+htfBias    = nz(htfBiasRaw, 0)
+
+// ── هيكل الفريم الحالي: آخر كسر لقمة/قاع محوري
+phS = ta.pivothigh(high, structLen, structLen)
+plS = ta.pivotlow(low,  structLen, structLen)
+var float lastPH = na
+var float lastPL = na
+if not na(phS)
+    lastPH := phS
+if not na(plS)
+    lastPL := plS
+var int structBias = 0
+if not na(lastPH) and close > lastPH
+    structBias := 1
+if not na(lastPL) and close < lastPL
+    structBias := -1
+
+bias = biasMode == "Off"       ? 0 :
+       biasMode == "HTF EMA"   ? htfBias :
+       biasMode == "Structure" ? structBias :
+       (htfBias == structBias ? htfBias : 0)      // "HTF + Structure" = توافق إجباري
+
+// اتجاه مسموح؟ (الانحياز 0 يعني حياد → الجهتان مسموحتان)
+f_biasOk(int dir) => bias == 0 or bias == dir
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HELPERS  |  الدوال المساعدة
+// ═══════════════════════════════════════════════════════════════════════════════
+f_poiColor(int dir, float score) =>
+    dir == 1 ? color.from_gradient(score, minDraw, 100, cDemWeak, cDemStrong)
+             : color.from_gradient(score, minDraw, 100, cSupWeak, cSupStrong)
+
+f_poiText(POI p) =>
+    (p.dir == 1 ? "POI ▲ " : "POI ▼ ") + str.tostring(math.round(p.score)) +
+     (p.htf ? " ★" : "") + (p.touches > 0 ? " ·" + str.tostring(p.touches) : "")
+
+// أقرب حافة معاكسة كهدف | nearest opposing POI edge as a target
+f_opposing(int dir, float ref) =>
+    float best = na
+    if dir == 1
+        if array.size(supplyPOI) > 0
+            for i = 0 to array.size(supplyPOI) - 1
+                POI p = array.get(supplyPOI, i)
+                if not p.broken and p.bot > ref
+                    if na(best) or p.bot < best
+                        best := p.bot
+    else
+        if array.size(demandPOI) > 0
+            for i = 0 to array.size(demandPOI) - 1
+                POI p = array.get(demandPOI, i)
+                if not p.broken and p.top < ref
+                    if na(best) or p.top > best
+                        best := p.top
+    best
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ①  DISPLACEMENT DETECTION  |  كشف الاندفاع
+// ═══════════════════════════════════════════════════════════════════════════════
+bosUp = close > nz(ta.highest(high, bosLen)[1], high)
+bosDn = close < nz(ta.lowest(low,  bosLen)[1], low)
+
+dispCore = relVol >= volMult and bodyPct >= bodyRatio and bodySz >= dispAtr * atr
+dispUp   = dispCore and close > open and (not needBos or bosUp)
+dispDn   = dispCore and close < open and (not needBos or bosDn)
+
+// شمعة الأصل: آخر شمعة معاكسة اللون قبل الاندفاع | origin = last opposite candle
+f_originIdx(bool bull) =>
+    int idx = 1
+    for i = 1 to originLB
+        if (bull ? close[i] < open[i] : close[i] > open[i])
+            idx := i
+            break
+    idx
+
+// عدد شموع القاعدة الملاصقة (أجسام صغيرة) | contiguous small-body base candles
+//  ملاحظة: حلقة Pine تعدّ تنازلياً إذا كانت النهاية أصغر من البداية، لذلك
+//  نحرس صراحةً ضد maxBase == 1.
+f_baseCount(int startIdx) =>
+    int cnt = 1
+    if mergeBase and maxBase > 1
+        for i = startIdx + 1 to startIdx + maxBase - 1
+            r  = high[i] - low[i]
+            bp = r > 0 ? math.abs(close[i] - open[i]) / r : 1.0
+            if bp <= baseBody
+                cnt += 1
+            else
+                break
+    cnt
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ③  VOLUMETRIC SCORE  |  التقييم الحجمي
+// ═══════════════════════════════════════════════════════════════════════════════
+//  كل مكوّن يُطبَّع 0..1 ثم يُضرب بوزنه، فيقع المجموع طبيعياً على سلّم 0..100.
+f_score(float rv, float speed, float deltaAgree, int baseN) =>
+    cVol   = math.min(rv / (volMult * 2.0), 1.0) * wVol             // يتشبّع عند ضعف العتبة
+    cSpeed = math.min(speed / (dispAtr * 2.5), 1.0) * wSpeed        // يتشبّع عند 2.5× العتبة
+    cDelta = math.min(math.max(deltaAgree, 0.0), 1.0) * wDelta      // اتفاق الدلتا مع الاتجاه
+    cBase  = (1.0 - (baseN - 1) / (maxBase * 1.0)) * wBase          // قاعدة أقصر = إزاحة أنظف
+    cFresh = 1.0 * wFresh                                           // كاملة عند الولادة، تتآكل باللمس
+    math.min(cVol + cSpeed + cDelta + cBase + cFresh, 100.0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ②  POI CREATION  |  ولادة المنطقة (على شمعة مغلقة فقط)
+// ═══════════════════════════════════════════════════════════════════════════════
+f_addPOI(int dir) =>
+    oIdx  = f_originIdx(dir == 1)
+    baseN = f_baseCount(oIdx)
+    float t = na
+    float b = na
+    for i = oIdx to oIdx + baseN - 1
+        hi = bodyZone ? math.max(open[i], close[i]) : high[i]
+        lo = bodyZone ? math.min(open[i], close[i]) : low[i]
+        t := na(t) ? hi : math.max(t, hi)
+        b := na(b) ? lo : math.min(b, lo)
+    // قصّ الارتفاع مع الإبقاء على الحافة القريبة من السعر (حافة الدخول)
+    cap = maxHeight * atr
+    if not na(t) and not na(b) and t - b > cap
+        if dir == 1
+            b := t - cap
+        else
+            t := b + cap
+    // اتفاق الدلتا: هل ضغط شمعة الاندفاع في اتجاه المنطقة؟
+    agree = dir == 1 ? (buyShare - sellShare) : (sellShare - buyShare)
+    sc    = f_score(relVol, bodySz / math.max(atr, syminfo.mintick), agree, baseN)
+    aligned = bias != 0 and bias == dir
+    if aligned
+        sc := math.min(sc + htfBoost, 100.0)
+    if not na(t) and not na(b) and t > b and sc >= minDraw
+        col = f_poiColor(dir, sc)
+        box bx = na
+        if showPOI
+            bx := box.new(bar_index - oIdx - baseN + 1, t, bar_index + 3, b,
+                 border_color = aligned ? cHtfTint : color.new(col, 25), border_width = aligned ? 2 : 1,
+                 bgcolor = col, extend = extend.right)
+        label lb = na
+        if showPOI and showLbl
+            lb := label.new(bar_index, dir == 1 ? b : t, "",
+                 style = dir == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(col, 20), textcolor = color.white, size = size.tiny)
+        //  inside = true عند الولادة: شمعة الاندفاع نفسها ملاصقة للمنطقة وغالباً
+        //  تتقاطع معها، فلو بدأنا بـ false لسُجّلت "لمسة" وهمية فوراً وتآكل التقييم.
+        //  (born latched: the displacement candle usually overlaps its own POI, so
+        //   starting at false would book a phantom tap and decay the score at birth.)
+        POI p = POI.new(top = t, bot = b, left = bar_index - oIdx, dir = dir, score = sc, score0 = sc,
+             touches = 0, broken = false, htf = aligned, inside = true, bx = bx, lb = lb)
+        if showPOI and showLbl and not na(lb)
+            label.set_text(lb, f_poiText(p))
+        // الأحدث في المقدمة | newest at the front, oldest pruned from the tail
+        if dir == 1
+            array.unshift(demandPOI, p)
+        else
+            array.unshift(supplyPOI, p)
+
+if barstate.isconfirmed and not na(volMA) and bar_index > math.max(volLen, atrLen)
+    if dispUp
+        f_addPOI(1)
+    if dispDn
+        f_addPOI(-1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  POI MAINTENANCE  |  صيانة المناطق: لمس، تآكل، كسر، تقليم
+// ═══════════════════════════════════════════════════════════════════════════════
+f_maintain(array<POI> arr) =>
+    int i = 0
+    while i < array.size(arr)
+        POI p = array.get(arr, i)
+        if not p.broken
+            inZone   = high >= p.bot and low <= p.top
+            brokeDem = p.dir ==  1 and close < p.bot and relVol >= breakVol
+            brokeSup = p.dir == -1 and close > p.top and relVol >= breakVol
+            if barstate.isconfirmed and (brokeDem or brokeSup)
+                p.broken := true
+                p.score  := 0.0
+                if not na(p.lb)
+                    label.delete(p.lb)
+                    p.lb := na
+                if not na(p.bx)
+                    if keepDead
+                        box.set_extend(p.bx, extend.none)
+                        box.set_right(p.bx, bar_index)
+                        box.set_bgcolor(p.bx, color.new(color.gray, 92))
+                        box.set_border_color(p.bx, color.new(color.gray, 65))
+                    else
+                        box.delete(p.bx)
+                        p.bx := na
+            else if barstate.isconfirmed and inZone and not p.inside
+                p.touches := p.touches + 1
+                p.score   := math.max(p.score - decayTap, 0.0)
+                if not na(p.bx)
+                    box.set_bgcolor(p.bx, color.new(f_poiColor(p.dir, p.score), math.min(82 + p.touches * 4, 95)))
+                if not na(p.lb)
+                    label.set_text(p.lb, f_poiText(p))
+            if barstate.isconfirmed
+                p.inside := inZone
+            if not na(p.lb)
+                label.set_xy(p.lb, bar_index, p.dir == 1 ? p.bot : p.top)
+        i += 1
+    // تقليم: احذف المكسورة (إن لم تُحفظ) ثم افرض السقف على الجهة
+    if not keepDead
+        int j = array.size(arr) - 1
+        while j >= 0
+            if array.get(arr, j).broken
+                array.remove(arr, j)
+            j -= 1
+    while array.size(arr) > maxPOI
+        POI old = array.pop(arr)                 // الأقدم في الذيل
+        if not na(old.bx)
+            box.delete(old.bx)
+        if not na(old.lb)
+            label.delete(old.lb)
+
+f_maintain(demandPOI)
+f_maintain(supplyPOI)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⑦  ACCOUNT GUARDS  |  حراسة الحساب
+// ═══════════════════════════════════════════════════════════════════════════════
+newDay = timeframe.change("D")
+var float dayEquity0 = na
+var int   dayTrades  = 0
+if newDay or na(dayEquity0)
+    dayEquity0 := strategy.equity
+    dayTrades  := 0
+
+dayPnlPct  = na(dayEquity0) or dayEquity0 == 0 ? 0.0 : (strategy.equity - dayEquity0) / dayEquity0 * 100.0
+lossLocked = dayPnlPct <= -dayLoss
+tradeCap   = dayTrades >= maxTrades
+
+var int lastExitBar = na
+cooling = not na(lastExitBar) and (bar_index - lastExitBar) < coolBars
+
+inSession = not useSess or not na(time(timeframe.period, sessSpec, sessTz == "Exchange" ? syminfo.timezone : sessTz))
+
+canArm = inSession and not lossLocked and not tradeCap and not cooling and
+         strategy.position_size == 0 and barstate.isconfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⑤  SETUP SELECTION  |  اختيار الصفقة
+// ═══════════════════════════════════════════════════════════════════════════════
+var int    sDir    = 0        // 0 = لا شيء | 1 = شراء | -1 = بيع
+var float  sEntry  = na
+var float  sStop   = na
+var float  sStop0  = na       // الوقف الأصلي (مرجع حساب R)
+var float  sTp1    = na
+var float  sTp2    = na
+var float  sR      = na
+var float  sQty    = na
+var int    sExpire = na
+var bool   sFilled = false
+var bool   sBeDone = false
+var float  sScore  = na
+
+const string ID_L = "VP-Long"
+const string ID_S = "VP-Short"
+
+// ملاحظة: Pine لا تسمح بتعديل متغيّر عام داخل دالة، لذلك التصفير مكتوب
+// صراحةً في كل موضع بدل تجميعه في دالة.
+// (Pine forbids writing to globals inside a function — resets are inlined.)
+
+// أفضل منطقة مرشّحة | best candidate POI for a direction
+//  السجلّ يُمرَّر كوسيط لا يُختار بمعامل ثلاثي: Pine قد تُقيّم طرفَي التعبير
+//  الثلاثي معاً، فيقرأ array.get من سجلّ فارغ ويرمي خطأ خارج النطاق.
+f_bestPOI(array<POI> arr, int dir) =>
+    float bScore = -1.0
+    float bTop   = na
+    float bBot   = na
+    int   n      = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            POI p = array.get(arr, i)
+            if not p.broken and p.score >= minEntry and p.touches <= maxTouch
+                entryPx = dir == 1 ? p.top - entryDep * (p.top - p.bot)
+                                   : p.bot + entryDep * (p.top - p.bot)
+                // لا نلاحق السعر: الأمر المعلّق يجب أن يكون خلف السعر لا أمامه
+                behind = dir == 1 ? close > entryPx : close < entryPx
+                far    = math.abs(close - entryPx) / math.max(atr, syminfo.mintick)
+                if behind and far <= maxDist and p.score > bScore
+                    bScore := p.score
+                    bTop   := p.top
+                    bBot   := p.bot
+    [bScore, bTop, bBot]
+
+// حجم المركز من المخاطرة | risk-based position size
+f_qty(float entryPx, float stopPx) =>
+    dist = math.abs(entryPx - stopPx)
+    pv   = syminfo.pointvalue > 0 ? syminfo.pointvalue : 1.0
+    float q = dist > 0 ? (strategy.equity * riskPct / 100.0) / (dist * pv) : 0.0
+    // سقف القيمة الاسمية
+    float cap = entryPx > 0 ? (strategy.equity * maxPosPct / 100.0) / (entryPx * pv) : q
+    math.min(q, cap)
+
+// المرشّحان يُحسبان في النطاق العام (تفكيك الـ tuple أضمن هناك) ثم يُستهلكان أدناه.
+[dScore, dTop, dBot]  = f_bestPOI(demandPOI,  1)
+[sScoreC, sTop, sBot] = f_bestPOI(supplyPOI, -1)
+
+// ── تسليح صفقة جديدة | arm a new setup
+if canArm and sDir == 0
+    okLong  = allowLong and f_biasOk(1)  and f_cvdOk(1)  and dScore  > 0
+    okShort = allowShrt and f_biasOk(-1) and f_cvdOk(-1) and sScoreC > 0
+    // عند تأهّل الجهتين نأخذ الأعلى تقييماً
+    int pick = okLong and okShort ? (dScore >= sScoreC ? 1 : -1) : okLong ? 1 : okShort ? -1 : 0
+    if pick != 0
+        top = pick == 1 ? dTop : sTop
+        bot = pick == 1 ? dBot : sBot
+        ePx = pick == 1 ? top - entryDep * (top - bot) : bot + entryDep * (top - bot)
+        sPx = pick == 1 ? bot - slBuf * atr : top + slBuf * atr
+        dist = math.abs(ePx - sPx)
+        // فرض حدّي مسافة الوقف
+        if dist < minStop * atr
+            sPx := pick == 1 ? ePx - minStop * atr : ePx + minStop * atr
+            dist := minStop * atr
+        if dist <= maxStop * atr and dist > 0
+            q = f_qty(ePx, sPx)
+            if q > 0
+                sDir    := pick
+                sEntry  := ePx
+                sStop   := sPx
+                sStop0  := sPx
+                sR      := dist
+                sQty    := q
+                sScore  := pick == 1 ? dScore : sScoreC
+                sExpire := bar_index + expireBar
+                sFilled := false
+                sBeDone := false
+                // الأهداف
+                float t1 = pick == 1 ? ePx + tp1R * dist : ePx - tp1R * dist
+                float t2 = pick == 1 ? ePx + tp2R * dist : ePx - tp2R * dist
+                if tpMode == "Opposing POI"
+                    opp = f_opposing(pick, ePx)
+                    if not na(opp)
+                        t2 := opp
+                        // الهدف الثاني يجب أن يبقى أبعد من الأول
+                        t2 := pick == 1 ? math.max(t2, t1 + syminfo.mintick) : math.min(t2, t1 - syminfo.mintick)
+                sTp1 := t1
+                sTp2 := t2
+                if entryMode == "Limit at POI"
+                    if pick == 1
+                        strategy.entry(ID_L, strategy.long,  qty = q, limit = ePx, comment = "POI " + str.tostring(math.round(sScore)))
+                    else
+                        strategy.entry(ID_S, strategy.short, qty = q, limit = ePx, comment = "POI " + str.tostring(math.round(sScore)))
+
+// ── وضع شمعة التأكيد | confirmation-candle entry
+//    لمس المنطقة داخل الشمعة + إغلاق ارتدادي خارجها في اتجاه المنطقة.
+//    في هذا الوضع لا يُرسَل أمر معلّق عند التسليح — ننتظر شمعة الرفض ثم ندخل سوقاً.
+if entryMode == "Confirmation candle" and sDir != 0 and not sFilled and barstate.isconfirmed
+    tapped = sDir == 1 ? low <= sEntry : high >= sEntry
+    reject = sDir == 1 ? (close > sEntry and close > open) : (close < sEntry and close < open)
+    if tapped and reject and strategy.position_size == 0
+        // إعادة تسعير الوقف والأهداف من سعر السوق الفعلي
+        sPx  = sDir == 1 ? math.min(sStop0, low - slBuf * atr) : math.max(sStop0, high + slBuf * atr)
+        dist = math.abs(close - sPx)
+        if dist >= minStop * atr and dist <= maxStop * atr
+            sStop  := sPx
+            sStop0 := sPx
+            sEntry := close
+            sR     := dist
+            sQty   := f_qty(close, sPx)
+            sTp1   := sDir == 1 ? close + tp1R * dist : close - tp1R * dist
+            sTp2   := sDir == 1 ? close + tp2R * dist : close - tp2R * dist
+            if sQty > 0
+                if sDir == 1
+                    strategy.entry(ID_L, strategy.long,  qty = sQty, comment = "POI-C " + str.tostring(math.round(sScore)))
+                else
+                    strategy.entry(ID_S, strategy.short, qty = sQty, comment = "POI-C " + str.tostring(math.round(sScore)))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⑥  ORDER LIFECYCLE  |  دورة حياة الأمر
+// ═══════════════════════════════════════════════════════════════════════════════
+inPos = strategy.position_size != 0
+
+// كشف التعبئة | fill detection
+if sDir != 0 and not sFilled and inPos
+    sFilled   := true
+    dayTrades := dayTrades + 1
+
+// إلغاء الأمر المعلّق إذا فسد السياق | cancel a stale / invalidated pending order
+if sDir != 0 and not sFilled
+    expired  = not na(sExpire) and bar_index > sExpire
+    invalid  = sDir == 1 ? close < sStop0 : close > sStop0     // اختُرقت المنطقة قبل التعبئة
+    biasFlip = not f_biasOk(sDir)
+    if expired or invalid or biasFlip or lossLocked
+        // cancel_all وليس cancel: الأخيرة تُلغي أوامر الدخول فقط وتترك أوامر
+        // الخروج مسجّلة. نحن هنا خارج السوق دائماً، فالإلغاء الشامل آمن.
+        strategy.cancel_all()
+        sDir    := 0
+        sEntry  := na
+        sStop   := na
+        sStop0  := na
+        sTp1    := na
+        sTp2    := na
+        sR      := na
+        sQty    := na
+        sExpire := na
+        sFilled := false
+        sBeDone := false
+        sScore  := na
+
+// إدارة الوقف بعد التعبئة | stop management once filled
+if sDir != 0 and sFilled and inPos
+    prog = sDir == 1 ? (close - sEntry) / sR : (sEntry - close) / sR   // الربح بوحدات R
+    if beEnable and not sBeDone and prog >= beTrigR
+        bePx = sDir == 1 ? sEntry + beOffR * sR : sEntry - beOffR * sR
+        sStop  := sDir == 1 ? math.max(sStop, bePx) : math.min(sStop, bePx)
+        sBeDone := true
+    if trlEnable and prog >= trlStartR
+        trlPx = sDir == 1 ? close - trlMult * atr : close + trlMult * atr
+        sStop := sDir == 1 ? math.max(sStop, trlPx) : math.min(sStop, trlPx)
+
+// أوامر الخروج | exit orders (re-issued each bar so the stop can move)
+//  تُرسَل مع الأمر المعلّق أيضاً حتى يكون الوقف حيّاً منذ لحظة التعبئة.
+if sDir != 0 and (inPos or entryMode == "Limit at POI")
+    fromId = sDir == 1 ? ID_L : ID_S
+    if partPct > 0 and partPct < 100
+        strategy.exit("TP1", from_entry = fromId, qty_percent = partPct, limit = sTp1, stop = sStop,
+             comment_profit = "TP1", comment_loss = "SL")
+        strategy.exit("TP2", from_entry = fromId, limit = sTp2, stop = sStop,
+             comment_profit = "TP2", comment_loss = "SL")
+    else
+        strategy.exit("TP", from_entry = fromId, limit = partPct >= 100 ? sTp1 : sTp2, stop = sStop,
+             comment_profit = "TP", comment_loss = "SL")
+
+// إغلاق كامل → تصفير الحالة | position fully closed → reset
+if sDir != 0 and sFilled and not inPos
+    lastExitBar := bar_index
+    strategy.cancel_all()
+    sDir    := 0
+    sEntry  := na
+    sStop   := na
+    sStop0  := na
+    sTp1    := na
+    sTp2    := na
+    sR      := na
+    sQty    := na
+    sExpire := na
+    sFilled := false
+    sBeDone := false
+    sScore  := na
+
+// قفل الخسارة اليومية يُغلق أي مركز مفتوح | daily loss lock flattens the book
+if lossLocked and inPos
+    strategy.close_all(comment = "Daily loss lock")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TRADE LEVEL VISUALS  |  رسم مستويات الصفقة
+// ═══════════════════════════════════════════════════════════════════════════════
+plotLive = showLvls and sDir != 0
+plot(plotLive ? sEntry : na, "Entry | الدخول", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 1)
+plot(plotLive ? sStop  : na, "Stop | الوقف",   color = color.new(color.red, 0),    style = plot.style_linebr, linewidth = 1)
+plot(plotLive ? sTp1   : na, "TP1 | الهدف ١",  color = color.new(color.teal, 30),  style = plot.style_linebr, linewidth = 1)
+plot(plotLive and partPct < 100 ? sTp2 : na, "TP2 | الهدف ٢", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD  |  لوحة الأداء
+// ═══════════════════════════════════════════════════════════════════════════════
+f_liveCount(array<POI> arr) =>
+    int n = 0
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            if not array.get(arr, i).broken
+                n += 1
+    n
+
+var table dash = table.new(dashPos, 2, 9, border_width = 1, frame_width = 1,
+     frame_color = color.new(color.gray, 40), border_color = color.new(color.gray, 70))
+
+if showDash and barstate.islast
+    wins   = strategy.wintrades
+    closed = strategy.closedtrades
+    winPct = closed > 0 ? wins * 100.0 / closed : 0.0
+    pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    netPct = strategy.initial_capital > 0 ? strategy.netprofit / strategy.initial_capital * 100.0 : 0.0
+    ddPct  = strategy.initial_capital > 0 ? strategy.max_drawdown / strategy.initial_capital * 100.0 : 0.0
+
+    color hdrBg  = bias == 1 ? color.new(#1B5E20, 55) : bias == -1 ? color.new(#B71C1C, 55) : color.new(color.gray, 70)
+    string bTxt  = bias == 1 ? "صاعد ▲ Bullish" : bias == -1 ? "هابط ▼ Bearish" : "محايد ● Neutral"
+    color  bCol  = bias == 1 ? #26A69A : bias == -1 ? #EF5350 : color.gray
+    string state = lossLocked ? "🔒 قفل الخسارة اليومية" :
+                   tradeCap   ? "🚫 بلغ حدّ الصفقات اليومي" :
+                   not inSession ? "⏸ خارج الجلسة" :
+                   cooling    ? "❄️ تبريد" :
+                   inPos      ? (sDir == 1 ? "🟢 مركز شراء مفتوح" : "🔴 مركز بيع مفتوح") :
+                   sDir != 0  ? "⏳ أمر معلّق عند " + str.tostring(sEntry, format.mintick) :
+                   "🔍 بحث عن منطقة"
+
+    table.cell(dash, 0, 0, "VolPOI | نقاط الاهتمام الحجمية", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+
+    table.cell(dash, 0, 1, "الانحياز | Bias", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 1, bTxt, text_color = bCol, text_size = size.small)
+
+    table.cell(dash, 0, 2, "الحالة | State", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 2, state, text_color = color.white, text_size = size.small)
+
+    table.cell(dash, 0, 3, "مناطق حيّة | Live POIs", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 3, "طلب " + str.tostring(f_liveCount(demandPOI)) + "  ·  عرض " + str.tostring(f_liveCount(supplyPOI)),
+         text_color = color.white, text_size = size.small)
+
+    table.cell(dash, 0, 4, "صافي الربح | Net P&L", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 4, str.tostring(netPct, "#.##") + "%", text_color = netPct >= 0 ? #26A69A : #EF5350, text_size = size.small)
+
+    table.cell(dash, 0, 5, "نسبة الربح | Win rate", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 5, str.tostring(winPct, "#.#") + "%  (" + str.tostring(closed) + ")", text_color = color.white, text_size = size.small)
+
+    table.cell(dash, 0, 6, "معامل الربح | Profit factor", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 6, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = na(pf) or pf >= 1 ? #26A69A : #EF5350, text_size = size.small)
+
+    table.cell(dash, 0, 7, "أقصى تراجع | Max drawdown", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 7, str.tostring(ddPct, "#.##") + "%", text_color = #EF5350, text_size = size.small)
+
+    table.cell(dash, 0, 8, "اليوم | Today", text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 8, str.tostring(dayTrades) + "/" + str.tostring(maxTrades) + " صفقة  ·  " + str.tostring(dayPnlPct, "#.##") + "%",
+         text_color = dayPnlPct >= 0 ? #26A69A : #EF5350, text_size = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTS  |  التنبيهات
+// ═══════════════════════════════════════════════════════════════════════════════
+newDem = barstate.isconfirmed and dispUp and bar_index > math.max(volLen, atrLen)
+newSup = barstate.isconfirmed and dispDn and bar_index > math.max(volLen, atrLen)
+armed  = sDir != 0 and sDir[1] == 0
+filled = sFilled and not sFilled[1]
+
+alertcondition(newDem, "منطقة طلب جديدة | New demand POI",  "تكوّنت نقطة اهتمام طلب بفوليوم مؤسسي")
+alertcondition(newSup, "منطقة عرض جديدة | New supply POI",  "تكوّنت نقطة اهتمام عرض بفوليوم مؤسسي")
+alertcondition(armed,  "أمر معلّق | Setup armed",           "تم تسليح صفقة عند نقطة اهتمام")
+alertcondition(filled, "تنفيذ صفقة | Trade filled",         "تم تنفيذ الدخول عند نقطة الاهتمام")
+
+if armed or filled
+    string msg = "📌 VolPOI " + syminfo.ticker + " (" + timeframe.period + ")"
+    msg := msg + (armed  ? "\n⏳ تسليح " + (sDir == 1 ? "شراء" : "بيع") +
+                           "  ·  دخول " + str.tostring(sEntry, format.mintick) +
+                           "  ·  وقف "  + str.tostring(sStop,  format.mintick) +
+                           "  ·  هدف "  + str.tostring(sTp2,   format.mintick) +
+                           "  ·  تقييم " + str.tostring(math.round(nz(sScore))) : "")
+    msg := msg + (filled ? "\n✅ تنفيذ عند " + str.tostring(close, format.mintick) : "")
+    alert(msg, alert.freq_once_per_bar_close)
