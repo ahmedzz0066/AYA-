@@ -537,10 +537,17 @@ if canArm and sDir == 0
                 sTp1 := t1
                 sTp2 := t2
                 if entryMode == "Limit at POI"
+                    // alert_message يُقرأ عبر {{strategy.order.alert_message}}
+                    string am = "VolPOI " + (pick == 1 ? "▲ شراء" : "▼ بيع") +
+                         " · دخول " + str.tostring(ePx, format.mintick) +
+                         " · وقف "  + str.tostring(sPx, format.mintick) +
+                         " · تقييم " + str.tostring(math.round(sScore))
                     if pick == 1
-                        strategy.entry(ID_L, strategy.long,  qty = q, limit = ePx, comment = "POI " + str.tostring(math.round(sScore)))
+                        strategy.entry(ID_L, strategy.long,  qty = q, limit = ePx,
+                             comment = "POI " + str.tostring(math.round(sScore)), alert_message = am)
                     else
-                        strategy.entry(ID_S, strategy.short, qty = q, limit = ePx, comment = "POI " + str.tostring(math.round(sScore)))
+                        strategy.entry(ID_S, strategy.short, qty = q, limit = ePx,
+                             comment = "POI " + str.tostring(math.round(sScore)), alert_message = am)
 
 // ── وضع شمعة التأكيد | confirmation-candle entry
 //    لمس المنطقة داخل الشمعة + إغلاق ارتدادي خارجها في اتجاه المنطقة.
@@ -561,10 +568,16 @@ if entryMode == "Confirmation candle" and sDir != 0 and not sFilled and barstate
             sTp1   := sDir == 1 ? close + tp1R * dist : close - tp1R * dist
             sTp2   := sDir == 1 ? close + tp2R * dist : close - tp2R * dist
             if sQty > 0
+                string amc = "VolPOI " + (sDir == 1 ? "▲ شراء" : "▼ بيع") + " (تأكيد)" +
+                     " · دخول " + str.tostring(close, format.mintick) +
+                     " · وقف "  + str.tostring(sPx, format.mintick) +
+                     " · تقييم " + str.tostring(math.round(sScore))
                 if sDir == 1
-                    strategy.entry(ID_L, strategy.long,  qty = sQty, comment = "POI-C " + str.tostring(math.round(sScore)))
+                    strategy.entry(ID_L, strategy.long,  qty = sQty,
+                         comment = "POI-C " + str.tostring(math.round(sScore)), alert_message = amc)
                 else
-                    strategy.entry(ID_S, strategy.short, qty = sQty, comment = "POI-C " + str.tostring(math.round(sScore)))
+                    strategy.entry(ID_S, strategy.short, qty = sQty,
+                         comment = "POI-C " + str.tostring(math.round(sScore)), alert_message = amc)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ⑥  ORDER LIFECYCLE  |  دورة حياة الأمر
@@ -613,14 +626,15 @@ if sDir != 0 and sFilled and inPos
 //  تُرسَل مع الأمر المعلّق أيضاً حتى يكون الوقف حيّاً منذ لحظة التعبئة.
 if sDir != 0 and (inPos or entryMode == "Limit at POI")
     fromId = sDir == 1 ? ID_L : ID_S
+    string amx = "VolPOI خروج " + (sDir == 1 ? "شراء" : "بيع") + " · وقف حالي " + str.tostring(sStop, format.mintick)
     if partPct > 0 and partPct < 100
         strategy.exit("TP1", from_entry = fromId, qty_percent = partPct, limit = sTp1, stop = sStop,
-             comment_profit = "TP1", comment_loss = "SL")
+             comment_profit = "TP1", comment_loss = "SL", alert_message = amx)
         strategy.exit("TP2", from_entry = fromId, limit = sTp2, stop = sStop,
-             comment_profit = "TP2", comment_loss = "SL")
+             comment_profit = "TP2", comment_loss = "SL", alert_message = amx)
     else
         strategy.exit("TP", from_entry = fromId, limit = partPct >= 100 ? sTp1 : sTp2, stop = sStop,
-             comment_profit = "TP", comment_loss = "SL")
+             comment_profit = "TP", comment_loss = "SL", alert_message = amx)
 
 // إغلاق كامل → تصفير الحالة | position fully closed → reset
 if sDir != 0 and sFilled and not inPos
@@ -666,7 +680,10 @@ f_liveCount(array<POI> arr) =>
 var table dash = table.new(dashPos, 2, 9, border_width = 1, frame_width = 1,
      frame_color = color.new(color.gray, 40), border_color = color.new(color.gray, 70))
 
-if showDash and barstate.islast
+// الاستراتيجيات لا تُحتسب إلا على شمعة مؤكَّدة (calc_on_every_tick = false عمداً،
+// فتفعيلها يُدخل حساباً داخل الشمعة ويهدّد ثبات نتائج الاختبار). لذلك نضيف
+// islastconfirmedhistory حتى تُرسم اللوحة على آخر شمعة مؤكَّدة أيضاً.
+if showDash and (barstate.islast or barstate.islastconfirmedhistory)
     wins   = strategy.wintrades
     closed = strategy.closedtrades
     winPct = closed > 0 ? wins * 100.0 / closed : 0.0
@@ -722,17 +739,18 @@ newSup = barstate.isconfirmed and dispDn and bar_index > math.max(volLen, atrLen
 armed  = sDir != 0 and sDir[1] == 0
 filled = sFilled and not sFilled[1]
 
-alertcondition(newDem, "منطقة طلب جديدة | New demand POI",  "تكوّنت نقطة اهتمام طلب بفوليوم مؤسسي")
-alertcondition(newSup, "منطقة عرض جديدة | New supply POI",  "تكوّنت نقطة اهتمام عرض بفوليوم مؤسسي")
-alertcondition(armed,  "أمر معلّق | Setup armed",           "تم تسليح صفقة عند نقطة اهتمام")
-alertcondition(filled, "تنفيذ صفقة | Trade filled",         "تم تنفيذ الدخول عند نقطة الاهتمام")
-
-if armed or filled
-    string msg = "📌 VolPOI " + syminfo.ticker + " (" + timeframe.period + ")"
+// ملاحظة: alertcondition() بلا أثر داخل الاستراتيجيات — TradingView تتجاهلها.
+// لذلك كل التنبيهات هنا عبر alert() المجمّع أدناه (اختر «Any alert() function
+// call» عند إنشاء التنبيه)، وعبر alert_message المربوطة بالأوامر نفسها
+// (استخدم {{strategy.order.alert_message}} في نصّ التنبيه).
+if newDem or newSup or armed or filled
+    string msg = "📌 VolPOI " + syminfo.ticker + " (" + timeframe.period + ") @ " + str.tostring(close, format.mintick)
+    msg := msg + (newDem ? "\n🟩 منطقة طلب جديدة بفوليوم مؤسسي" : "")
+    msg := msg + (newSup ? "\n🟥 منطقة عرض جديدة بفوليوم مؤسسي" : "")
     msg := msg + (armed  ? "\n⏳ تسليح " + (sDir == 1 ? "شراء" : "بيع") +
                            "  ·  دخول " + str.tostring(sEntry, format.mintick) +
                            "  ·  وقف "  + str.tostring(sStop,  format.mintick) +
                            "  ·  هدف "  + str.tostring(sTp2,   format.mintick) +
                            "  ·  تقييم " + str.tostring(math.round(nz(sScore))) : "")
-    msg := msg + (filled ? "\n✅ تنفيذ عند " + str.tostring(close, format.mintick) : "")
+    msg := msg + (filled ? "\n✅ تنفيذ الدخول عند " + str.tostring(close, format.mintick) : "")
     alert(msg, alert.freq_once_per_bar_close)
