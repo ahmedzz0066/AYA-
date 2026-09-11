@@ -1,0 +1,558 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at
+// https://mozilla.org/MPL/2.0/
+//
+// Volume Footprint — reconstructed from first principles
+//
+// A footprint needs bid and ask volume at every price level: 2N unknowns. An
+// OHLCV bar gives five numbers. The reconstruction is underdetermined, so this
+// script states its model out loud rather than hiding a prior behind a formula.
+//
+//   A1  price is continuous: it visited every level between the extremes it touched
+//   A2  volume accrues in proportion to distance travelled (dV ~ |dp|)
+//   A3  upward travel is buy-initiated, downward travel is sell-initiated
+//
+// Everything here follows from A1-A3 and nothing else. See docs/DERIVATION.md.
+
+//@version=6
+indicator("Volume Footprint (First Principles)", "VFP", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500,
+     max_bars_back = 1000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+
+ENG_PATH  = "Path (geometric, derived)"
+ENG_CLOSE = "Close position (naive)"
+ENG_LTF   = "Lower timeframe (measured)"
+
+grpE = "Engine"
+engine = input.string(ENG_PATH, "Split engine", options = [ENG_PATH, ENG_CLOSE, ENG_LTF], group = grpE,
+     tooltip = "Path: the derived least-action model, OHLCV only, works everywhere.\nClose: the textbook (C-L)/(H-L) split, shown for contrast.\nLower timeframe: measure the split on sub-bars instead of modelling it.")
+ltfRes = input.timeframe("1", "Lower timeframe", group = grpE)
+alpha  = input.float(1.0, "Least-action exponent", minval = 0.0, maxval = 6.0, step = 0.25, group = grpE,
+     tooltip = "Weights the two path hypotheses by length^-alpha.\n0 = both equally likely. 1 = inverse length (derived default). Large = commit to the shorter path.")
+
+grpR = "Rows"
+ticksPerRow = input.int(4, "Ticks per row", minval = 1, maxval = 5000, group = grpR)
+windowBars  = input.int(5, "Window bars", minval = 1, maxval = 30, group = grpR)
+concentr    = input.float(6.0, "Volume concentration", minval = 1.0, maxval = 60.0, step = 0.5, group = grpR,
+     tooltip = "Kernel bandwidth as a divisor of the bar range: sigma = range / this.\nThe legs already carry the profile's shape, so this only blurs. Low values wash out the buy/sell asymmetry the model exists to express.")
+maxRows     = input.int(40, "Max rows per bar", minval = 4, maxval = 120, group = grpR,
+     tooltip = "Safety cap on drawing objects. If the window needs more rows than this, the row size is widened to fit.")
+
+grpM = "Metrics"
+vaPct     = input.float(70.0, "Value area %",        minval = 30.0, maxval = 99.0, group = grpM)
+imbThresh = input.float(3.0,  "Imbalance ratio",     minval = 1.1,  maxval = 20.0, step = 0.1, group = grpM,
+     tooltip = "Diagonal dominance required. 3.0 means one side must be 300% of the other across the spread.")
+imbStack  = input.int(3,      "Stacked imbalance run", minval = 2, maxval = 10, group = grpM)
+tiltPct   = input.float(5.0,  "Balance tilt %",      minval = 0.0,  maxval = 50.0, group = grpM)
+resTolPpm = input.float(1.0,  "Residual tolerance (ppm)", minval = 0.0, group = grpM)
+
+grpD = "Display"
+showCells   = input.bool(true, "Footprint cells",   group = grpD)
+showPoc     = input.bool(true, "Point of control",  group = grpD)
+showVa      = input.bool(true, "Value area",        group = grpD)
+showImb     = input.bool(true, "Imbalance shading", group = grpD)
+showProfile = input.bool(true, "Composite profile", group = grpD)
+showDash    = input.bool(true, "Dashboard",         group = grpD)
+profWidth   = input.int(30, "Profile width (bars)", minval = 6, maxval = 200, group = grpD)
+cellSize    = input.string(size.tiny, "Cell text size", options = [size.tiny, size.small, size.normal], group = grpD)
+
+grpC = "Colours"
+cBuy  = input.color(#26a69a,                  "Buy",            group = grpC)
+cSell = input.color(#ef5350,                  "Sell",           group = grpC)
+cPoc  = input.color(color.new(#ffb300, 60),   "POC",            group = grpC)
+cVa   = input.color(color.new(#42a5f5, 85),   "Value area",     group = grpC)
+cImbB = input.color(color.new(#26a69a, 60),   "Buy imbalance",  group = grpC)
+cImbS = input.color(color.new(#ef5350, 60),   "Sell imbalance", group = grpC)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Numerics — Pine has no erf, so the normal integrals are built from scratch
+// ─────────────────────────────────────────────────────────────────────────────
+
+SQRT2    = 1.4142135623730951
+INV_S2PI = 0.3989422804014327
+EPS      = 1e-12
+
+// Abramowitz & Stegun 7.1.26, |error| <= 1.5e-7 — ample next to the modelling error.
+erf(float x) =>
+    t = 1.0 / (1.0 + 0.3275911 * math.abs(x))
+    p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+    y = 1.0 - p * math.exp(-x * x)
+    x >= 0 ? y : -y
+
+ncdf(float z) => 0.5 * (1.0 + erf(z / SQRT2))
+npdf(float z) => INV_S2PI * math.exp(-0.5 * z * z)
+
+// Antiderivative of the CDF: Psi'(z) = Phi(z), because phi'(z) = -z*phi(z)
+// cancels the z*phi(z) term from differentiating the product.
+npsi(float z) => z * ncdf(z) + npdf(z)
+
+// Mass a uniform leg [a,b] of weight m deposits into the price row [p1,p2].
+// sigma = 0 is plain interval overlap — exact, since a leg IS a uniform density.
+// sigma > 0 convolves with a normal kernel first, which stays closed-form.
+legMass(float a, float b, float m, float p1, float p2, float sigma) =>
+    w = b - a
+    float out = 0.0
+    if sigma <= 0.0
+        out := w <= EPS ? ((p1 <= a and a < p2) ? m : 0.0) : m * math.max(0.0, math.min(p2, b) - math.max(p1, a)) / w
+    else if w <= EPS
+        out := m * (ncdf((p2 - a) / sigma) - ncdf((p1 - a) / sigma))
+    else
+        acc = npsi((p2 - a) / sigma) - npsi((p1 - a) / sigma) - npsi((p2 - b) / sigma) + npsi((p1 - b) / sigma)
+        out := m * sigma * acc / w
+    out
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The model: two path hypotheses, six legs, one split
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Path A (up first)   O -> H -> L -> C,  length 2R + d
+// Path B (down first) O -> L -> H -> C,  length 2R - d
+// Weighted by length^-alpha: by A2 a longer path demands more volume, so for a
+// fixed V it is the less likely explanation of the bar.
+pathWeightA(float o, float h, float l, float c, float a) =>
+    r = h - l
+    d = c - o
+    float wa = 0.5
+    if r > EPS and a > 0.0
+        la = math.pow(2.0 * r + d, -a)
+        lb = math.pow(2.0 * r - d, -a)
+        wa := la / (la + lb)
+    wa
+
+// Up-leg mass as a fraction of total leg mass. At alpha = 1 this is the closed
+// form (4 + 2x - x^2) / (8 - 2x^2) with x = body/range, bounded to [1/6, 5/6]:
+// even a bar closing on its high had someone on the other side of every print.
+pathShare(float o, float h, float l, float c, float a) =>
+    r = h - l
+    float s = 0.5
+    if r > EPS
+        wa = pathWeightA(o, h, l, c, a)
+        wb = 1.0 - wa
+        d  = c - o
+        mb = wa * (r + d) + wb * r
+        ms = wa * r + wb * (r - d)
+        s := mb + ms > EPS ? mb / (mb + ms) : 0.5
+    s
+
+closeShare(float h, float l, float c) =>
+    r = h - l
+    r <= EPS ? 0.5 : math.max(0.0, math.min(1.0, (c - l) / r))
+
+// Deposit one bar's six-leg mixture into a row grid based at absolute index
+// kBase. The shape comes from the legs; the totals come from `share`, so an
+// engine may override the split without disturbing where each side traded.
+accumulate(float o, float h, float l, float c, float v, float share, float a,
+           float sigma, float rowSize, int kBase, array<float> buyArr, array<float> sellArr) =>
+    n = array.size(buyArr)
+    r = h - l
+    if r <= EPS
+        // Degenerate bar: one price, no geometry to read.
+        k = int(math.max(0, math.min(n - 1, int(math.floor(l / rowSize)) - kBase)))
+        array.set(buyArr,  k, array.get(buyArr,  k) + v * share)
+        array.set(sellArr, k, array.get(sellArr, k) + v * (1.0 - share))
+    else
+        wa = pathWeightA(o, h, l, c, a)
+        wb = 1.0 - wa
+
+        // The six legs: lo, hi, mass, is-up
+        lLo = array.from(o,            l,      l,            l,            l,      c)
+        lHi = array.from(h,            h,      c,            o,            h,      h)
+        lMs = array.from(wa * (h - o), wa * r, wa * (c - l), wb * (o - l), wb * r, wb * (h - c))
+        lUp = array.from(true,         false,  true,         false,        true,   false)
+
+        float upMass = 0.0
+        float dnMass = 0.0
+        for j = 0 to 5
+            m = array.get(lMs, j)
+            if m > EPS
+                if array.get(lUp, j)
+                    upMass += m
+                else
+                    dnMass += m
+
+        buyScale  = upMass > EPS ? v * share         / upMass : 0.0
+        sellScale = dnMass > EPS ? v * (1.0 - share) / dnMass : 0.0
+        reach     = sigma > 0.0 ? 4.0 * sigma : 0.0
+
+        for j = 0 to 5
+            m = array.get(lMs, j)
+            if m > EPS
+                a0   = array.get(lLo, j)
+                b0   = array.get(lHi, j)
+                isUp = array.get(lUp, j)
+                sc   = isUp ? buyScale : sellScale
+                // Only visit rows the leg can actually reach.
+                kFrom = int(math.max(0,     int(math.floor((a0 - reach) / rowSize)) - kBase))
+                kTo   = int(math.min(n - 1, int(math.floor((b0 + reach) / rowSize)) - kBase))
+                if kTo >= kFrom
+                    for k = kFrom to kTo
+                        p1 = (kBase + k) * rowSize
+                        q  = legMass(a0, b0, m, p1, p1 + rowSize, sigma) * sc
+                        if q > 0.0
+                            if isUp
+                                array.set(buyArr,  k, array.get(buyArr,  k) + q)
+                            else
+                                array.set(sellArr, k, array.get(sellArr, k) + q)
+
+// Kernel smoothing leaks mass past the bar extremes and the grid is finite, so
+// renormalise. Volume conservation is then exact by construction, and the
+// residual read-out measures only floating-point noise.
+rescale(array<float> arr, float target) =>
+    got = array.sum(arr)
+    if got > EPS
+        k = target / got
+        for i = 0 to array.size(arr) - 1
+            array.set(arr, i, array.get(arr, i) * k)
+    else if array.size(arr) > 0
+        array.set(arr, int(array.size(arr) / 2), target)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Metrics
+// ─────────────────────────────────────────────────────────────────────────────
+
+argmaxTotal(array<float> b, array<float> s) =>
+    int best = 0
+    float bv = -1.0
+    // Pine's for-loop reverses direction when start > end, so an empty array
+    // would step to -1 and fault instead of skipping. Guard the bound.
+    if array.size(b) > 0
+        for i = 0 to array.size(b) - 1
+            t = array.get(b, i) + array.get(s, i)
+            if t > bv
+                bv   := t
+                best := i
+    best
+
+// Smallest contiguous band around the POC holding vaPct of volume, grown by
+// annexing whichever neighbour carries more. The 70% convention is inherited
+// from market profile, not derived — it is roughly the +/-1 sigma mass.
+valueArea(array<float> b, array<float> s, int poc, float pct) =>
+    n     = array.size(b)
+    total = array.sum(b) + array.sum(s)
+    int lo = poc
+    int hi = poc
+    if total > 0 and n > 0
+        target = total * pct / 100.0
+        float acc = array.get(b, poc) + array.get(s, poc)
+        while acc < target and (lo > 0 or hi < n - 1)
+            below = lo > 0     ? array.get(b, lo - 1) + array.get(s, lo - 1) : -1.0
+            above = hi < n - 1 ? array.get(b, hi + 1) + array.get(s, hi + 1) : -1.0
+            if above >= below
+                hi  += 1
+                acc += above
+            else
+                lo  -= 1
+                acc += below
+    [lo, hi]
+
+// Shared area of the normalised buy and sell profiles, in [0,1]. A model that
+// gives both sides the same shape pins this at 1.00 and cannot express the
+// distinction between rotation and one side chasing.
+overlapCoef(array<float> b, array<float> s) =>
+    bt = array.sum(b)
+    st = array.sum(s)
+    float ovl = 0.0
+    if bt > EPS and st > EPS and array.size(b) > 0
+        for i = 0 to array.size(b) - 1
+            ovl += math.min(array.get(b, i) / bt, array.get(s, i) / st)
+    ovl
+
+fmtVol(float v) =>
+    av = math.abs(v)
+    av >= 1e6 ? str.tostring(v / 1e6, "#.#") + "M" : av >= 1e3 ? str.tostring(v / 1e3, "#.#") + "k" : str.tostring(v, "#")
+
+signed(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Row grid
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Rows are anchored to an absolute price grid (row k spans [k*s, (k+1)*s)), not
+// to each bar's low. Without that anchoring, rows from different bars do not
+// line up and diagonal comparisons across the window are meaningless.
+//
+// The row size is widened when the window would need more rows than the cap, so
+// the drawing budget holds. It is derived from a rolling window extent so that
+// it is a proper series and every bar agrees on the grid.
+winHi   = ta.highest(high, windowBars)
+winLo   = ta.lowest(low, windowBars)
+rawSize = ticksPerRow * syminfo.mintick
+rowSize = math.max(syminfo.mintick, (winHi - winLo) / rawSize > maxRows ? (winHi - winLo) / maxRows : rawSize)
+
+rowLo(float l, float s) => int(math.floor(l / s))
+rowHi(float h, float s) =>
+    k = int(math.floor(h / s))
+    // A high sitting exactly on a grid boundary opens a row of zero width.
+    // The tolerance is relative to the row, so it holds at any price scale.
+    math.abs(h - k * s) <= s * 1e-9 ? k - 1 : k
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lower-timeframe data (requested at global scope, indexed by history later)
+// ─────────────────────────────────────────────────────────────────────────────
+
+useLtf = engine == ENG_LTF
+[ltfO, ltfH, ltfL, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid, ltfRes, [open, high, low, close, volume])
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build one bar's profile. `off` is a history offset, so the same code serves
+// both the live series (off = 0) and the redraw walk over the window.
+// ─────────────────────────────────────────────────────────────────────────────
+
+buildProfile(int off, float s) =>
+    o = open[off]
+    h = high[off]
+    l = low[off]
+    c = close[off]
+    v = nz(volume[off])
+
+    kLo = rowLo(l, s)
+    kHi = int(math.max(kLo, rowHi(h, s)))
+    n   = kHi - kLo + 1
+
+    buyArr  = array.new<float>(n, 0.0)
+    sellArr = array.new<float>(n, 0.0)
+    sigma   = concentr > 0 ? (h - l) / concentr : 0.0
+
+    float share    = 0.5
+    bool  measured = false
+
+    if useLtf
+        // Guards are nested rather than chained with `and`: Pine does not
+        // reliably short-circuit, and array.size() of an na array faults.
+        vArr = ltfV[off]
+        if not na(vArr)
+            if array.size(vArr) > 0
+                // A genuine measurement, not a model: each sub-bar contributes
+                // its own split to its own levels, so this degrades into the
+                // truth as the sub-timeframe shrinks.
+                oArr = ltfO[off]
+                hArr = ltfH[off]
+                lArr = ltfL[off]
+                cArr = ltfC[off]
+                float subTot = 0.0
+                float subBuy = 0.0
+                for j = 0 to array.size(vArr) - 1
+                    sv = nz(array.get(vArr, j))
+                    if sv > 0
+                        so = array.get(oArr, j)
+                        sh = array.get(hArr, j)
+                        sl = array.get(lArr, j)
+                        sc = array.get(cArr, j)
+                        ss   = pathShare(so, sh, sl, sc, alpha)
+                        ssig = concentr > 0 ? (sh - sl) / concentr : 0.0
+                        accumulate(so, sh, sl, sc, sv, ss, alpha, ssig, s, kLo, buyArr, sellArr)
+                        subTot += sv
+                        subBuy += sv * ss
+                if subTot > EPS
+                    share    := subBuy / subTot
+                    measured := true
+
+    if not measured
+        share := engine == ENG_CLOSE ? closeShare(h, l, c) : pathShare(o, h, l, c, alpha)
+        accumulate(o, h, l, c, v, share, alpha, sigma, s, kLo, buyArr, sellArr)
+
+    tgtBuy = v * share
+    rescale(buyArr,  tgtBuy)
+    rescale(sellArr, v - tgtBuy)
+
+    [buyArr, sellArr, kLo, n]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live series — computed every bar so plots and alerts have real history
+// ─────────────────────────────────────────────────────────────────────────────
+
+[curBuy, curSell, curKLo, curN] = buildProfile(0, rowSize)
+
+// Many FX pairs and index CFDs carry no volume feed at all. Without this the
+// footprint renders blank and looks like a bug in the script.
+hasVolume = not na(volume) and ta.highest(nz(volume), 20) > 0
+
+barBuy  = array.sum(curBuy)
+barSell = array.sum(curSell)
+barVol  = barBuy + barSell
+barDelta = barBuy - barSell
+barTilt  = barVol > 0 ? 100.0 * barDelta / barVol : 0.0
+barOvl   = overlapCoef(curBuy, curSell)
+barRes   = volume > 0 ? math.abs(barVol - volume) / volume * 1e6 : 0.0
+curPoc   = argmaxTotal(curBuy, curSell)
+barPocPx = (curKLo + curPoc) * rowSize + rowSize / 2
+
+// Diagonal imbalance: buyers at a level traded against sellers resting one
+// level below, so that — not the same-level ratio — is the informative
+// comparison. Runs of them are the classic absorption / initiative signature.
+countStacks(array<float> b, array<float> s, float th, int need) =>
+    n = array.size(b)
+    int runB = 0
+    int runS = 0
+    bool okB = false
+    bool okS = false
+    if n > 0
+        for i = 0 to n - 1
+            bq = array.get(b, i)
+            sq = array.get(s, i)
+            bImb = i > 0     and bq > 0 and bq > th * array.get(s, i - 1)
+            sImb = i < n - 1 and sq > 0 and sq > th * array.get(b, i + 1)
+            runB := bImb ? runB + 1 : 0
+            runS := sImb ? runS + 1 : 0
+            okB  := okB or runB >= need
+            okS  := okS or runS >= need
+    [okB, okS]
+
+[stackBuy, stackSell] = countStacks(curBuy, curSell, imbThresh, imbStack)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drawing object pools
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<label> labs  = array.new<label>()
+var array<box>   boxes = array.new<box>()
+var array<line>  lines = array.new<line>()
+var table        dash  = table.new(position.top_right, 2, 9, border_width = 1)
+
+clearAll() =>
+    while array.size(labs) > 0
+        label.delete(array.pop(labs))
+    while array.size(boxes) > 0
+        box.delete(array.pop(boxes))
+    while array.size(lines) > 0
+        line.delete(array.pop(lines))
+
+dashCell(int r, string k, string v, color vc) =>
+    table.cell(dash, 0, r, k, text_size = size.small, text_halign = text.align_left,
+         text_color = color.gray, bgcolor = color.new(color.black, 82))
+    table.cell(dash, 1, r, v, text_size = size.small, text_halign = text.align_right,
+         text_color = vc, bgcolor = color.new(color.black, 82))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render — drawings are rebuilt on the last bar only, so one set stays alive
+// instead of one per historical bar.
+// ─────────────────────────────────────────────────────────────────────────────
+
+if barstate.islast
+    clearAll()
+
+    nBars = int(math.min(windowBars, bar_index + 1))
+    gLo   = rowLo(winLo, rowSize)
+    gHi   = int(math.max(gLo, rowHi(winHi, rowSize)))
+    gN    = gHi - gLo + 1
+
+    compBuy  = array.new<float>(gN, 0.0)
+    compSell = array.new<float>(gN, 0.0)
+
+    float totBuy  = 0.0
+    float totSell = 0.0
+    float worstRes = 0.0
+
+    for i = 0 to nBars - 1
+        [bArr, sArr, kLo, n] = buildProfile(i, rowSize)
+
+        bSum = array.sum(bArr)
+        sSum = array.sum(sArr)
+        totBuy  += bSum
+        totSell += sSum
+        if nz(volume[i]) > 0
+            worstRes := math.max(worstRes, math.abs(bSum + sSum - volume[i]) / volume[i] * 1e6)
+
+        poc = argmaxTotal(bArr, sArr)
+        [vaLo, vaHi] = valueArea(bArr, sArr, poc, vaPct)
+
+        // Merge onto the shared grid. Row indices are absolute, so this is a
+        // plain key-wise sum — the payoff of anchoring rows to price.
+        for k = 0 to n - 1
+            g = kLo + k - gLo
+            if g >= 0 and g < gN
+                array.set(compBuy,  g, array.get(compBuy,  g) + array.get(bArr, k))
+                array.set(compSell, g, array.get(compSell, g) + array.get(sArr, k))
+
+        // ── this bar's column ───────────────────────────────────────────────
+        x = bar_index - i
+        for k = 0 to n - 1
+            bq = array.get(bArr, k)
+            sq = array.get(sArr, k)
+            if bq + sq > 0
+                p1  = (kLo + k) * rowSize
+                mid = p1 + rowSize / 2
+
+                bImb = k > 0     and bq > 0 and bq > imbThresh * array.get(sArr, k - 1)
+                sImb = k < n - 1 and sq > 0 and sq > imbThresh * array.get(bArr, k + 1)
+
+                // One label per cell carries both the numbers and the highlight,
+                // which halves the drawing objects a separate box would cost.
+                isPoc = showPoc and k == poc
+                isImb = showImb and (bImb or sImb)
+                isVa  = showVa and k >= vaLo and k <= vaHi
+                bg    = isPoc ? cPoc : isImb ? (bImb ? cImbB : cImbS) : isVa ? cVa : color.new(color.black, 100)
+
+                // TradingView caps drawings at 500; a wide window would blow
+                // through that, so stop adding cells rather than lose the chart.
+                if array.size(labs) < 495 and (showCells or isPoc or isImb or isVa)
+                    array.push(labs, label.new(x, mid, showCells ? fmtVol(sq) + "  " + fmtVol(bq) : "",
+                         xloc = xloc.bar_index, style = label.style_label_center,
+                         size = cellSize, color = bg,
+                         textcolor = showCells ? (bq > sq ? cBuy : cSell) : color.new(color.black, 100)))
+
+    // ── composite profile, drawn to the right of the window ─────────────────
+    if showProfile and gN > 0
+        float peak = 0.0
+        for k = 0 to gN - 1
+            peak := math.max(peak, math.max(array.get(compBuy, k), array.get(compSell, k)))
+        if peak > 0
+            half  = int(profWidth / 2)
+            axis  = bar_index + 3 + half
+            pPoc  = argmaxTotal(compBuy, compSell)
+            [pvLo, pvHi] = valueArea(compBuy, compSell, pPoc, vaPct)
+            for k = 0 to gN - 1
+                p1 = (gLo + k) * rowSize
+                p2 = p1 + rowSize
+                wB = int(math.round(half * array.get(compBuy,  k) / peak))
+                wS = int(math.round(half * array.get(compSell, k) / peak))
+                // Both sides share one horizontal scale, so their widths are
+                // directly comparable — the visual form of the overlap coefficient.
+                if wS > 0
+                    array.push(boxes, box.new(axis - wS, p2, axis, p1, border_width = 0,
+                         bgcolor = color.new(cSell, k == pPoc ? 10 : 45)))
+                if wB > 0
+                    array.push(boxes, box.new(axis, p2, axis + wB, p1, border_width = 0,
+                         bgcolor = color.new(cBuy, k == pPoc ? 10 : 45)))
+                if k == pvLo or k == pvHi
+                    array.push(lines, line.new(bar_index - nBars + 1, p1, axis + half, p1,
+                         xloc = xloc.bar_index, color = color.new(#42a5f5, 40), style = line.style_dotted))
+
+    // ── dashboard ───────────────────────────────────────────────────────────
+    if showDash
+        tot   = totBuy + totSell
+        tilt  = tot > 0 ? 100.0 * (totBuy - totSell) / tot : 0.0
+        lead  = math.abs(tilt)
+        bal   = lead < tiltPct ? "balanced" : (tilt > 0 ? "buyers" : "sellers")
+        exact = worstRes <= resTolPpm
+        dPoc  = argmaxTotal(compBuy, compSell)
+        [dvLo, dvHi] = valueArea(compBuy, compSell, dPoc, vaPct)
+
+        dashCell(0, "engine",     engine == ENG_PATH ? "path (a=" + str.tostring(alpha, "#.##") + ")" : engine == ENG_CLOSE ? "close" : "ltf " + ltfRes, color.silver)
+        dashCell(1, "window",     str.tostring(nBars) + " bars, " + str.tostring(curN) + " rows @ " + str.tostring(rowSize, format.mintick), color.silver)
+        dashCell(2, "volume",     hasVolume ? fmtVol(tot) : "NO VOLUME DATA", hasVolume ? color.silver : color.red)
+        dashCell(3, "delta",      (totBuy - totSell >= 0 ? "+" : "-") + fmtVol(math.abs(totBuy - totSell)), totBuy >= totSell ? cBuy : cSell)
+        dashCell(4, "balance",    bal + "  " + signed(tilt) + "%", lead < tiltPct ? color.silver : (tilt > 0 ? cBuy : cSell))
+        dashCell(5, "bar OVL",    str.tostring(barOvl, "#.##"), barOvl > 0.9 ? color.silver : color.orange)
+        dashCell(6, "chart POC",  str.tostring((gLo + dPoc) * rowSize, format.mintick), #ffb300)
+        dashCell(7, "value area", str.tostring((gLo + dvLo) * rowSize, format.mintick) + " - " + str.tostring((gLo + dvHi + 1) * rowSize, format.mintick), color.silver)
+        dashCell(8, "residual",   str.tostring(worstRes, "#.###") + " ppm " + (exact ? "EXACT" : "CHECK"), exact ? color.silver : color.red)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plots and alerts
+// ─────────────────────────────────────────────────────────────────────────────
+
+plot(barPocPx, "Bar POC",   color = color.new(#ffb300, 0), style = plot.style_circles, linewidth = 1, display = display.pane)
+plot(barDelta, "Bar delta", color = color.new(color.gray, 100), display = display.data_window)
+plot(barTilt,  "Bar tilt %",color = color.new(color.gray, 100), display = display.data_window)
+plot(barOvl,   "Bar OVL",   color = color.new(color.gray, 100), display = display.data_window)
+plot(barRes,   "Residual ppm", color = color.new(color.gray, 100), display = display.data_window)
+
+alertcondition(stackBuy,  "Stacked buy imbalance",  "Stacked buy imbalance on {{ticker}} {{interval}}")
+alertcondition(stackSell, "Stacked sell imbalance", "Stacked sell imbalance on {{ticker}} {{interval}}")
+alertcondition(ta.crossover(barTilt, tiltPct),   "Tilt flips to buyers",  "Footprint tilt turned buy-side on {{ticker}} {{interval}}")
+alertcondition(ta.crossunder(barTilt, -tiltPct), "Tilt flips to sellers", "Footprint tilt turned sell-side on {{ticker}} {{interval}}")
+alertcondition(barRes > resTolPpm, "Residual check failed", "Footprint volume conservation residual exceeded tolerance on {{ticker}}")
