@@ -240,3 +240,96 @@ class TestPineSourceStaysInSync(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPineStructure(unittest.TestCase):
+    """Static checks for the Pine constraints that bite hardest at compile time."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(PINE_PATH) as fh:
+            cls.src = fh.read()
+        cls.lines = cls.src.splitlines()
+
+    def test_declares_version_6(self):
+        self.assertIn("//@version=6", self.src)
+
+    def test_no_tabs(self):
+        for i, line in enumerate(self.lines, 1):
+            self.assertNotIn("\t", line, msg=f"tab on line {i}; Pine wants spaces")
+
+    def test_indentation_follows_pine_continuation_rules(self):
+        """Pine keys blocks off 4-space indents, and distinguishes a wrapped
+        line from a new block by that line NOT being a multiple of 4. So a
+        statement must sit on a multiple of 4, and a continuation must not --
+        getting either backwards silently reparses the script."""
+        depth = 0
+        for i, line in enumerate(self.lines, 1):
+            code = line.split("//")[0]
+            if not line.strip() or line.lstrip().startswith("//"):
+                depth += code.count("(") - code.count(")")
+                continue
+            indent = len(line) - len(line.lstrip())
+            if depth > 0:
+                self.assertNotEqual(
+                    indent % 4, 0,
+                    msg=f"line {i} continues a wrapped call but sits on a "
+                        f"multiple-of-4 indent, which Pine reads as a new block",
+                )
+            else:
+                self.assertEqual(
+                    indent % 4, 0, msg=f"statement at odd indent {indent} on line {i}"
+                )
+            depth = max(0, depth + code.count("(") - code.count(")"))
+
+    def test_user_functions_are_defined_before_use(self):
+        # Pine resolves top-down: calling a function declared further down the
+        # file is a compile error, and is easy to introduce when reordering.
+        defs = {}
+        for i, line in enumerate(self.lines):
+            m = re.match(r"^([a-zA-Z_]\w*)\s*\(.*=>\s*$", line)
+            if m:
+                defs[m.group(1)] = i
+        self.assertIn("legMass", defs, msg="parser failed to find function defs")
+
+        for name, def_line in defs.items():
+            for i, line in enumerate(self.lines):
+                if i <= def_line or line.lstrip().startswith("//"):
+                    continue
+                if re.search(rf"\b{name}\s*\(", line):
+                    break
+            # Now look for any *earlier* call.
+            for i, line in enumerate(self.lines[:def_line]):
+                if line.lstrip().startswith("//"):
+                    continue
+                self.assertIsNone(
+                    re.search(rf"\b{name}\s*\(", line),
+                    msg=f"{name}() called on line {i + 1}, defined on line {def_line + 1}",
+                )
+
+    def test_for_loops_over_arrays_are_guarded(self):
+        # Pine iterates backwards when start > end, so `0 to size-1` on an empty
+        # array steps to -1 and faults instead of skipping.
+        for i, line in enumerate(self.lines, 1):
+            m = re.search(r"for \w+ = 0 to (array\.size\([^)]*\)) - 1", line)
+            if not m:
+                continue
+            window = "\n".join(self.lines[max(0, i - 14) : i])
+            self.assertRegex(
+                window,
+                r"(size\([^)]*\) > 0|> EPS|if n > 0)",
+                msg=f"unguarded array loop on line {i}: {line.strip()}",
+            )
+
+    def test_na_guards_are_nested_not_chained(self):
+        # `and` does not reliably short-circuit, so array.size() must not sit in
+        # the same condition as the na() check that protects it.
+        for i, line in enumerate(self.lines, 1):
+            if "array.size" in line and "na(" in line and " and " in line:
+                self.fail(f"chained na/size guard on line {i}: {line.strip()}")
+
+    def test_drawing_budget_is_capped(self):
+        # TradingView hard-caps drawings; the window can ask for more.
+        self.assertRegex(self.src, r"array\.size\(labs\) < \d+")
+        for obj in ("max_boxes_count", "max_labels_count", "max_lines_count"):
+            self.assertIn(obj, self.src)

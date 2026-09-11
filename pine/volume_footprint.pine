@@ -216,11 +216,14 @@ rescale(array<float> arr, float target) =>
 argmaxTotal(array<float> b, array<float> s) =>
     int best = 0
     float bv = -1.0
-    for i = 0 to array.size(b) - 1
-        t = array.get(b, i) + array.get(s, i)
-        if t > bv
-            bv   := t
-            best := i
+    // Pine's for-loop reverses direction when start > end, so an empty array
+    // would step to -1 and fault instead of skipping. Guard the bound.
+    if array.size(b) > 0
+        for i = 0 to array.size(b) - 1
+            t = array.get(b, i) + array.get(s, i)
+            if t > bv
+                bv   := t
+                best := i
     best
 
 // Smallest contiguous band around the POC holding vaPct of volume, grown by
@@ -252,7 +255,7 @@ overlapCoef(array<float> b, array<float> s) =>
     bt = array.sum(b)
     st = array.sum(s)
     float ovl = 0.0
-    if bt > EPS and st > EPS
+    if bt > EPS and st > EPS and array.size(b) > 0
         for i = 0 to array.size(b) - 1
             ovl += math.min(array.get(b, i) / bt, array.get(s, i) / st)
     ovl
@@ -316,27 +319,36 @@ buildProfile(int off, float s) =>
     float share    = 0.5
     bool  measured = false
 
-    if useLtf and not na(ltfV[off]) and array.size(ltfV[off]) > 0
-        // A genuine measurement, not a model: each sub-bar contributes its own
-        // split to its own levels, so this degrades into the truth as the
-        // sub-timeframe shrinks.
-        float subTot = 0.0
-        float subBuy = 0.0
-        for j = 0 to array.size(ltfV[off]) - 1
-            so = array.get(ltfO[off], j)
-            sh = array.get(ltfH[off], j)
-            sl = array.get(ltfL[off], j)
-            sc = array.get(ltfC[off], j)
-            sv = nz(array.get(ltfV[off], j))
-            if sv > 0
-                ss   = pathShare(so, sh, sl, sc, alpha)
-                ssig = concentr > 0 ? (sh - sl) / concentr : 0.0
-                accumulate(so, sh, sl, sc, sv, ss, alpha, ssig, s, kLo, buyArr, sellArr)
-                subTot += sv
-                subBuy += sv * ss
-        if subTot > EPS
-            share    := subBuy / subTot
-            measured := true
+    if useLtf
+        // Guards are nested rather than chained with `and`: Pine does not
+        // reliably short-circuit, and array.size() of an na array faults.
+        vArr = ltfV[off]
+        if not na(vArr)
+            if array.size(vArr) > 0
+                // A genuine measurement, not a model: each sub-bar contributes
+                // its own split to its own levels, so this degrades into the
+                // truth as the sub-timeframe shrinks.
+                oArr = ltfO[off]
+                hArr = ltfH[off]
+                lArr = ltfL[off]
+                cArr = ltfC[off]
+                float subTot = 0.0
+                float subBuy = 0.0
+                for j = 0 to array.size(vArr) - 1
+                    sv = nz(array.get(vArr, j))
+                    if sv > 0
+                        so = array.get(oArr, j)
+                        sh = array.get(hArr, j)
+                        sl = array.get(lArr, j)
+                        sc = array.get(cArr, j)
+                        ss   = pathShare(so, sh, sl, sc, alpha)
+                        ssig = concentr > 0 ? (sh - sl) / concentr : 0.0
+                        accumulate(so, sh, sl, sc, sv, ss, alpha, ssig, s, kLo, buyArr, sellArr)
+                        subTot += sv
+                        subBuy += sv * ss
+                if subTot > EPS
+                    share    := subBuy / subTot
+                    measured := true
 
     if not measured
         share := engine == ENG_CLOSE ? closeShare(h, l, c) : pathShare(o, h, l, c, alpha)
@@ -353,6 +365,10 @@ buildProfile(int off, float s) =>
 // ─────────────────────────────────────────────────────────────────────────────
 
 [curBuy, curSell, curKLo, curN] = buildProfile(0, rowSize)
+
+// Many FX pairs and index CFDs carry no volume feed at all. Without this the
+// footprint renders blank and looks like a bug in the script.
+hasVolume = not na(volume) and ta.highest(nz(volume), 20) > 0
 
 barBuy  = array.sum(curBuy)
 barSell = array.sum(curSell)
@@ -373,15 +389,16 @@ countStacks(array<float> b, array<float> s, float th, int need) =>
     int runS = 0
     bool okB = false
     bool okS = false
-    for i = 0 to n - 1
-        bq = array.get(b, i)
-        sq = array.get(s, i)
-        bImb = i > 0     and bq > 0 and bq > th * array.get(s, i - 1)
-        sImb = i < n - 1 and sq > 0 and sq > th * array.get(b, i + 1)
-        runB := bImb ? runB + 1 : 0
-        runS := sImb ? runS + 1 : 0
-        okB  := okB or runB >= need
-        okS  := okS or runS >= need
+    if n > 0
+        for i = 0 to n - 1
+            bq = array.get(b, i)
+            sq = array.get(s, i)
+            bImb = i > 0     and bq > 0 and bq > th * array.get(s, i - 1)
+            sImb = i < n - 1 and sq > 0 and sq > th * array.get(b, i + 1)
+            runB := bImb ? runB + 1 : 0
+            runS := sImb ? runS + 1 : 0
+            okB  := okB or runB >= need
+            okS  := okS or runS >= need
     [okB, okS]
 
 [stackBuy, stackSell] = countStacks(curBuy, curSell, imbThresh, imbStack)
@@ -516,7 +533,7 @@ if barstate.islast
 
         dashCell(0, "engine",     engine == ENG_PATH ? "path (a=" + str.tostring(alpha, "#.##") + ")" : engine == ENG_CLOSE ? "close" : "ltf " + ltfRes, color.silver)
         dashCell(1, "window",     str.tostring(nBars) + " bars, " + str.tostring(curN) + " rows @ " + str.tostring(rowSize, format.mintick), color.silver)
-        dashCell(2, "volume",     fmtVol(tot), color.silver)
+        dashCell(2, "volume",     hasVolume ? fmtVol(tot) : "NO VOLUME DATA", hasVolume ? color.silver : color.red)
         dashCell(3, "delta",      (totBuy - totSell >= 0 ? "+" : "-") + fmtVol(math.abs(totBuy - totSell)), totBuy >= totSell ? cBuy : cSell)
         dashCell(4, "balance",    bal + "  " + signed(tilt) + "%", lead < tiltPct ? color.silver : (tilt > 0 ? cBuy : cSell))
         dashCell(5, "bar OVL",    str.tostring(barOvl, "#.##"), barOvl > 0.9 ? color.silver : color.orange)
@@ -538,4 +555,4 @@ alertcondition(stackBuy,  "Stacked buy imbalance",  "Stacked buy imbalance on {{
 alertcondition(stackSell, "Stacked sell imbalance", "Stacked sell imbalance on {{ticker}} {{interval}}")
 alertcondition(ta.crossover(barTilt, tiltPct),   "Tilt flips to buyers",  "Footprint tilt turned buy-side on {{ticker}} {{interval}}")
 alertcondition(ta.crossunder(barTilt, -tiltPct), "Tilt flips to sellers", "Footprint tilt turned sell-side on {{ticker}} {{interval}}")
-alertcondition(barRes > 1.0, "Residual check failed", "Footprint volume conservation residual exceeded 1 ppm on {{ticker}}")
+alertcondition(barRes > resTolPpm, "Residual check failed", "Footprint volume conservation residual exceeded tolerance on {{ticker}}")
