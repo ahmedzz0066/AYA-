@@ -235,6 +235,11 @@ I would rather write these down than discover them at 0.5% a pop.
 - **Comment-based state in the EA.** The invalidation level rides in the order
   comment so nothing is lost on restart. If your broker rewrites comments, the
   early-cancel degrades to expiry-only. Check it on demo.
+- **Do not enable `calc_on_every_tick` in the Pine script.** TradingView's
+  compiler suggests it to make the info table render on unconfirmed bars. Taking
+  that suggestion makes the strategy recalculate intrabar, which changes when
+  orders are evaluated and lets the backtest repaint. Trading fill integrity for
+  a cosmetic table is a catastrophic exchange rate.
 - **Broker timezone drift.** DST shifts server time twice a year. Re-check
   `InpServerGmtOffset` in March and October.
 - **The MQL5 EA has not been compiled.** No MetaEditor in this container. It is

@@ -135,6 +135,12 @@ if takeLong and strategy.position_size == 0
     pendingBar   := bar_index
     pendingLong  := true
     tradesToday  += 1
+    alert("XAUUSD M5 3R | BUY LIMIT " + str.tostring(longEntry, "#.00") +
+          " | SL " + str.tostring(longSL, "#.00") +
+          " | TP " + str.tostring(longTP, "#.00") +
+          " | R " + str.tostring(longR, "#.00") + " USD/oz" +
+          " | cancel unfilled in " + str.tostring(expireBars) + " bars",
+          alert.freq_once_per_bar_close)
 
 if takeShort and strategy.position_size == 0
     strategy.entry("S", strategy.short, qty=qtyShort, limit=shortEntry)
@@ -143,6 +149,12 @@ if takeShort and strategy.position_size == 0
     pendingBar   := bar_index
     pendingLong  := false
     tradesToday  += 1
+    alert("XAUUSD M5 3R | SELL LIMIT " + str.tostring(shortEntry, "#.00") +
+          " | SL " + str.tostring(shortSL, "#.00") +
+          " | TP " + str.tostring(shortTP, "#.00") +
+          " | R " + str.tostring(shortR, "#.00") + " USD/oz" +
+          " | cancel unfilled in " + str.tostring(expireBars) + " bars",
+          alert.freq_once_per_bar_close)
 
 // cancel unfilled limits: stale, invalidated, or out of session.
 // Dead money is worse than a loss - it also blocks the next setup.
@@ -172,8 +184,14 @@ plot(takeLong ? longSL : takeShort ? shortSL : na,       "stop",  color.red,    
 plot(takeLong ? longTP : takeShort ? shortTP : na,       "target",color.green,  2, plot.style_linebr)
 
 // The one number that matters, on the chart, at all times.
+//
+// NOTE: the compiler suggests calc_on_every_tick=true to make barstate.islast
+// fire on unconfirmed bars. Do NOT take that suggestion. It makes the strategy
+// recalculate intrabar, which changes when orders are evaluated and lets the
+// backtest repaint - trading a cosmetic table for the integrity of every fill
+// is a catastrophic exchange rate. Widen the guard instead.
 var table info = table.new(position.top_right, 2, 4, border_width=1)
-if barstate.islast
+if barstate.islast or barstate.islastconfirmedhistory
     table.cell(info, 0, 0, "break-even WR",  text_color=color.white, bgcolor=color.new(color.black, 20))
     table.cell(info, 1, 0, str.tostring(100 / (1 + rr), "#.0") + "%", text_color=color.yellow, bgcolor=color.new(color.black, 20))
     table.cell(info, 0, 1, "actual WR",      text_color=color.white, bgcolor=color.new(color.black, 20))
@@ -184,5 +202,7 @@ if barstate.islast
     table.cell(info, 0, 3, "ATR (USD)",      text_color=color.white, bgcolor=color.new(color.black, 20))
     table.cell(info, 1, 3, str.tostring(atrV, "#.00"), text_color=color.white, bgcolor=color.new(color.black, 20))
 
-alertcondition(takeLong,  "XAUUSD 3R buy limit",  "Place BUY LIMIT on XAUUSD M5 - 3:1 setup")
-alertcondition(takeShort, "XAUUSD 3R sell limit", "Place SELL LIMIT on XAUUSD M5 - 3:1 setup")
+// alertcondition() does nothing inside a strategy - the alerts above fire at
+// the moment the limit is placed and carry the actual levels, which is the
+// only form of alert that is useful at 5-minute speed. Set the alert to
+// "Any alert() function call".
