@@ -1,0 +1,407 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HIDDEN LIQUIDITY PROFILE  (HLP)
+//  Derived from first principles, not adapted from a volume-profile template.
+//
+//  THE PROBLEM
+//  ───────────
+//  Liquidity is resting orders. Resting orders live in the order book, and the
+//  book is invisible on a chart: all we are given is O, H, L, C, V per bar.
+//  So the question is not "how do I draw the book" but "what does the book
+//  necessarily leave behind in OHLCV that we can invert back into evidence?"
+//
+//  THE AXIOMS
+//  ──────────
+//  A1. Price moves only when aggressive (market) orders exhaust the resting
+//      (limit) orders sitting at a price. No exhaustion -> no movement.
+//
+//  A2. Invert A1. Volume that did NOT move price is proof that something large
+//      and passive was standing there absorbing it. Displacement per unit of
+//      volume is therefore an inverse measure of hidden size:
+//
+//          efficiency  e = |close - open| / (high - low)      in [0, 1]
+//          absorption  a = volume * (1 - e)^gamma
+//
+//      This is the key inversion. A volume profile asks "where did trade
+//      happen?". HLP asks "where did trade happen WITHOUT result?" - those
+//      are different quantities, and only the second one implies resting size.
+//      Note the limiting case is correct by construction: a zero-range bar on
+//      heavy volume (e = 0) scores maximum absorption, which is exactly what a
+//      wall in the book looks like from outside.
+//
+//  A3. Not all resting orders are limit orders. Stops cluster just beyond swing
+//      extremes, and their footprint is the opposite of absorption: a fast
+//      penetration that immediately fails. Sweep = trade through a prior
+//      extreme, close back inside it. That level held a pool, and the pool's
+//      size is bounded by the volume spent taking it.
+//
+//  A4. Negative evidence counts. Where price traversed a range with (almost) no
+//      trade - a gap / fair-value gap - there was NO liquidity. Such prices
+//      must be penalised, or the profile would mistake a vacuum for a wall.
+//
+//  A5. The SIDE of the hidden order is recoverable. After absorption, where the
+//      bar settles inside its own range says who won: settling at the top means
+//      passive bids ate the selling (demand-side liquidity); settling at the
+//      bottom means passive offers ate the buying (supply-side liquidity).
+//
+//          location l = (close - low) / (high - low)
+//          bias     b = 2l - 1                        in [-1, +1]
+//
+//  A6. Evidence must be comparable across time. Raw volume drifts with session
+//      and regime, so it is normalised by its own moving average before use.
+//      A quiet hour and a busy hour then testify with equal weight.
+//
+//  THE COMPOSITION
+//  ───────────────
+//      Score(p) = SUM absorption(p) + SUM stop-pool(p) - SUM void(p)
+//      Skew(p)  = signed share of Score(p) attributable to demand vs supply
+//
+//  READING IT
+//  ──────────
+//    - Long bars  = prices the market had to fight through. Magnets, then
+//                   barriers. Price decelerates into them.
+//    - Short bars = prices that never held size. Price crosses them quickly;
+//                   they are poor targets and poor stops.
+//    - Green      = absorption resolved upward -> demand-side resting bids.
+//      Red        = absorption resolved downward -> supply-side resting offers.
+//    - POL        = Point of Liquidity: the single most defended price in the
+//                   window. Not the same as POC (most-traded price), and when
+//                   the two disagree the disagreement is the information.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("Hidden Liquidity Profile", "HLP", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 2000)
+
+// ─────────────────────────────── INPUTS ────────────────────────────────────────
+GW = "1 · Profile window"
+lookback = input.int(300, "Lookback (bars)", minval = 20, maxval = 1500, group = GW,
+     tooltip = "How much history the profile is built from.")
+bins     = input.int(96, "Price bins", minval = 12, maxval = 240, group = GW,
+     tooltip = "Vertical resolution. More bins = finer levels but noisier shelves.")
+volLen   = input.int(100, "Volume normaliser length", minval = 5, maxval = 500, group = GW,
+     tooltip = "Axiom 6: volume is divided by its own SMA so a quiet session and a busy session contribute comparable evidence.")
+
+GM = "2 · Hidden-liquidity model"
+useAbs   = input.bool(true, "Absorption — volume that did not move price", group = GM,
+     tooltip = "Axiom 2. The core term.")
+gamma    = input.float(2.0, "     Absorption emphasis  γ", minval = 0.0, maxval = 6.0, step = 0.25, group = GM,
+     tooltip = "Exponent on inefficiency. γ=0 degenerates to an ordinary volume profile. Higher γ keeps only the most stubborn, least-efficient volume.")
+useSweep = input.bool(true, "Stop pools — swept extremes", group = GM, tooltip = "Axiom 3.")
+swingLen = input.int(20, "     Swing length", minval = 2, maxval = 100, group = GM)
+sweepW   = input.float(1.5, "     Stop-pool weight", minval = 0.0, maxval = 10.0, step = 0.1, group = GM)
+useVoid  = input.bool(true, "Voids — price moved with no trade", group = GM, tooltip = "Axiom 4.")
+voidW    = input.float(1.0, "     Void penalty", minval = 0.0, maxval = 5.0, step = 0.1, group = GM)
+
+GD = "3 · Display"
+sideOpt  = input.string("Right of price", "Profile position", options = ["Right of price", "Inside window"], group = GD)
+profW    = input.int(90, "Profile width (bars)", minval = 10, maxval = 300, group = GD)
+offsetB  = input.int(8, "Offset from last bar", minval = 0, maxval = 100, group = GD)
+vaPct    = input.float(68.0, "Liquidity area %", minval = 30.0, maxval = 95.0, step = 1.0, group = GD,
+     tooltip = "Share of total hidden liquidity gathered around the POL, expanded outward pair-by-pair.")
+showPOL  = input.bool(true, "Show Point of Liquidity", group = GD)
+showLA   = input.bool(true, "Show liquidity-area bounds", group = GD)
+
+GS = "4 · Shelves"
+showShelf = input.bool(true, "Project liquidity shelves", group = GS,
+     tooltip = "Local maxima of the profile, extended across the chart as forward-looking zones.")
+shelfN    = input.int(4, "Max shelves", minval = 1, maxval = 10, group = GS)
+shelfMin  = input.float(45.0, "Min strength (% of POL)", minval = 5.0, maxval = 100.0, step = 5.0, group = GS)
+shelfExt  = input.int(30, "Extend right (bars)", minval = 0, maxval = 200, group = GS)
+
+GC = "5 · Colours"
+cDemand  = input.color(color.new(#26a69a, 0), "Demand-side", group = GC)
+cSupply  = input.color(color.new(#ef5350, 0), "Supply-side", group = GC)
+cNeutral = input.color(color.new(#78909c, 0), "Balanced", group = GC)
+cPOL     = input.color(color.new(#ffb300, 0), "Point of Liquidity", group = GC)
+showTbl  = input.bool(true, "Show statistics table", group = GC)
+
+// ─────────────────────── PER-BAR PRIMITIVES (axioms 2, 5, 6) ───────────────────
+// Computed on every bar so the profile loop can read them at any offset.
+barRng  = math.max(high - low, syminfo.mintick)
+effcy   = math.abs(close - open) / barRng            // A2: displacement efficiency
+settle  = (close - low) / barRng                     // A5: settlement location
+volAvg  = ta.sma(volume, volLen)
+volRel  = na(volume) or na(volAvg) or volAvg <= 0 ? 1.0 : volume / volAvg   // A6
+absorbS = volRel * math.pow(1.0 - effcy, gamma)      // A2: hidden-order evidence
+biasS   = 2.0 * settle - 1.0                         // A5: +1 bid-side, -1 ask-side
+priorHi = ta.highest(high, swingLen)[1]              // A3: extremes stops rest beyond
+priorLo = ta.lowest(low, swingLen)[1]
+
+// ───────────────────────────── HELPERS ─────────────────────────────────────────
+// Arrays are reference types in Pine, so these mutate the caller's profile.
+
+// A3 — deposit a point mass of liquidity at one price.
+addPoint(array<float> tot, array<float> net, float px, float base, float binH, int nb, float w, float sgn) =>
+    if not na(px) and not na(w) and w > 0.0 and binH > 0.0
+        j = math.max(0, math.min(nb - 1, int(math.floor((px - base) / binH))))
+        array.set(tot, j, array.get(tot, j) + w)
+        array.set(net, j, array.get(net, j) + w * sgn)
+
+// A4 — flag every bin spanned by an untraded interval.
+addVoid(array<float> vd, float p1, float p2, float base, float binH, int nb) =>
+    if binH > 0.0
+        a  = math.min(p1, p2)
+        b  = math.max(p1, p2)
+        j0 = math.max(0, math.min(nb - 1, int(math.floor((a - base) / binH))))
+        j1 = math.max(0, math.min(nb - 1, int(math.floor((b - base) / binH))))
+        for j = j0 to j1
+            array.set(vd, j, array.get(vd, j) + 1.0)
+
+// Bar-to-bin smearing: a bar's evidence belongs to every price it visited,
+// in proportion to how much of the bar's range each bin captured.
+spread(array<float> tot, array<float> net, float bl, float bh, float base, float binH, int nb, float w, float sgn) =>
+    if binH > 0.0 and not na(w) and w > 0.0 and not na(bl) and not na(bh)
+        rng = math.max(bh - bl, syminfo.mintick)
+        j0  = math.max(0, math.min(nb - 1, int(math.floor((bl - base) / binH))))
+        j1  = math.max(0, math.min(nb - 1, int(math.floor((bh - base) / binH))))
+        for j = j0 to j1
+            binLo = base + j * binH
+            binHi = binLo + binH
+            ov    = math.min(bh, binHi) - math.max(bl, binLo)
+            if ov > 0.0
+                share = math.min(1.0, ov / rng)
+                array.set(tot, j, array.get(tot, j) + w * share)
+                array.set(net, j, array.get(net, j) + w * share * sgn)
+
+// ───────────────────────────── DRAWING STATE ───────────────────────────────────
+var array<box>   pBoxes = array.new<box>()
+var array<box>   sBoxes = array.new<box>()
+var array<line>  pLines = array.new<line>()
+var array<label> pLabels = array.new<label>()
+
+var float polLevel  = na
+var float laHi      = na
+var float laLo      = na
+var float shelfTop  = na
+var float shelfBot  = na
+
+var table stat = table.new(position.top_right, 2, 7, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+// ───────────────────────────── MAIN PASS ───────────────────────────────────────
+if barstate.islast
+    // Wipe the previous render. Pop-until-empty avoids Pine's reverse-iterating
+    // `for 0 to -1` trap on empty arrays.
+    while array.size(pBoxes) > 0
+        box.delete(array.pop(pBoxes))
+    while array.size(sBoxes) > 0
+        box.delete(array.pop(sBoxes))
+    while array.size(pLines) > 0
+        line.delete(array.pop(pLines))
+    while array.size(pLabels) > 0
+        label.delete(array.pop(pLabels))
+
+    // ── window bounds ──────────────────────────────────────────────────────────
+    n    = math.min(lookback, bar_index + 1)
+    wHi  = high
+    wLo  = low
+    for i = 0 to n - 1
+        wHi := math.max(wHi, high[i])
+        wLo := math.min(wLo, low[i])
+
+    binH = (wHi - wLo) / bins
+    if binH <= 0.0
+        binH := syminfo.mintick
+
+    tot = array.new<float>(bins, 0.0)   // total hidden-liquidity evidence
+    net = array.new<float>(bins, 0.0)   // signed: + demand-side, - supply-side
+    vd  = array.new<float>(bins, 0.0)   // void hit count
+
+    // ── accumulate the three evidence terms ────────────────────────────────────
+    for i = 0 to n - 1
+        bh = high[i]
+        bl = low[i]
+
+        // A2 + A5 — absorption, smeared across the prices the bar visited
+        if useAbs
+            spread(tot, net, bl, bh, wLo, binH, bins, absorbS[i], biasS[i])
+
+        // A3 — stop pools at swept extremes
+        if useSweep
+            ph = priorHi[i]
+            if not na(ph)
+                if bh > ph and close[i] < ph
+                    // buy-stops above the high were filled by passive offers
+                    addPoint(tot, net, ph, wLo, binH, bins, sweepW * volRel[i], -1.0)
+            pl = priorLo[i]
+            if not na(pl)
+                if bl < pl and close[i] > pl
+                    // sell-stops below the low were filled by passive bids
+                    addPoint(tot, net, pl, wLo, binH, bins, sweepW * volRel[i], 1.0)
+
+        // A4 — voids: price traversed an interval no trade ever occurred in
+        if useVoid and i + 2 <= n - 1
+            if low[i] > high[i + 2]
+                addVoid(vd, high[i + 2], low[i], wLo, binH, bins)
+            if high[i] < low[i + 2]
+                addVoid(vd, high[i], low[i + 2], wLo, binH, bins)
+
+    // ── apply the void penalty, scaled to the profile's own magnitude ──────────
+    // Absolute units would be meaningless across instruments; a fraction of the
+    // profile's mean bin keeps the penalty dimensionless.
+    voidBins = 0
+    if useVoid
+        meanBin = array.sum(tot) / bins
+        for j = 0 to bins - 1
+            hits = array.get(vd, j)
+            if hits > 0.0
+                voidBins := voidBins + 1
+                before = array.get(tot, j)
+                after  = math.max(0.0, before - voidW * meanBin * hits)
+                array.set(tot, j, after)
+                // shrink the signed component by the same factor: a void removes
+                // evidence, it does not flip whose evidence it was
+                if before > 0.0
+                    array.set(net, j, array.get(net, j) * after / before)
+
+    // keep |net| <= tot so the skew stays a true share
+    for j = 0 to bins - 1
+        t = array.get(tot, j)
+        array.set(net, j, math.max(-t, math.min(t, array.get(net, j))))
+
+    // ── Point of Liquidity: the single most defended price ─────────────────────
+    maxV   = 0.0
+    polIdx = 0
+    for j = 0 to bins - 1
+        v = array.get(tot, j)
+        if v > maxV
+            maxV   := v
+            polIdx := j
+    polLevel := wLo + (polIdx + 0.5) * binH
+
+    // ── liquidity area: expand outward from the POL, always taking the ─────────
+    //    richer neighbour, until vaPct of all evidence is enclosed
+    grand  = array.sum(tot)
+    target = grand * vaPct / 100.0
+    accum  = array.get(tot, polIdx)
+    laUp   = polIdx
+    laDn   = polIdx
+    while accum < target and (laUp < bins - 1 or laDn > 0)
+        vUp = laUp < bins - 1 ? array.get(tot, laUp + 1) : -1.0
+        vDn = laDn > 0 ? array.get(tot, laDn - 1) : -1.0
+        if vUp >= vDn
+            laUp  := laUp + 1
+            accum := accum + vUp
+        else
+            laDn  := laDn - 1
+            accum := accum + vDn
+    laHi := wLo + (laUp + 1) * binH
+    laLo := wLo + laDn * binH
+
+    // ── render the profile ─────────────────────────────────────────────────────
+    wStart = bar_index - n + 1
+    xa     = sideOpt == "Right of price" ? bar_index + offsetB : wStart
+
+    if maxV > 0.0
+        for j = 0 to bins - 1
+            v = array.get(tot, j)
+            if v > 0.0
+                w = math.max(1, int(math.round(profW * v / maxV)))
+                y1 = wLo + j * binH
+                y2 = y1 + binH
+                skew = v > 0.0 ? array.get(net, j) / v : 0.0
+                col = skew >= 0.0 ? color.from_gradient(skew, 0.0, 1.0, cNeutral, cDemand)
+                     : color.from_gradient(skew, -1.0, 0.0, cSupply, cNeutral)
+                inLA = j >= laDn and j <= laUp
+                array.push(pBoxes, box.new(xa, y2, xa + w, y1,
+                     border_width = 0, bgcolor = color.new(col, inLA ? 18 : 58)))
+
+    // ── POL and liquidity-area bounds ──────────────────────────────────────────
+    if showPOL
+        array.push(pLines, line.new(wStart, polLevel, xa + profW + 4, polLevel,
+             color = cPOL, width = 2))
+        array.push(pLabels, label.new(xa + profW + 4, polLevel,
+             "POL " + str.tostring(polLevel, format.mintick),
+             style = label.style_label_left, color = color.new(cPOL, 15),
+             textcolor = color.black, size = size.small))
+    if showLA
+        array.push(pLines, line.new(wStart, laHi, xa + profW, laHi,
+             color = color.new(cNeutral, 30), style = line.style_dotted))
+        array.push(pLines, line.new(wStart, laLo, xa + profW, laLo,
+             color = color.new(cNeutral, 30), style = line.style_dotted))
+
+    // ── liquidity shelves: local maxima projected forward ──────────────────────
+    shelfTop := na
+    shelfBot := na
+    if showShelf and maxV > 0.0
+        pkIdx = array.new<int>()
+        pkVal = array.new<float>()
+        for j = 0 to bins - 1
+            v  = array.get(tot, j)
+            pv = j > 0 ? array.get(tot, j - 1) : -1.0
+            nx = j < bins - 1 ? array.get(tot, j + 1) : -1.0
+            if v >= pv and v >= nx and v >= maxV * shelfMin / 100.0
+                array.push(pkIdx, j)
+                array.push(pkVal, v)
+        drawn = 0
+        while drawn < shelfN and array.size(pkVal) > 0
+            m  = array.indexof(pkVal, array.max(pkVal))
+            j  = array.get(pkIdx, m)
+            v  = array.get(pkVal, m)
+            y1 = wLo + j * binH
+            y2 = y1 + binH
+            skew = array.get(net, j) / v
+            col  = skew >= 0.0 ? cDemand : cSupply
+            array.push(sBoxes, box.new(wStart, y2, bar_index + shelfExt, y1,
+                 border_color = color.new(col, 45), border_width = 1,
+                 bgcolor = color.new(col, 88)))
+            if drawn == 0
+                shelfTop := y2
+                shelfBot := y1
+            array.remove(pkIdx, m)
+            array.remove(pkVal, m)
+            drawn := drawn + 1
+
+    // ── statistics ─────────────────────────────────────────────────────────────
+    if showTbl
+        netAll  = array.sum(net)
+        skewAll = grand > 0.0 ? 100.0 * netAll / grand : 0.0
+        voidPct = 100.0 * voidBins / bins
+        dist    = polLevel > 0.0 ? 100.0 * (close - polLevel) / polLevel : 0.0
+        hdr     = color.new(color.gray, 85)
+        txt     = color.new(color.white, 0)
+
+        table.cell(stat, 0, 0, "HIDDEN LIQUIDITY", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 0, str.tostring(n) + " bars", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 0, 1, "Point of Liquidity", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 1, str.tostring(polLevel, format.mintick), bgcolor = hdr, text_color = cPOL, text_size = size.small)
+        table.cell(stat, 0, 2, "Liquidity area", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 2, str.tostring(laLo, format.mintick) + " – " + str.tostring(laHi, format.mintick),
+             bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 0, 3, "Book skew", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 3, (skewAll >= 0.0 ? "+" : "") + str.tostring(skewAll, "#.0") + "% " +
+             (skewAll >= 0.0 ? "demand" : "supply"),
+             bgcolor = hdr, text_color = skewAll >= 0.0 ? cDemand : cSupply, text_size = size.small)
+        table.cell(stat, 0, 4, "Price vs POL", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 4, (dist >= 0.0 ? "+" : "") + str.tostring(dist, "#.00") + "%",
+             bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 0, 5, "Void share", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 5, str.tostring(voidPct, "#.0") + "%", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 0, 6, "Top shelf", bgcolor = hdr, text_color = txt, text_size = size.small)
+        table.cell(stat, 1, 6, na(shelfTop) ? "—" :
+             str.tostring((shelfTop + shelfBot) / 2.0, format.mintick),
+             bgcolor = hdr, text_color = txt, text_size = size.small)
+    else
+        table.clear(stat, 0, 0, 1, 6)
+
+// ───────────────────────────── SIGNALS ─────────────────────────────────────────
+// The profile is rebuilt only on the last bar, so these levels are live values,
+// not a historical series — they are for real-time alerting, not backtesting.
+polCross = not na(polLevel) and ((close > polLevel and close[1] <= polLevel) or
+     (close < polLevel and close[1] >= polLevel))
+shelfHit = not na(shelfTop) and close <= shelfTop and close >= shelfBot and
+     not (close[1] <= shelfTop and close[1] >= shelfBot)
+
+if polCross
+    alert("HLP · price crossed the Point of Liquidity at " + str.tostring(polLevel, format.mintick),
+         alert.freq_once_per_bar_close)
+if shelfHit
+    alert("HLP · price entered the strongest hidden-liquidity shelf near " +
+         str.tostring((shelfTop + shelfBot) / 2.0, format.mintick), alert.freq_once_per_bar_close)
+
+alertcondition(polCross, "HLP: POL cross", "Price crossed the Point of Liquidity")
+alertcondition(shelfHit, "HLP: shelf entry", "Price entered the strongest hidden-liquidity shelf")
+
+plot(polLevel, "Point of Liquidity", color = cPOL, display = display.data_window)
+plot(laHi, "Liquidity area high", color = cNeutral, display = display.data_window)
+plot(laLo, "Liquidity area low", color = cNeutral, display = display.data_window)
