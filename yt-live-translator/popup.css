@@ -1,0 +1,28 @@
+:root {
+  --bg: #fff; --fg: #1d1d1f; --muted: #6b7280; --line: #e5e7eb; --accent: #c4302b;
+  --ok: #15803d; --warn: #b45309; --err: #b91c1c; --field: #f6f7f9;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #17181b; --fg: #f1f1f2; --muted: #9aa0a6; --line: #2d2f34; --field: #22242a; }
+}
+* { box-sizing: border-box; }
+body { width: 340px; margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 "Segoe UI", Tahoma, "Noto Naskh Arabic", sans-serif; }
+header h1 { font-size: 17px; margin: 0; }
+header p { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+.primary { width: 100%; padding: 11px; border: 0; border-radius: 10px; background: var(--accent);
+  color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+.primary.stop { background: #374151; }
+.primary:disabled { opacity: .6; cursor: wait; }
+.status { margin: 10px 0 14px; padding: 8px 10px; border-radius: 8px; background: var(--field);
+  font-size: 13px; }
+.status.running { color: var(--ok); }
+.status.starting { color: var(--warn); }
+.status.error { color: var(--err); }
+details { border-top: 1px solid var(--line); padding: 8px 0; }
+summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+label { display: block; margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+label.row { display: flex; gap: 8px; align-items: center; color: var(--fg); }
+input:not([type=checkbox]):not([type=range]), select, textarea { width: 100%; margin-top: 4px; padding: 8px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--field); color: var(--fg); font: inherit; }
+input[type=range] { width: 100%; }
