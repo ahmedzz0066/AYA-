@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>مترجم يوتيوب الفوري</h1>
+    <p>تركي ← عربي</p>
+  </header>
+
+  <button id="toggle" class="primary">▶ ابدأ الترجمة على هذا التبويب</button>
+  <div id="status" class="status idle">متوقف</div>
+
+  <details id="keys" open>
+    <summary>المفاتيح</summary>
+    <label>مفتاح Deepgram (تحويل الصوت التركي إلى نص)
+      <input id="deepgramKey" type="password" dir="ltr" placeholder="dg_...">
+    </label>
+    <label>مفتاح Anthropic (الترجمة)
+      <input id="anthropicKey" type="password" dir="ltr" placeholder="sk-ant-...">
+    </label>
+  </details>
+
+  <details>
+    <summary>الترجمة</summary>
+    <label>أسلوب العربية
+      <select id="style">
+        <option value="msa">فصحى مبسّطة</option>
+        <option value="levantine">لهجة شامية خفيفة (مثل الدبلجة)</option>
+        <option value="white">لهجة بيضاء</option>
+      </select>
+    </label>
+    <label>أسماء الشخصيات (اختياري، سطر لكل اسم)
+      <textarea id="glossary" rows="3" placeholder="Kerem=كيريم&#10;Aslı=أصلي"></textarea>
+    </label>
+  </details>
+
+  <details>
+    <summary>الشكل</summary>
+    <label>حجم الخط <span id="fontSizeVal"></span>
+      <input id="fontSize" type="range" min="16" max="48" step="1">
+    </label>
+    <label>ارتفاع الترجمة عن الأسفل <span id="bottomVal"></span>
+      <input id="bottom" type="range" min="4" max="40" step="1">
+    </label>
+    <label class="row"><input id="showOriginal" type="checkbox"> إظهار النص التركي الأصلي</label>
+  </details>
+
+  <details>
+    <summary>متقدّم</summary>
+    <label>نموذج الترجمة
+      <input id="model" dir="ltr" placeholder="claude-haiku-5-5">
+    </label>
+    <label>نموذج Deepgram
+      <input id="sttModel" dir="ltr" placeholder="nova-2">
+    </label>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

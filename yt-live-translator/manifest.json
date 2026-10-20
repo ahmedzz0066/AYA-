@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "مترجم يوتيوب الفوري (تركي ← عربي)",
+  "version": "1.0.0",
+  "description": "ترجمة فورية احترافية للكلام التركي في فيديوهات يوتيوب إلى العربية، تظهر كترجمة مباشرة فوق الفيديو.",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabCapture", "offscreen", "storage", "activeTab"],
+  "host_permissions": ["https://api.anthropic.com/*", "wss://api.deepgram.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "مترجم يوتيوب الفوري",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
